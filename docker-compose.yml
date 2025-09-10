@@ -1,0 +1,29 @@
+# docker-compose.yml (añade un servicio minio)
+version: "3.9"
+services:
+  minio:
+    image: quay.io/minio/minio:RELEASE.2025-01-02T00-00-00Z  # o la última
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      - "9000:9000"
+      - "9001:9001"   # consola web
+    volumes:
+      - ./data/minio:/data
+
+  bot:
+    build: .
+    env_file: .env
+    environment:
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+      MINIO_SECURE: "false"
+    depends_on:
+      - minio
+    volumes:
+      - ./data:/app/data
+      - ./docs:/app/docs
+    restart: unless-stopped
