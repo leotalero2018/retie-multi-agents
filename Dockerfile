@@ -26,4 +26,5 @@ ENV CHROMA_DB_DIR=data/chroma_db \
     EMBEDDING_MODEL=text-embedding-3-small \
     CHAT_MODEL=gpt-4o-mini
 
-CMD ["python", "app/bot/main.py"]
+CMD ["python", "app/api/main.py"]
+
