@@ -1,11 +1,18 @@
+# app/agent/orchestrator.py
 from typing import List, Dict, Optional
 from collections import OrderedDict
+from openai import OpenAI
+
 from app.config import settings
 from app.retriever.retrieve import search
 from app.agent.prompt import make_prompt
-from app.agent.registry import AGENTS, AgentConfig
 
-from openai import OpenAI
+try:
+    from app.agent.registry import AGENTS, AgentConfig
+except Exception:
+    AGENTS = {}
+    AgentConfig = object  # placeholder
+
 _client = OpenAI(api_key=settings.OPENAI_API_KEY)
 
 def _dedupe_hits(hits: List[Dict]) -> List[Dict]:
@@ -23,6 +30,34 @@ def _dedupe_hits(hits: List[Dict]) -> List[Dict]:
     return list(ordered.values())
 
 
+def _resolve_collection(agent_key: Optional[str], explicit: Optional[str]) -> str:
+    if explicit:
+        return explicit
+    agent = AGENTS.get(agent_key) if agent_key else None
+    if agent and getattr(agent, "collection", None):
+        return agent.collection
+    # mapping rápido si no usas registry
+    if agent_key == "plumber":
+        return "retie_plumber"
+    if agent_key == "pymupdf":
+        return "retie_pymupdf"
+    if agent_key == "hybrid":
+        return "retie_hybrid"
+    return settings.COLLECTION_NAME
+
+
+def _resolve_model(agent_key: Optional[str], explicit: Optional[str]) -> str:
+    if explicit:
+        return explicit
+    agent = AGENTS.get(agent_key) if agent_key else None
+    if agent:
+        try:
+            return agent.resolved_chat_model()
+        except Exception:
+            return getattr(agent, "chat_model", settings.CHAT_MODEL)
+    return settings.CHAT_MODEL
+
+
 def answer_question(
     question: str,
     top_k: Optional[int] = None,
@@ -31,31 +66,25 @@ def answer_question(
     chat_model: Optional[str] = None,
     system_prompt: Optional[str] = None,
 ) -> str:
-    """
-    Preferencias (prioridad):
-      1) agent_key (usa config del agente: colección, modelo, prompt, top_k...)
-      2) parámetros explícitos (collection_name, chat_model, system_prompt, top_k)
-      3) settings por defecto (.env)
-    """
-    agent: Optional[AgentConfig] = AGENTS.get(agent_key) if agent_key else None
+    coll = _resolve_collection(agent_key, collection_name)
+    model = _resolve_model(agent_key, chat_model)
+    tk = top_k or settings.TOP_K
+    sys = system_prompt or "Eres un asistente útil."
 
-    coll = collection_name or (agent.collection if agent else settings.COLLECTION_NAME)
-    tk   = top_k or (agent.resolved_top_k() if agent else settings.TOP_K)
-    model= chat_model or (agent.resolved_chat_model() if agent else settings.CHAT_MODEL)
-    sys  = system_prompt or (agent.system_prompt if agent and agent.system_prompt else "Eres un asistente útil.")
-
-    raw_hits: List[Dict] = search(question, top_k=tk, collection_name=coll)
+    raw_hits = search(question, top_k=tk, collection_name=coll)
     hits = _dedupe_hits(raw_hits)
+
+    header = f"(Agente: {agent_key or '-'} | Modelo: {model} | Colección: {coll})"
+
+    if not hits:
+        return f"{header}\n\nNo tengo evidencia en los documentos."
 
     prompt = make_prompt(hits, question)
     resp = _client.chat.completions.create(
         model=model,
-        temperature=(agent.temperature if agent else 0.0),
-        messages=[
-            {"role": "system", "content": sys},
-            {"role": "user", "content": prompt},
-        ],
-        max_tokens=(agent.resolved_max_tokens() if agent else settings.MAX_TOKENS),
+        temperature=0.0,
+        messages=[{"role": "system", "content": sys}, {"role": "user", "content": prompt}],
+        max_tokens=settings.MAX_TOKENS,
     )
     answer = resp.choices[0].message.content.strip()
 
@@ -66,9 +95,4 @@ def answer_question(
         page = meta.get("page", "?")
         fuentes.append(f"[{i}] {src}, p{page}")
 
-    # Debug opcional: muestra qué agente/modelo/colección respondió
-    debug = f"(Agente: {agent_key or '-'} | Modelo: {model} | Colección: {coll})"
-    return f"{debug}\n\n{answer}\n\nFuentes:\n" + "\n".join(fuentes)
-
-# Ajustar identificador para detectar el tipo de pregunta, dependiendo de esto se asignará un agente y este 
-# hará el mismo flujo para devolverle la respuesta al orchestrator
+    return f"{header}\n\n{answer}\n\nFuentes:\n" + "\n".join(fuentes)

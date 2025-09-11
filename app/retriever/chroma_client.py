@@ -1,4 +1,5 @@
 # app/retriever/chroma_client.py
+from typing import Any
 from chromadb import PersistentClient
 from app.config import settings
 
@@ -20,6 +21,7 @@ def get_collection(name: str | None = None):
     return _collections[name]
 
 def drop_collection(name: str):
+    _client.delete_collection(name) 
     """Elimina por completo la colección y limpia la caché local."""
     try:
         _client.delete_collection(name)
