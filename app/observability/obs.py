@@ -4,6 +4,8 @@ import time
 from contextlib import contextmanager
 from typing import Optional
 from app.config import settings
+from app.observability.safe_capture import capture
+
 
 _langfuse = None
 

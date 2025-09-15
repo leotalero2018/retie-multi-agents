@@ -22,4 +22,8 @@ ENV CHROMA_DB_DIR=data/chroma_db \
     CHAT_MODEL=gpt-4o-mini \
     PYTHONPATH=/app
 
-CMD ["python", "app/api/main.py"]
+# Exponemos 8000 para local; en Railway se usa $PORT
+EXPOSE 8000
+
+# Usa uvicorn y respeta $PORT (fallback 8000 en local)
+CMD ["sh", "-c", "uvicorn app.api.main:app --host 0.0.0.0 --port ${PORT:-8000}"]

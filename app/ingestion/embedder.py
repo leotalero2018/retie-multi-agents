@@ -4,10 +4,27 @@ from app.config import settings
 
 if getattr(settings, "EMBEDDING_PROVIDER", "openai") == "openai":
     # === OpenAI con batching por tokens ===
+    import os
+    import httpx
     from openai import OpenAI
     import tiktoken
 
-    _client = OpenAI(api_key=settings.OPENAI_API_KEY)
+    def _build_openai_client() -> OpenAI:
+        # Lee opcionalmente un proxy desde env
+        proxy = os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PROXY") or None
+        http_client = httpx.Client(proxies=proxy, timeout=60) if proxy else None
+
+        base_url = os.getenv("OPENAI_BASE_URL") or None  # p. ej. Azure/OpenRouter
+        api_key = settings.OPENAI_API_KEY
+
+        # NOTA: No pasamos 'proxies' directo; usamos http_client si aplica.
+        return OpenAI(
+            api_key=api_key,
+            base_url=base_url,
+            http_client=http_client,  # None si no hay proxy
+        )
+
+    _client = _build_openai_client()
     _enc = tiktoken.get_encoding("cl100k_base")
 
     # Límite seguro por request (OpenAI ~300k). Dejamos margen.
