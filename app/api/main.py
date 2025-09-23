@@ -13,7 +13,7 @@ async def health():
 if getattr(settings, "TELEGRAM_TOKEN", None):
     from aiogram import Bot, Dispatcher
     from aiogram.types import Update
-    from app.bot.run_polling import router  # debe NO crear Bot/Dispatcher
+    from app.bot.router import router  # <-- CHANGED: import from router.py
 
     bot = Bot(token=settings.TELEGRAM_TOKEN)
     dp = Dispatcher()
