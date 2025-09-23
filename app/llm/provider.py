@@ -17,39 +17,36 @@ def _openai_chat(prompt: str) -> str:
     return completion.choices[0].message.content.strip()
 
 
-# ========= EXTRACTIVO (sin clave) =========
-#verificar el envío de respuestas, son muy tomadas del texto, es decir no hay 
-#una respuesta sin demasiado contexto, muy general actualmente
-def _extractive_answer(blocks: List[Dict], question: str) -> str:
+# ========= EXTRACTIVE (sin clave) =========
+def _extractive_answer(blocks: List[Dict], question: str, *, is_admin: bool) -> str:
     """
-    Toma los bloques (hits) y arma una respuesta corta usando solo su texto.
-    Reglas:
-    - Si no hay hits: "No tengo evidencia en los documentos."
-    - Si hay, devuelve un resumen conciso + citas [archivo, p].
+    For admins, include citations. For normal users, no citations or source metadata.
     """
     if not blocks:
         return "No tengo evidencia en los documentos."
 
-    # Concatenamos 1–2 frases por bloque, truncando
     snippets = []
     for b in blocks:
         txt = b["text"].strip().replace("\n", " ")
         if len(txt) > 350:
             txt = txt[:350] + "..."
-        src = b["meta"].get("source", "?")
-        page = b["meta"].get("page", 0)
-        snippets.append(f"- {txt} [{src}, p{page}]")
+        if is_admin:
+            src = b.get("meta", {}).get("source", "?")
+            page = b.get("meta", {}).get("page", 0)
+            snippets.append(f"- {txt} [{src}, p{page}]")
+        else:
+            snippets.append(f"- {txt}")
 
-    # Respuesta básica (extractiva)
     header = "Con base en los documentos, encontré lo siguiente:"
     body = "\n".join(snippets)
     return f"{header}\n{body}"
 
 
-def chat_answer(prompt: str, blocks: List[Dict], question: str) -> str:
+def chat_answer(prompt: str, blocks: List[Dict], question: str, *, is_admin: bool = False) -> str:
     provider = getattr(settings, "CHAT_PROVIDER", "openai")
     if provider == "openai":
+        # The prompt itself is already admin-aware (will/won’t ask for citations).
         return _openai_chat(prompt)
     else:
-        # "extractive" u otro → respuesta sin LLM
-        return _extractive_answer(blocks, question)
+        # “extractive” or other fallback: also admin-aware for citations
+        return _extractive_answer(blocks, question, is_admin=is_admin)

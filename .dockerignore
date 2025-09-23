@@ -1,0 +1,43 @@
+# VCS, IDE, entornos
+.git
+.vscode/
+.idea/
+
+# Entornos virtuales (en cualquier subcarpeta)
+venv/
+.venv/
+ENV/
+*/venv/
+*/.venv/
+RetieAgent/venv/
+RetieAgent/.venv/
+
+# Cachés / compilados Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Logs y dotenv
+*.log
+.env
+.env.bak
+
+# Node
+node_modules
+
+# Datos locales que no deben ir al build (se crean en runtime)
+data/
+data/chroma_db/
+RetieAgent/data/chroma_db/
+downloads
+
+# DB locales
+*.db
+*.sqlite3
+
+# Otros temporales
+*.pid
+*.seed
+*.bak
+*.swp

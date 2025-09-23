@@ -7,7 +7,8 @@ from app.config import settings
 from app.retriever.retrieve import search
 from app.agent.prompt import make_prompt
 from app.llm.provider import chat_answer
-from app.agent.registry import AGENTS  # <- para resolver colección/modelo por agente
+from app.agent.registry import AGENTS
+from app.agent.orchestrator import _dedupe_hits
 
 
 # ---- State definition ----
@@ -23,8 +24,11 @@ class GraphState(TypedDict):
 # ---- Nodes ----
 def node_retrieve(state: GraphState) -> GraphState:
     q = state["question"]
+    raw_hits = search(q, top_k=settings.TOP_K)
+    hits = _dedupe_hits(raw_hits)
     agent_key = state.get("agent_key")
     collection_name: Optional[str] = None
+    state["prompt"] = make_prompt(hits, q)
 
     # Si hay agente, usamos su colección; si no, la default de settings
     if agent_key and agent_key in AGENTS:

@@ -58,7 +58,7 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 $env:PYTHONPATH = "$(Get-Location)"
 python -m app.bot.run_polling
 
-Estructura del proyecto
+Estructura del proyectore
 
 retie-agent/
 ├─ app/

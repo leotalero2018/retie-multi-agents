@@ -1,11 +1,10 @@
-# app/agent/orchestrator.py
 from typing import List, Dict, Optional
 from collections import OrderedDict
 from openai import OpenAI
 
 from app.config import settings
 from app.retriever.retrieve import search
-from app.agent.prompt import make_prompt
+from app.agent.prompt import make_prompt  # updated signature supports is_admin
 
 try:
     from app.agent.registry import AGENTS, AgentConfig
@@ -14,6 +13,7 @@ except Exception:
     AgentConfig = object  # placeholder
 
 _client = OpenAI(api_key=settings.OPENAI_API_KEY)
+
 
 def _dedupe_hits(hits: List[Dict]) -> List[Dict]:
     best: dict[tuple, Dict] = {}
@@ -36,7 +36,7 @@ def _resolve_collection(agent_key: Optional[str], explicit: Optional[str]) -> st
     agent = AGENTS.get(agent_key) if agent_key else None
     if agent and getattr(agent, "collection", None):
         return agent.collection
-    # mapping rápido si no usas registry
+    # fallback mapping if not using registry
     if agent_key == "plumber":
         return "retie_plumber"
     if agent_key == "pymupdf":
@@ -65,6 +65,8 @@ def answer_question(
     agent_key: Optional[str] = None,
     chat_model: Optional[str] = None,
     system_prompt: Optional[str] = None,
+    *,
+    is_admin: bool = False,  # <— NEW: controls exposure of sources/citations
 ) -> str:
     coll = _resolve_collection(agent_key, collection_name)
     model = _resolve_model(agent_key, chat_model)
@@ -77,9 +79,12 @@ def answer_question(
     header = f"(Agente: {agent_key or '-'} | Modelo: {model} | Colección: {coll})"
 
     if not hits:
-        return f"{header}\n\nNo tengo evidencia en los documentos."
+        # Only admins see the technical header
+        return (header + "\n\n" if is_admin else "") + "No tengo evidencia en los documentos."
 
-    prompt = make_prompt(hits, question)
+    # Build prompt WITHOUT citations or source names for non-admins
+    prompt = make_prompt(hits, question, is_admin=is_admin)
+
     resp = _client.chat.completions.create(
         model=model,
         temperature=0.0,
@@ -88,6 +93,11 @@ def answer_question(
     )
     answer = resp.choices[0].message.content.strip()
 
+    if not is_admin:
+        # Clean user-facing answer only (no “Fuentes”, no citations)
+        return answer
+
+    # Admins: append explicit sources
     fuentes = []
     for i, h in enumerate(hits, 1):
         meta = h.get("meta", {})
