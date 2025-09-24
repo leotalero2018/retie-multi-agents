@@ -1,4 +1,3 @@
-# syntax=docker/dockerfile:1.7
 FROM python:3.11-slim
 
 # Dependencias del sistema (mantener mínimo)
