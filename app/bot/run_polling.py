@@ -6,11 +6,14 @@ import os
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 
-# 👇 agrega estas dos líneas
+# Carga variables de entorno
 from dotenv import load_dotenv
 load_dotenv()
 
-from app.bot.router import router  # <- solo importa el Router puro
+from app.bot.router import router
+
+dp = Dispatcher()
+dp.include_router(router)
 
 async def main() -> None:
     token = os.environ.get("TELEGRAM_TOKEN")
@@ -18,8 +21,6 @@ async def main() -> None:
         raise RuntimeError("Falta TELEGRAM_TOKEN")
 
     bot = Bot(token=token, default=DefaultBotProperties(parse_mode="HTML"))
-    dp = Dispatcher()
-    dp.include_router(router)
 
     logging.basicConfig(level=logging.INFO)
     await dp.start_polling(bot)

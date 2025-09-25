@@ -11,9 +11,8 @@ async def health():
 
 # Levantar endpoints de Telegram SOLO si hay token
 if getattr(settings, "TELEGRAM_TOKEN", None):
-    from aiogram import Bot, Dispatcher
-    from aiogram.types import Update
-    from app.bot.run_polling import dp  # Import Dispatcher directly
+    from aiogram import Bot, types
+    from app.bot.run_polling import dp
 
     bot = Bot(token=settings.TELEGRAM_TOKEN)
 
@@ -26,7 +25,7 @@ if getattr(settings, "TELEGRAM_TOKEN", None):
             metadata={"chat_id": body.get("message", {}).get("chat", {}).get("id", "")},
         ) as trace:
             with span_ctx(trace, "feed_update"):
-                update = Update.model_validate(body)
+                update = types.Update.model_validate(body)
                 await dp.feed_update(bot, update)
         return {"status": "ok"}
 else:

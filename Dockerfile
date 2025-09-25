@@ -1,7 +1,9 @@
 # syntax=docker/dockerfile:1.7
 FROM python:3.11-slim
 
-# Dependencias del sistema (mantener mínimo)
+# -------------------------------
+# Dependencias del sistema
+# -------------------------------
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     tesseract-ocr \
@@ -9,34 +11,55 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libgl1 \
  && rm -rf /var/lib/apt/lists/*
 
+# -------------------------------
+# Directorio de trabajo
+# -------------------------------
 WORKDIR /app
 
-# 1) Actualiza pip primero (reduce problemas de resolución), y establece variables útiles
+# -------------------------------
+# Variables de entorno útiles
+# -------------------------------
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_DEFAULT_TIMEOUT=100 \
-    PIP_RETRIES=5
+    PIP_RETRIES=5 \
+    PYTHONPATH=/app \
+    CHROMA_DB_DIR=/app/data/chroma_db \
+    COLLECTION_NAME=retie_docs \
+    EMBEDDING_MODEL=text-embedding-3-small \
+    CHAT_MODEL=gpt-4o-mini
 
-# 2) Copia requirements primero para aprovechar cache de Docker
+# -------------------------------
+# Copiar requirements primero para usar cache
+# -------------------------------
 COPY requirements.txt .
 
-# 3) Instala dependencias
-# Si no agregaste el --extra-index-url en requirements.txt, puedes exportarlo aquí:
-# ENV PIP_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cpu
+# -------------------------------
+# Instalar dependencias
+# -------------------------------
 RUN python -m pip install --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt --progress-bar off
 
-# 4) Copia el código fuente
+# -------------------------------
+# Copiar código fuente
+# -------------------------------
 COPY . .
 
-# 5) Asegura que existan los directorios de runtime
+# -------------------------------
+# Crear carpetas necesarias
+# -------------------------------
 RUN mkdir -p downloads data/chroma_db
 
-# 6) Variables de entorno de la app
-ENV CHROMA_DB_DIR=data/chroma_db \
-    COLLECTION_NAME=retie_docs \
-    EMBEDDING_MODEL=text-embedding-3-small \
-    CHAT_MODEL=gpt-4o-mini \
-    PYTHONPATH=/app
+# -------------------------------
+# Verificación opcional (debug build)
+# -------------------------------
+RUN ls -R /app
 
+# -------------------------------
+# Exponer puerto para Railway
+# -------------------------------
 EXPOSE 8000
-CMD ["sh", "-c", "uvicorn app.api.main:app --host 0.0.0.0 --port ${PORT:-8000}"]
+
+# -------------------------------
+# CMD principal: FastAPI con uvicorn
+# -------------------------------
+CMD ["sh", "-c", "echo '🚀 Starting FastAPI app...' && uvicorn app.api.main:app --host 0.0.0.0 --port ${PORT:-8000}"]
