@@ -13,11 +13,9 @@ async def health():
 if getattr(settings, "TELEGRAM_TOKEN", None):
     from aiogram import Bot, Dispatcher
     from aiogram.types import Update
-    from app.bot.run_polling import router  # debe NO crear Bot/Dispatcher
+    from app.bot.run_polling import dp  # Import Dispatcher directly
 
     bot = Bot(token=settings.TELEGRAM_TOKEN)
-    dp = Dispatcher()
-    dp.include_router(router)
 
     @app.post("/telegram/webhook")
     async def telegram_webhook(request: Request):
