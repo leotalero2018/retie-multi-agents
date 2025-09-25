@@ -1,9 +1,0 @@
-[build]
-builder = "DOCKERFILE"
-
-[deploy]
-startCommand = "uvicorn app.api.main:app --host 0.0.0.0 --port ${PORT:-8000}"
-
-[volumes]
-# Nombre del volumen en Railway = carpeta dentro del contenedor
-"chroma-data" = "/app/data/chroma_db"
