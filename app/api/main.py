@@ -3,10 +3,12 @@ from fastapi import FastAPI, Request
 from app.config import settings
 from app.observability.obs import trace_ctx, span_ctx
 from app.api.debug import router as debug_router
-app.include_router(debug_router)
+
 
 app = FastAPI()
 
+app.include_router(debug_router)
+ 
 @app.get("/health")
 async def health():
     return {"ok": True}
