@@ -34,9 +34,10 @@ ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
 COPY requirements.txt .
 
 # -------------------------------
-# Instalar dependencias
+# Instalar PyTorch CPU primero (con enlace oficial) y luego el resto de requirements
 # -------------------------------
 RUN python -m pip install --upgrade pip && \
+    pip install --no-cache-dir torch==2.2.2+cpu -f https://download.pytorch.org/whl/cpu/torch_stable.html && \
     pip install --no-cache-dir -r requirements.txt --progress-bar off
 
 # -------------------------------
