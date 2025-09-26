@@ -1,39 +1,53 @@
 # app/api/main.py
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Query, APIRouter
 from app.config import settings
 from app.observability.obs import trace_ctx, span_ctx
 from app.api.debug import router as debug_router
 from app.api import ingest
-from fastapi import APIRouter, Query
-from app.db.chroma import get_vector_store
-from app.llm import chat_with_context 
+from app.llm.provider import chat_answer  # usa el que ya tienes en provider.py
+from app.llm.chroma_stub import get_vector_store  # stub temporal si no tienes db
 
-
+# Crear la app
 app = FastAPI()
 
+# Routers existentes
 app.include_router(debug_router)
 app.include_router(ingest.router)
- 
+
+# Router local para endpoints propios
+router = APIRouter()
+
+
 @app.get("/health")
 async def health():
     return {"ok": True}
 
+
 @router.get("/query")
 def query_docs(q: str = Query(..., description="Pregunta del usuario")):
-    # 1. Recuperar documentos de Chroma
+    # 1. Recuperar documentos (stub o Chroma si luego lo conectas)
     vs = get_vector_store()
     results = vs.similarity_search(q, k=3)
 
     # 2. Armar contexto
     context = "\n".join([r.page_content for r in results])
 
-    # 3. Llamar al modelo
-    answer = chat_with_context(q, context)
+    # 3. Llamar al modelo (usa el provider que ya tienes funcionando)
+    answer = chat_answer(
+        prompt=f"Pregunta: {q}\nContexto:\n{context}",
+        blocks=[],
+        question=q,
+        is_admin=False
+    )
 
     return {"question": q, "answer": answer, "context": context}
 
 
-# Levantar endpoints de Telegram SOLO si hay token
+# Incluir router local
+app.include_router(router)
+
+
+# --- TELEGRAM ---
 if getattr(settings, "TELEGRAM_TOKEN", None):
     from aiogram import Bot, types
     from app.bot.run_polling import dp
