@@ -55,11 +55,11 @@ RUN mkdir -p downloads data/chroma_db
 RUN ls -R /app
 
 # -------------------------------
-# Exponer puerto para Railway
+# Exponer puerto (no lo usa el bot, pero Railway lo requiere)
 # -------------------------------
 EXPOSE 8000
 
 # -------------------------------
-# CMD principal: FastAPI con uvicorn
+# CMD principal: Bot de Telegram
 # -------------------------------
-CMD ["sh", "-c", "echo '🚀 Starting FastAPI app...' && uvicorn app.api.main:app --host 0.0.0.0 --port ${PORT:-8000}"]
+CMD ["sh", "-c", "echo '🤖 Starting Telegram bot...' && python -m app.bot.run_polling"]
