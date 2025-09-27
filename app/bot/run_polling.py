@@ -15,7 +15,9 @@ from app.bot.router import router
 # CONFIGURACIÓN MINIO / BUCKET
 # ------------------------------------------------------------------------
 BUCKET_NAME = os.getenv("MINIO_BUCKET_NAME", "Data")
-MINIO_ENDPOINT = os.getenv("MINIO_PUBLIC_ENDPOINT")  # tu endpoint público
+
+# ⚠️ Corregido: solo host, sin https:// ni puerto
+MINIO_ENDPOINT = os.getenv("MINIO_PUBLIC_ENDPOINT", "bucket-production-b0dd.up.railway.app")
 ACCESS_KEY = os.getenv("MINIO_ROOT_USER")
 SECRET_KEY = os.getenv("MINIO_ROOT_PASSWORD")
 
@@ -30,7 +32,7 @@ client = Minio(
     MINIO_ENDPOINT,
     access_key=ACCESS_KEY,
     secret_key=SECRET_KEY,
-    secure=True  # porque es HTTPS
+    secure=True  # HTTPS
 )
 
 logging.info("🔄 Descargando embeddings desde el bucket...")
