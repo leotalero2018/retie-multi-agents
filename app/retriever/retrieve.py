@@ -21,28 +21,56 @@ def _bm25_fallback(query: str, documents: List[str], metas: List[Dict], top_k: i
     return [{"text": documents[i], "meta": metas[i], "score": float(scores[i])} for i in idxs]
 
 
-def search(query: str, top_k: Optional[int] = None, collection_name: Optional[str] = None) -> List[Dict]:
+def search(
+    query: str,
+    top_k: Optional[int] = None,
+    collection_name: Optional[str] = None,
+    distance_threshold: Optional[float] = None,
+) -> List[Dict]:
+    """
+    Dense-first retrieval:
+    - Embeds the query with the SAME model used at index time.
+    - Queries Chroma via query_embeddings (no EF conflict).
+    - Applies a distance threshold to filter weak hits.
+    - Falls back to BM25 if dense gives nothing (optional).
+    """
     top_k = top_k or settings.TOP_K
-    col = get_collection(collection_name)
+    thr = distance_threshold if distance_threshold is not None else getattr(settings, "RAG_DISTANCE_THRESHOLD", 0.45)
 
-    # 1) RAG denso (embeddings)
+    col = get_collection(collection_name)  # IMPORTANT: must NOT attach embedding_function here
+
+    # 1) Dense RAG
     try:
-        # Usa una sola forma. Si indexaste con OpenAI embeddings, no uses prefijo "query: "
-        q_emb = embed_texts([query])[0]
-        res = col.query(query_embeddings=[q_emb], n_results=top_k)
-        docs = res.get("documents", [[]])[0]
-        metas = res.get("metadatas", [[]])[0]
-        dists = res.get("distances", [[]])[0]
+        # If you indexed with OpenAI 1536-dim, DO NOT prefix "query:" to the text.
+        q_emb_vec = embed_texts([query])[0]  # must return a 1536-dim vector (same model as index)
+        res = col.query(
+            query_embeddings=[q_emb_vec],
+            n_results=top_k,
+            include=["documents", "distances", "metadatas"],
+        )
 
-        items = [{"text": d, "meta": m, "score": float(dist)} for d, m, dist in zip(docs, metas, dists)]
-        if items:
-            return items
-        # si no hay resultados, intenta fallback
-        raise RuntimeError("empty dense results")
+        docs = res.get("documents", [[]])[0] or []
+        metas = res.get("metadatas", [[]])[0] or []
+        dists = res.get("distances", [[]])[0] or []
+
+        items_dense = []
+        for d, m, dist in zip(docs, metas, dists):
+            if dist <= thr:
+                items_dense.append({"text": d, "meta": m, "score": float(dist)})
+
+        # Logging útil en depuración:
+        # print(f"[RAG] k={top_k} thr={thr} dists={dists} kept={len(items_dense)}")
+
+        if items_dense:
+            return items_dense
+
+        # si no hay resultados densos útiles, intenta fallback
+        raise RuntimeError("empty or weak dense results")
+
     except Exception:
-        # 2) Fallback léxico BM25 si hay paquete y la colección no es enorme
+        # 2) Fallback léxico BM25 si está disponible
         try:
-            res_all = col.get()   # dict con 'documents' y 'metadatas' planas (listas del mismo largo)
+            res_all = col.get()  # dict plano con 'documents' y 'metadatas'
             documents: List[str] = res_all.get("documents", []) or []
             metas: List[Dict] = res_all.get("metadatas", []) or []
             if BM25Okapi and documents:

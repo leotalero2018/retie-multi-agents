@@ -1,30 +1,46 @@
 # app/retriever/chroma_client.py
 from typing import Any
+import chromadb
 from chromadb import PersistentClient
 from app.config import settings
 
-_client = PersistentClient(path=settings.CHROMA_DB_DIR)
-_collections: dict[str, any] = {}
+# Create a single persistent Chroma client pointing to the same directory used at runtime
+_client: PersistentClient = chromadb.PersistentClient(path=settings.CHROMA_DB_DIR)
+
+# Local cache of collections (per-process)
+_collections: dict[str, Any] = {}
 
 
 def get_collection(name: str | None = None):
     """
-    Devuelve/crea una colección por nombre y la cachea en este proceso.
-    Si name es None, usa settings.COLLECTION_NAME.
+    Returns or creates a collection by name and caches it in this process.
+    IMPORTANT:
+      - Do NOT attach any embedding_function here to avoid EF conflicts
+        with persisted/default collection configuration.
+      - Distance space is set via metadata only.
     """
-    name = name or settings.COLLECTION_NAME
-    if name not in _collections:
-        _collections[name] = _client.get_or_create_collection(
-            name=name,
-            metadata={"hnsw:space": "cosine"},
-        )
-    return _collections[name]
+    col_name = name or settings.COLLECTION_NAME
+
+    if col_name not in _collections:
+        # Ensure collection exists WITHOUT embedding_function to prevent conflicts.
+        # Use cosine space so distances are comparable to cosine similarity thresholds.
+        try:
+            col = _client.get_collection(col_name)
+        except Exception:
+            col = _client.create_collection(
+                name=col_name,
+                metadata={"hnsw:space": "cosine"},
+            )
+        _collections[col_name] = col
+
+    return _collections[col_name]
+
 
 def drop_collection(name: str):
-    """Elimina por completo la colección y limpia la caché local."""
+    """Drops the collection entirely and clears local cache."""
     try:
         _client.delete_collection(name)
-        print(f"✅ Colección {name} eliminada.")
+        print(f"✅ Collection {name} deleted.")
     except Exception:
-        print(f"⚠ Colección {name} no existía, se continúa.")
+        print(f"⚠ Collection {name} did not exist; continuing.")
     _collections.pop(name, None)

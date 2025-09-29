@@ -2,84 +2,74 @@
 from typing import List
 from app.config import settings
 
-if getattr(settings, "EMBEDDING_PROVIDER", "openai") == "openai":
-    # === OpenAI con batching por tokens ===
+# The retriever.search() will call embed_texts() and then use query_embeddings
+# against Chroma (no EF bound to the collection). Make sure this uses THE SAME
+# model used at indexing time. For 1536-dim vectors use "text-embedding-3-small"
+# (or "text-embedding-ada-002" if you indexed long ago with the legacy model).
+
+if getattr(settings, "EMBEDDING_PROVIDER", "openai").lower() == "openai":
     import os
     import httpx
     from openai import OpenAI
-    import tiktoken
 
     def _build_openai_client() -> OpenAI:
-        # Lee opcionalmente un proxy desde env
+        # Optional proxy support
         proxy = os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PROXY") or None
         http_client = httpx.Client(proxies=proxy, timeout=60) if proxy else None
 
-        base_url = os.getenv("OPENAI_BASE_URL") or None  # p. ej. Azure/OpenRouter
-        api_key = settings.OPENAI_API_KEY
+        # Base URL allows Azure/OpenRouter/etc if needed
+        base_url = os.getenv("OPENAI_BASE_URL") or None
 
-        # NOTA: No pasamos 'proxies' directo; usamos http_client si aplica.
-        return OpenAI(
-            api_key=api_key,
-            base_url=base_url,
-            http_client=http_client,  # None si no hay proxy
+        # Prefer CHROMA_OPENAI_API_KEY if present (Chroma ecosystem convention),
+        # otherwise fall back to OPENAI_API_KEY from settings/env.
+        api_key = (
+            os.getenv("CHROMA_OPENAI_API_KEY")
+            or os.getenv("OPENAI_API_KEY")
+            or settings.OPENAI_API_KEY
         )
 
+        if not api_key:
+            raise RuntimeError(
+                "Missing OpenAI API key. Set CHROMA_OPENAI_API_KEY or OPENAI_API_KEY."
+            )
+
+        return OpenAI(api_key=api_key, base_url=base_url, http_client=http_client)
+
     _client = _build_openai_client()
-    _enc = tiktoken.get_encoding("cl100k_base")
 
-    # Límite seguro por request (OpenAI ~300k). Dejamos margen.
-    _MAX_TOKENS_PER_REQ = 280_000
-
-    def _count_tokens(txt: str) -> int:
-        return len(_enc.encode(txt))
-
-    def _make_batches(items: List[str]) -> List[List[str]]:
-        batches: List[List[str]] = []
-        cur_batch: List[str] = []
-        cur_tokens = 0
-
-        for t in items:
-            tt = _count_tokens(t)
-            # Si un solo chunk es gigantesco (raro), igual lo mandamos solo
-            if tt > _MAX_TOKENS_PER_REQ:
-                if cur_batch:
-                    batches.append(cur_batch)
-                    cur_batch, cur_tokens = [], 0
-                batches.append([t])
-                continue
-
-            # Si agregarlo excede el límite -> cerrar lote
-            if cur_tokens + tt > _MAX_TOKENS_PER_REQ and cur_batch:
-                batches.append(cur_batch)
-                cur_batch, cur_tokens = [], 0
-
-            cur_batch.append(t)
-            cur_tokens += tt
-
-        if cur_batch:
-            batches.append(cur_batch)
-        return batches
+    # Default to 1536-dim model unless explicitly overridden in settings
+    _MODEL = getattr(settings, "EMBEDDING_MODEL", None) or "text-embedding-3-small"
 
     def embed_texts(texts: List[str]) -> List[List[float]]:
-        """Embebe en lotes respetando el máximo de tokens por request."""
-        vectors: List[List[float]] = []
-        for batch in _make_batches(texts):
-            resp = _client.embeddings.create(
-                model=settings.EMBEDDING_MODEL,
-                input=batch,
-            )
-            vectors.extend([d.embedding for d in resp.data])
-        return vectors
+        """
+        Embed a list of texts using the configured OpenAI embedding model.
+        IMPORTANT:
+          - Do NOT prepend prefixes like 'query:' or 'passage:' for OpenAI models.
+          - Keep one vector per input in the returned list.
+        """
+        if not texts:
+            return []
+
+        # OpenAI API supports batching; send as a single request unless extremely large.
+        resp = _client.embeddings.create(model=_MODEL, input=texts)
+        return [d.embedding for d in resp.data]
 
 else:
-    # === Proveedor local (sentence-transformers) ===
+    # Local provider via sentence-transformers (keep as a dev fallback).
     from sentence_transformers import SentenceTransformer
 
-    _model_name = "intfloat/multilingual-e5-base"
-    _model = SentenceTransformer(_model_name)
+    # NOTE: Local model dimension must match the one used at index time if mixing!
+    # For consistency with your current index, prefer OpenAI in production.
+    _MODEL_NAME = "intfloat/multilingual-e5-base"
+    _model = SentenceTransformer(_MODEL_NAME)
 
     def _prep_inputs(texts: List[str]) -> List[str]:
-        return [f"passage: {t}" for t in texts]
+        # E5 family expects prefixes like "query:" / "passage:", but since your
+        # index uses OpenAI 1536-dim, avoid mixing providers in production.
+        return [t for t in texts]
 
     def embed_texts(texts: List[str]) -> List[List[float]]:
-        return _model.encode(_prep_inputs(texts), normalize_embeddings=True).tolist()
+        if not texts:
+            return []
+        vecs = _model.encode(_prep_inputs(texts), normalize_embeddings=True)
+        return vecs.tolist()
