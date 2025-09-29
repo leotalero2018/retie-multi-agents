@@ -51,11 +51,6 @@ COPY . .
 RUN mkdir -p downloads data/chroma_db
 
 # -------------------------------
-# Exponer puerto (Railway requiere que el contenedor escuche en $PORT)
+# CMD principal: Bot de Telegram con Polling
 # -------------------------------
-EXPOSE 8000
-
-# -------------------------------
-# CMD principal: API con FastAPI (uvicorn)
-# -------------------------------
-CMD ["sh", "-c", "uvicorn app.api.main:app --host 0.0.0.0 --port ${PORT:-8000}"]
+CMD ["python", "-m", "app.bot.run_polling"]
