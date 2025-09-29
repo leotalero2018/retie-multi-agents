@@ -17,8 +17,9 @@ from app.bot.router import router
 # ------------------------------------------------------------------------
 BUCKET_NAME = os.getenv("MINIO_BUCKET_NAME", "data")
 
-# Usa el endpoint privado de Railway (interno, sin https://)
+# Endpoint privado de Railway (interno, sin http/https)
 MINIO_ENDPOINT = os.getenv("MINIO_PRIVATE_ENDPOINT", "bucket.railway.internal:9000")
+
 ACCESS_KEY = os.getenv("MINIO_ROOT_USER")
 SECRET_KEY = os.getenv("MINIO_ROOT_PASSWORD")
 
@@ -35,10 +36,10 @@ try:
     os.makedirs(LOCAL_CHROMA_DIR, exist_ok=True)
 
     client = Minio(
-        MINIO_ENDPOINT.replace("http://", "").replace("https://", ""),
+        MINIO_ENDPOINT,
         access_key=ACCESS_KEY,
         secret_key=SECRET_KEY,
-        secure=False  # porque Railway expone MinIO privado sin TLS
+        secure=False  # Railway interno no usa TLS
     )
 
     logging.info("🔄 Descargando embeddings desde el bucket...")
