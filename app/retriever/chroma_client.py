@@ -21,10 +21,10 @@ def get_collection(name: str | None = None):
     return _collections[name]
 
 def drop_collection(name: str):
-    _client.delete_collection(name) 
     """Elimina por completo la colección y limpia la caché local."""
     try:
         _client.delete_collection(name)
+        print(f"✅ Colección {name} eliminada.")
     except Exception:
-        pass  # si no existe, ignoramos
+        print(f"⚠ Colección {name} no existía, se continúa.")
     _collections.pop(name, None)
