@@ -2,7 +2,8 @@
 import asyncio
 import logging
 import os
-from minio import Minio  
+import shutil
+from minio import Minio
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
@@ -14,45 +15,53 @@ from app.bot.router import router
 # ------------------------------------------------------------------------
 # CONFIGURACIÓN MINIO / BUCKET
 # ------------------------------------------------------------------------
-BUCKET_NAME = os.getenv("MINIO_BUCKET_NAME", "data") 
+BUCKET_NAME = os.getenv("MINIO_BUCKET_NAME", "data")
 
-# Usa el endpoint privado que Railway expone
+# Usa el endpoint privado de Railway (interno, sin https://)
 MINIO_ENDPOINT = os.getenv("MINIO_PRIVATE_ENDPOINT", "bucket.railway.internal:9000")
 ACCESS_KEY = os.getenv("MINIO_ROOT_USER")
 SECRET_KEY = os.getenv("MINIO_ROOT_PASSWORD")
 
 # Carpeta local donde Chroma buscará los embeddings
 LOCAL_CHROMA_DIR = "./data/chroma_db"
-os.makedirs(LOCAL_CHROMA_DIR, exist_ok=True)
 
 # ------------------------------------------------------------------------
 # DESCARGA DE EMBEDDINGS DESDE EL BUCKET
 # ------------------------------------------------------------------------
 try:
+    # Borrar cualquier embedding previo para evitar datos viejos
+    if os.path.exists(LOCAL_CHROMA_DIR):
+        shutil.rmtree(LOCAL_CHROMA_DIR)
+    os.makedirs(LOCAL_CHROMA_DIR, exist_ok=True)
+
     client = Minio(
         MINIO_ENDPOINT.replace("http://", "").replace("https://", ""),
         access_key=ACCESS_KEY,
         secret_key=SECRET_KEY,
-        secure=False  
+        secure=False  # porque Railway expone MinIO privado sin TLS
     )
 
     logging.info("🔄 Descargando embeddings desde el bucket...")
 
-    # Verifica si el bucket existe
     if not client.bucket_exists(BUCKET_NAME):
-        logging.warning(f"⚠️ El bucket '{BUCKET_NAME}' no existe en MinIO")
-    else:
-        for obj in client.list_objects(BUCKET_NAME, recursive=True):
-            dest_path = os.path.join(LOCAL_CHROMA_DIR, obj.object_name)
-            os.makedirs(os.path.dirname(dest_path), exist_ok=True)
-            client.fget_object(BUCKET_NAME, obj.object_name, dest_path)
-            logging.info(f"✅ Archivo descargado: {obj.object_name}")
+        raise RuntimeError(f"❌ El bucket '{BUCKET_NAME}' no existe en MinIO")
 
-        logging.info(f"✅ Descarga completa en {LOCAL_CHROMA_DIR}")
+    count = 0
+    for obj in client.list_objects(BUCKET_NAME, recursive=True):
+        dest_path = os.path.join(LOCAL_CHROMA_DIR, obj.object_name)
+        os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+        client.fget_object(BUCKET_NAME, obj.object_name, dest_path)
+        logging.info(f"✅ Archivo descargado: {obj.object_name}")
+        count += 1
+
+    if count == 0:
+        raise RuntimeError(f"❌ El bucket '{BUCKET_NAME}' está vacío, no se descargó ningún archivo.")
+
+    logging.info(f"✅ Descarga completa: {count} archivos en {LOCAL_CHROMA_DIR}")
 
 except Exception as e:
-    logging.warning(f"⚠️ No se pudieron descargar embeddings desde el bucket: {e}")
-    logging.warning("Continuando ejecución del bot con datos locales si existen...")
+    logging.error(f"🚨 Error crítico al descargar embeddings del bucket: {e}")
+    raise  # detenemos el bot si no hay embeddings válidos
 
 # ------------------------------------------------------------------------
 # CONFIGURACIÓN DEL BOT
