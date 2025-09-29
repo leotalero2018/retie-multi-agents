@@ -21,21 +21,15 @@ logging.basicConfig(level=logging.INFO, force=True)
 # CONFIGURACIÓN MINIO / BUCKET
 # ------------------------------------------------------------------------
 BUCKET_NAME = os.getenv("MINIO_BUCKET_NAME", "data")
-
-# Endpoint privado de Railway (interno, sin http/https)
 MINIO_ENDPOINT = os.getenv("MINIO_PRIVATE_ENDPOINT", "bucket.railway.internal:9000")
-
 ACCESS_KEY = os.getenv("MINIO_ROOT_USER")
 SECRET_KEY = os.getenv("MINIO_ROOT_PASSWORD")
-
-# Carpeta local donde Chroma buscará los embeddings
 LOCAL_CHROMA_DIR = "./data/chroma_db"
 
 # ------------------------------------------------------------------------
 # DESCARGA DE EMBEDDINGS DESDE EL BUCKET (SOFT FAIL)
 # ------------------------------------------------------------------------
 try:
-    # Borrar cualquier embedding previo para evitar datos viejos
     if os.path.exists(LOCAL_CHROMA_DIR):
         shutil.rmtree(LOCAL_CHROMA_DIR)
     os.makedirs(LOCAL_CHROMA_DIR, exist_ok=True)
@@ -44,7 +38,7 @@ try:
         MINIO_ENDPOINT,
         access_key=ACCESS_KEY,
         secret_key=SECRET_KEY,
-        secure=False  # Railway interno no usa TLS
+        secure=False
     )
 
     logging.info("🔄 Descargando embeddings desde el bucket...")
@@ -78,7 +72,10 @@ dp.include_router(router)
 async def main() -> None:
     token = os.environ.get("TELEGRAM_TOKEN")
     if not token:
-        raise RuntimeError("Falta TELEGRAM_TOKEN")
+        logging.error("❌ Falta TELEGRAM_TOKEN. El bot no podrá conectarse a Telegram.")
+        # En vez de detener el contenedor, lo dejamos en un loop infinito suave
+        while True:
+            await asyncio.sleep(60)
 
     bot = Bot(token=token, default=DefaultBotProperties(parse_mode="HTML"))
 
