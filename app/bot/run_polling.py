@@ -2,7 +2,7 @@
 import asyncio
 import logging
 import os
-from minio import Minio  # pip install minio
+from minio import Minio  
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
@@ -14,12 +14,10 @@ from app.bot.router import router
 # ------------------------------------------------------------------------
 # CONFIGURACIÓN MINIO / BUCKET
 # ------------------------------------------------------------------------
-BUCKET_NAME = os.getenv("MINIO_BUCKET_NAME", "Data")
+BUCKET_NAME = os.getenv("MINIO_BUCKET_NAME", "data") 
 
-# 🔹 Debe ser solo host, sin https:// ni puerto
-raw_endpoint = os.getenv("MINIO_PUBLIC_ENDPOINT", "bucket-production-b0dd.up.railway.app")
-MINIO_ENDPOINT = raw_endpoint.replace("https://", "").replace("http://", "").split(":")[0]
-
+# Usa el endpoint privado que Railway expone
+MINIO_ENDPOINT = os.getenv("MINIO_PRIVATE_ENDPOINT", "bucket.railway.internal:9000")
 ACCESS_KEY = os.getenv("MINIO_ROOT_USER")
 SECRET_KEY = os.getenv("MINIO_ROOT_PASSWORD")
 
@@ -32,21 +30,25 @@ os.makedirs(LOCAL_CHROMA_DIR, exist_ok=True)
 # ------------------------------------------------------------------------
 try:
     client = Minio(
-        MINIO_ENDPOINT,
+        MINIO_ENDPOINT.replace("http://", "").replace("https://", ""),
         access_key=ACCESS_KEY,
         secret_key=SECRET_KEY,
-        secure=True  # HTTPS
+        secure=False  
     )
 
     logging.info("🔄 Descargando embeddings desde el bucket...")
 
-    for obj in client.list_objects(BUCKET_NAME, recursive=True):
-        dest_path = os.path.join(LOCAL_CHROMA_DIR, obj.object_name)
-        os.makedirs(os.path.dirname(dest_path), exist_ok=True)
-        client.fget_object(BUCKET_NAME, obj.object_name, dest_path)
-        logging.info(f"✅ Archivo descargado: {obj.object_name}")
+    # Verifica si el bucket existe
+    if not client.bucket_exists(BUCKET_NAME):
+        logging.warning(f"⚠️ El bucket '{BUCKET_NAME}' no existe en MinIO")
+    else:
+        for obj in client.list_objects(BUCKET_NAME, recursive=True):
+            dest_path = os.path.join(LOCAL_CHROMA_DIR, obj.object_name)
+            os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+            client.fget_object(BUCKET_NAME, obj.object_name, dest_path)
+            logging.info(f"✅ Archivo descargado: {obj.object_name}")
 
-    logging.info(f"✅ Descarga completa en {LOCAL_CHROMA_DIR}")
+        logging.info(f"✅ Descarga completa en {LOCAL_CHROMA_DIR}")
 
 except Exception as e:
     logging.warning(f"⚠️ No se pudieron descargar embeddings desde el bucket: {e}")
