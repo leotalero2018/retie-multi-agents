@@ -53,4 +53,4 @@ RUN mkdir -p downloads data/chroma_db
 # -------------------------------
 # CMD principal: Bot de Telegram con Polling
 # -------------------------------
-CMD ["python", "-m", "app.bot.run_polling"]
+#CMD ["python", "-m", "app.bot.run_polling"]
