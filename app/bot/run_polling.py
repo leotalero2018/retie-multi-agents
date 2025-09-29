@@ -13,6 +13,11 @@ load_dotenv()
 from app.bot.router import router
 
 # ------------------------------------------------------------------------
+# CONFIGURACIÓN DE LOGS
+# ------------------------------------------------------------------------
+logging.basicConfig(level=logging.INFO, force=True)
+
+# ------------------------------------------------------------------------
 # CONFIGURACIÓN MINIO / BUCKET
 # ------------------------------------------------------------------------
 BUCKET_NAME = os.getenv("MINIO_BUCKET_NAME", "data")
@@ -27,7 +32,7 @@ SECRET_KEY = os.getenv("MINIO_ROOT_PASSWORD")
 LOCAL_CHROMA_DIR = "./data/chroma_db"
 
 # ------------------------------------------------------------------------
-# DESCARGA DE EMBEDDINGS DESDE EL BUCKET
+# DESCARGA DE EMBEDDINGS DESDE EL BUCKET (SOFT FAIL)
 # ------------------------------------------------------------------------
 try:
     # Borrar cualquier embedding previo para evitar datos viejos
@@ -45,24 +50,24 @@ try:
     logging.info("🔄 Descargando embeddings desde el bucket...")
 
     if not client.bucket_exists(BUCKET_NAME):
-        raise RuntimeError(f"❌ El bucket '{BUCKET_NAME}' no existe en MinIO")
+        logging.warning(f"⚠️ El bucket '{BUCKET_NAME}' no existe en MinIO")
+    else:
+        count = 0
+        for obj in client.list_objects(BUCKET_NAME, recursive=True):
+            dest_path = os.path.join(LOCAL_CHROMA_DIR, obj.object_name)
+            os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+            client.fget_object(BUCKET_NAME, obj.object_name, dest_path)
+            logging.info(f"✅ Archivo descargado: {obj.object_name}")
+            count += 1
 
-    count = 0
-    for obj in client.list_objects(BUCKET_NAME, recursive=True):
-        dest_path = os.path.join(LOCAL_CHROMA_DIR, obj.object_name)
-        os.makedirs(os.path.dirname(dest_path), exist_ok=True)
-        client.fget_object(BUCKET_NAME, obj.object_name, dest_path)
-        logging.info(f"✅ Archivo descargado: {obj.object_name}")
-        count += 1
-
-    if count == 0:
-        raise RuntimeError(f"❌ El bucket '{BUCKET_NAME}' está vacío, no se descargó ningún archivo.")
-
-    logging.info(f"✅ Descarga completa: {count} archivos en {LOCAL_CHROMA_DIR}")
+        if count == 0:
+            logging.warning(f"⚠️ El bucket '{BUCKET_NAME}' está vacío.")
+        else:
+            logging.info(f"✅ Descarga completa: {count} archivos en {LOCAL_CHROMA_DIR}")
 
 except Exception as e:
-    logging.error(f"🚨 Error crítico al descargar embeddings del bucket: {e}")
-    raise  # detenemos el bot si no hay embeddings válidos
+    logging.warning(f"⚠️ No se pudieron descargar embeddings: {e}")
+    logging.warning("➡️ El bot seguirá funcionando con datos locales si existen...")
 
 # ------------------------------------------------------------------------
 # CONFIGURACIÓN DEL BOT
@@ -77,7 +82,6 @@ async def main() -> None:
 
     bot = Bot(token=token, default=DefaultBotProperties(parse_mode="HTML"))
 
-    logging.basicConfig(level=logging.INFO)
     logging.info("🤖 Iniciando bot RETIE...")
     await dp.start_polling(bot)
 
