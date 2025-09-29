@@ -34,7 +34,7 @@ ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
 COPY requirements.txt .
 
 # -------------------------------
-# Instalar PyTorch CPU primero (con enlace oficial) y luego el resto de requirements
+# Instalar PyTorch CPU y demás dependencias
 # -------------------------------
 RUN python -m pip install --upgrade pip && \
     pip install --no-cache-dir torch==2.2.2+cpu -f https://download.pytorch.org/whl/cpu/torch_stable.html && \
@@ -51,6 +51,5 @@ COPY . .
 RUN mkdir -p downloads data/chroma_db
 
 # -------------------------------
-# CMD principal: Bot de Telegram con Polling
+# No CMD aquí -> Railway usará Procfile
 # -------------------------------
-#CMD ["python", "-m", "app.bot.run_polling"]
