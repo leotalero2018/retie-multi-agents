@@ -20,7 +20,7 @@ logging.basicConfig(level=logging.INFO, force=True)
 # ------------------------------------------------------------------------
 # CONFIGURACIÓN MINIO / BUCKET
 # ------------------------------------------------------------------------
-BUCKET_NAME = os.getenv("MINIO_BUCKET_NAME", "data")
+BUCKET_NAME = os.getenv("MINIO_BUCKET_NAME", "embeddings-store")
 MINIO_ENDPOINT = os.getenv("MINIO_PRIVATE_ENDPOINT", "bucket.railway.internal:9000")
 ACCESS_KEY = os.getenv("MINIO_ROOT_USER")
 SECRET_KEY = os.getenv("MINIO_ROOT_PASSWORD")
