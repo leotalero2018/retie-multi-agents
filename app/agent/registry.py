@@ -30,7 +30,7 @@ AGENTS: Dict[str, AgentConfig] = {
     # Agente basado en PDFPlumber 
     "plumber": AgentConfig(
         key="plumber",
-        collection="retie_plumber",
+        collection="retie_docs",
         chat_model="gpt-4o-mini",    
         top_k=4,
         system_prompt="Eres un asistente experto en RETIE. Sé preciso y cita [archivo, página]."

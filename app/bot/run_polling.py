@@ -1,84 +1,59 @@
 # app/bot/run_polling.py
+# Run with: python -m app.bot.run_polling
+from __future__ import annotations
+
 import asyncio
 import logging
 import os
-import shutil
-from minio import Minio
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from dotenv import load_dotenv
-load_dotenv()
-
+from app.config import settings
+from app.bootstrap_sync import sync_chroma_from_minio
 from app.bot.router import router
 
-# ------------------------------------------------------------------------
-# CONFIGURACIÓN DE LOGS
-# ------------------------------------------------------------------------
+os.makedirs(settings.CHROMA_PERSIST_DIR, exist_ok=True)
+sync_chroma_from_minio()
+
+# Load env (local dev)
+load_dotenv()
+
 logging.basicConfig(level=logging.INFO, force=True)
 
-# ------------------------------------------------------------------------
-# CONFIGURACIÓN MINIO / BUCKET
-# ------------------------------------------------------------------------
-BUCKET_NAME = os.getenv("MINIO_BUCKET_NAME", "embeddings-store")
-MINIO_ENDPOINT = os.getenv("MINIO_PRIVATE_ENDPOINT", "bucket.railway.internal:9000")
-ACCESS_KEY = os.getenv("MINIO_ROOT_USER")
-SECRET_KEY = os.getenv("MINIO_ROOT_PASSWORD")
-LOCAL_CHROMA_DIR = "./data/chroma_db"
+# Optional: auto-sync Chroma from S3 bucket at startup
+def _maybe_sync_from_bucket():
+    if os.getenv("AUTO_SYNC_FROM_BUCKET", "false").lower() not in ("1", "true", "yes"):
+        return
+    try:
+        from app.services.storage_s3 import download_folder
+        bucket = os.getenv("S3_BUCKET_NAME")
+        prefix = os.getenv("S3_PREFIX", "chroma_db/")
+        persist = os.getenv("CHROMA_PERSIST_DIR", "./data/chroma_db")
+        if not bucket:
+            logging.warning("AUTO_SYNC_FROM_BUCKET is enabled but S3_BUCKET_NAME is missing.")
+            return
+        logging.info(f"🔄 Syncing Chroma from s3://{bucket}/{prefix} -> {persist}")
+        download_folder(bucket=bucket, prefix=prefix, local_dir=persist)
+        logging.info("✅ Sync complete.")
+    except Exception as e:
+        logging.error(f"⚠️ Could not sync from bucket: {e}")
 
-# ------------------------------------------------------------------------
-# DESCARGA DE EMBEDDINGS DESDE EL BUCKET (SOFT FAIL)
-# ------------------------------------------------------------------------
-try:
-    if os.path.exists(LOCAL_CHROMA_DIR):
-        shutil.rmtree(LOCAL_CHROMA_DIR)
-    os.makedirs(LOCAL_CHROMA_DIR, exist_ok=True)
-
-    client = Minio(
-        MINIO_ENDPOINT,
-        access_key=ACCESS_KEY,
-        secret_key=SECRET_KEY,
-        secure=False
-    )
-
-    logging.info("🔄 Descargando embeddings desde el bucket...")
-
-    if not client.bucket_exists(BUCKET_NAME):
-        logging.warning(f"⚠️ El bucket '{BUCKET_NAME}' no existe en MinIO")
-    else:
-        count = 0
-        for obj in client.list_objects(BUCKET_NAME, recursive=True):
-            dest_path = os.path.join(LOCAL_CHROMA_DIR, obj.object_name)
-            os.makedirs(os.path.dirname(dest_path), exist_ok=True)
-            client.fget_object(BUCKET_NAME, obj.object_name, dest_path)
-            logging.info(f"✅ Archivo descargado: {obj.object_name}")
-            count += 1
-
-        if count == 0:
-            logging.warning(f"⚠️ El bucket '{BUCKET_NAME}' está vacío.")
-        else:
-            logging.info(f"✅ Descarga completa: {count} archivos en {LOCAL_CHROMA_DIR}")
-
-except Exception as e:
-    logging.warning(f"⚠️ No se pudieron descargar embeddings: {e}")
-    logging.warning("➡️ El bot seguirá funcionando con datos locales si existen...")
-
-# ------------------------------------------------------------------------
-# CONFIGURACIÓN DEL BOT
-# ------------------------------------------------------------------------
 dp = Dispatcher()
 dp.include_router(router)
 
 async def main() -> None:
-    token = os.environ.get("TELEGRAM_TOKEN")
+    # Support both TELEGRAM_BOT_TOKEN (new) and TELEGRAM_TOKEN (legacy)
+    token = os.environ.get("TELEGRAM_BOT_TOKEN") or os.environ.get("TELEGRAM_TOKEN")
     if not token:
-        logging.error("❌ Falta TELEGRAM_TOKEN. El bot no podrá conectarse a Telegram.")
-        # En vez de detener el contenedor, lo dejamos en un loop infinito suave
+        logging.error("❌ Missing TELEGRAM_BOT_TOKEN (or TELEGRAM_TOKEN). Bot cannot start.")
+        # Keep process alive for container health checks without hammering CPU
         while True:
             await asyncio.sleep(60)
 
-    bot = Bot(token=token, default=DefaultBotProperties(parse_mode="HTML"))
+    _maybe_sync_from_bucket()
 
+    bot = Bot(token=token, default=DefaultBotProperties(parse_mode="HTML"))
     logging.info("🤖 Iniciando bot RETIE...")
     await dp.start_polling(bot)
 

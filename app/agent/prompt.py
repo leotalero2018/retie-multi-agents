@@ -3,21 +3,26 @@ from typing import List, Dict
 # Two templates:
 # - USER: no citations requested
 # - ADMIN: asks the model to cite [archivo, página]
+
 PROMPT_TEMPLATE_USER = (
-    "Eres un experto en RETIE. Usa únicamente la información provista en CONTEXTO.\n"
-    "Si no hay información suficiente, responde: 'No tengo evidencia en los documentos.'\n\n"
+    "Eres un experto en RETIE. Usa exclusivamente la información provista en CONTEXTO.\n"
+    "Si la respuesta literal no aparece, redacta el mejor resumen posible con lo disponible "
+    "No cites archivos ni páginas.\n\n"
     "CONTEXTO:\n{context}\n\n"
     "Pregunta: {question}\n"
-    "Responde en español, de forma breve y clara."
+    "Responde en español, breve y claro."
 )
 
 PROMPT_TEMPLATE_ADMIN = (
-    "Eres un experto en RETIE. Usa únicamente la información provista en CONTEXTO.\n"
-    "Si no hay información suficiente, responde: 'No tengo evidencia en los documentos.'\n\n"
+    "Eres un experto en RETIE. Usa exclusivamente la información provista en CONTEXTO.\n"
+    "Si la respuesta literal no aparece, redacta el mejor resumen posible con lo disponible "
+    "y cita en formato [archivo, página] cada idea relevante. Evita decir 'No tengo evidencia...' "
+    "cuando el CONTEXTO contenga información relacionada.\n\n"
     "CONTEXTO:\n{context}\n\n"
     "Pregunta: {question}\n"
     "Responde en español, conciso y con citas en formato [archivo, página]."
 )
+
 
 
 def build_context(blocks: List[Dict], *, include_meta: bool) -> str:

@@ -1,4 +1,6 @@
 # app/bot/router.py
+from __future__ import annotations
+
 import os
 import re
 import asyncio
@@ -9,11 +11,11 @@ from aiogram.enums import ChatAction
 from aiogram.types import Message
 from aiogram.filters import CommandStart, Command
 
-from app.config import settings
-from app.agent.registry import AGENTS
-from app.agent.graph import run_graph
-from app.retriever.chroma_client import get_collection
+from app.agent.retie_agent import RetieAgent
+from app.agent.registry import AGENTS as _AGENTS  # optional registry (may be empty)
 
+# Single agent instance
+_agent = RetieAgent()
 router = Router(name="telegram_router")
 
 # -----------------------------------------------------------------------------
@@ -36,7 +38,6 @@ def _is_admin(user_id: Optional[int]) -> bool:
 def _require_admin(message: Message) -> bool:
     uid = message.from_user.id if message.from_user else None
     if not _is_admin(uid):
-        # Keep reply generic (don’t leak policy)
         asyncio.create_task(message.answer("⛔ Comando solo para administradores."))
         return False
     return True
@@ -45,7 +46,7 @@ def _require_admin(message: Message) -> bool:
 # Chat state
 # -----------------------------------------------------------------------------
 CHAT_AGENT: Dict[int, str] = {}
-DEFAULT_AGENT = "plumber"
+DEFAULT_AGENT = "plumber"  # keeps your previous default
 LAST_QUERY: Dict[int, str] = {}
 
 # -----------------------------------------------------------------------------
@@ -66,8 +67,8 @@ _INLINE_BRACKET_CITE_RE = re.compile(
         (?:
             \d{1,3}
             (?:\s*[-–]\s*\d{1,3})?
-            (?:\s*,\s*(?:p|pp)\.?\s*\d+)?
-            (?:\s*,\s*\d{1,3})*
+            (?:\s*,\s*(?:p|pp)\.?\s*\d+)?      # page refs
+            (?:\s*,\s*\d{1,3})*                # extra cites
         )
         \s*
     \]
@@ -103,25 +104,31 @@ async def on_start(message: Message):
 
 @router.message(Command("agent"))
 async def on_agent(message: Message):
+    # /agent <key>
     parts = (message.text or "").strip().split()
     if len(parts) < 2:
         return await message.answer("Formato: /agent <key>")
     key = parts[1].lower()
-    if key not in AGENTS:
+    # If registry present and key must exist there; otherwise allow free text to route collections
+    if _AGENTS and key not in _AGENTS:
         return await message.answer("Agente inválido.")
     CHAT_AGENT[message.chat.id] = key
-    cfg = AGENTS[key]
-    await message.answer(
-        f"✅ Agente: {key} (modelo={cfg.resolved_chat_model()}, colección={cfg.collection})"
-    )
+    if _AGENTS and key in _AGENTS:
+        cfg = _AGENTS[key]
+        return await message.answer(
+            f"✅ Agente: {key} (modelo={cfg.resolved_chat_model()}, colección={cfg.collection})"
+        )
+    await message.answer(f"✅ Agente: {key}")
 
 @router.message(Command("who"))
 async def on_who(message: Message):
     key = CHAT_AGENT.get(message.chat.id, DEFAULT_AGENT)
-    cfg = AGENTS[key]
-    await message.answer(
-        f"Agente actual: {key} (modelo={cfg.resolved_chat_model()}, colección={cfg.collection})"
-    )
+    if _AGENTS and key in _AGENTS:
+        cfg = _AGENTS[key]
+        return await message.answer(
+            f"Agente actual: {key} (modelo={cfg.resolved_chat_model()}, colección={cfg.collection})"
+        )
+    await message.answer(f"Agente actual: {key}")
 
 # -----------------------------------------------------------------------------
 # Admin authentication
@@ -148,63 +155,52 @@ async def on_admin_logout(message: Message):
 # -----------------------------------------------------------------------------
 # Admin-only commands
 # -----------------------------------------------------------------------------
-@router.message(Command("debug"))
-async def on_debug(message: Message):
-    if not _require_admin(message):
-        return
-    key = CHAT_AGENT.get(message.chat.id, DEFAULT_AGENT)
-    cfg = AGENTS[key]
-    try:
-        col = get_collection(cfg.collection)
-        metadatas = col.get().get("metadatas", [])
-        pdfs = sorted({m.get("source", "desconocido") for m in metadatas})
-        total_chunks = len(metadatas)
-    except Exception as e:
-        pdfs = []
-        total_chunks = f"error: {e}"
-    await message.answer(
-        f"CHROMA_DB_DIR={settings.CHROMA_DB_DIR}\n"
-        f"Agente={key}\nColección={cfg.collection}\n"
-        f"Total chunks={total_chunks}\n"
-        f"PDFs indexados:\n- " + ("\n- ".join(pdfs) if pdfs else "(ninguno)")
-    )
-
 @router.message(Command("docs"))
 async def on_docs(message: Message):
+    """
+    Returns top-k doc headers for the last query, using the same retrieval as the agent.
+    """
     if not _require_admin(message):
         return
+
     parts = (message.text or "").strip().split()
     try:
         k = int(parts[1]) if len(parts) >= 2 else 5
         k = max(1, min(20, k))
     except ValueError:
         k = 5
+
     last_q = LAST_QUERY.get(message.chat.id)
     if not last_q:
         return await message.answer("No hay una consulta previa en este chat. Envía una pregunta primero.")
 
     key = CHAT_AGENT.get(message.chat.id, DEFAULT_AGENT)
-    cfg = AGENTS[key]
+
+    # Use the agent's retrieval via a tiny helper call (without LLM)
+    # We reuse the internal logic by calling answer with admin=True but not ideal for docs list.
+    # Instead, we expose a lightweight retrieval by importing the same search used by the agent:
     try:
-        col = get_collection(cfg.collection)
-        result = col.query(query_texts=[last_q], n_results=k)
-        metadatas_lists: List[List[dict]] = result.get("metadatas", [[]])
-        mlist = metadatas_lists[0] if metadatas_lists else []
+        from app.retriever.retrieve import search  # same function agent uses
+        from app.agent.retie_agent import _resolve_collection, _dedupe_hits
+
+        coll = _resolve_collection(agent_key=key, explicit=None)
+        hits = _dedupe_hits(search(last_q, top_k=k, collection_name=coll))
+
+        if not hits:
+            return await message.answer("No se encontraron documentos para la última consulta.")
 
         seen = set()
-        lines = []
-        for i, m in enumerate(mlist, start=1):
-            src = m.get("source", "desconocido")
-            page = m.get("page", m.get("page_number", ""))
-            title = m.get("title", os.path.basename(src) if isinstance(src, str) else "desconocido")
+        lines: List[str] = []
+        for i, h in enumerate(hits, start=1):
+            meta = h.get("meta", {})
+            src = meta.get("source", "desconocido")
+            page = meta.get("page", meta.get("page_number", ""))
+            title = meta.get("title", os.path.basename(src) if isinstance(src, str) else "desconocido")
             key_uniq = (src, page, title)
             if key_uniq in seen:
                 continue
             seen.add(key_uniq)
             lines.append(f"{i}. {title}  (src={src}, page={page})")
-
-        if not lines:
-            return await message.answer("No se encontraron documentos para la última consulta.")
 
         await message.answer("📄 Documentos más relevantes para la última consulta:\n" + "\n".join(lines))
     except Exception as e:
@@ -222,13 +218,16 @@ async def on_text(message: Message):
 
     LAST_QUERY[message.chat.id] = q
 
-    # typing action through the message's bot (no global Bot needed)
+    # typing action via the message's bot
     await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
 
+    # Offload blocking LLM call from event loop
     loop = asyncio.get_running_loop()
-    raw_resp = await loop.run_in_executor(None, run_graph, q, user_id, session_id, agent_key)
+    raw_resp = await loop.run_in_executor(
+        None,
+        lambda: _agent.answer(q, agent_key=agent_key, is_admin=_is_admin(message.from_user.id if message.from_user else None)),
+    )
 
     is_admin = _is_admin(message.from_user.id if message.from_user else None)
     resp = _clean_for_user(raw_resp, is_admin)
-
     await message.answer(resp)

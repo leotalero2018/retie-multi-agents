@@ -1,64 +1,45 @@
 # app/api/debug.py
+# Debug endpoint to list objects in your Railway S3-compatible bucket (e.g., MinIO/Spaces/S3).
+# Requires env: S3_ENDPOINT_URL, S3_BUCKET_NAME, S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY
+# Optional protection: MINIO_DEBUG_SECRET (query param ?secret=)
+
 import os
-import urllib.parse
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from typing import List
+import boto3
 
 router = APIRouter()
 
-# Intentaremos usar tu MinIOHandler si existe; si no, caemos a una conexión directa.
-try:
-    from app.ingestion.minio_handler import MinIOHandler  # nombre que creaste
-except Exception:
-    MinIOHandler = None
+def _s3():
+    return boto3.client(
+        "s3",
+        endpoint_url=os.getenv("S3_ENDPOINT_URL"),
+        aws_access_key_id=os.getenv("S3_ACCESS_KEY_ID"),
+        aws_secret_access_key=os.getenv("S3_SECRET_ACCESS_KEY"),
+        region_name=os.getenv("S3_REGION", "auto"),
+    )
 
-@router.get("/debug/minio")
-def debug_minio(secret: str | None = None):
+@router.get("/debug/bucket")
+def debug_bucket(secret: str | None = Query(default=None), prefix: str = "chroma_db/"):
     """
-    Endpoint de debug que lista los PDFs dentro del bucket MINIO_BUCKET.
-    Opcionalmente protegido por MINIO_DEBUG_SECRET (valor en env).
+    Lists objects under the given prefix in S3 bucket (Railway).
+    Protected by MINIO_DEBUG_SECRET if set.
     """
-    # --- seguridad opcional ---
     debug_secret = os.getenv("MINIO_DEBUG_SECRET")
-    if debug_secret:
-        if secret != debug_secret:
-            raise HTTPException(status_code=403, detail="Forbidden")
+    if debug_secret and secret != debug_secret:
+        raise HTTPException(status_code=403, detail="Forbidden")
 
-    bucket = os.getenv("MINIO_BUCKET", "data")
+    bucket = os.getenv("S3_BUCKET_NAME")
+    if not bucket:
+        raise HTTPException(status_code=500, detail="S3_BUCKET_NAME not configured")
 
     try:
-        # 1) Si existe tu clase MinIOHandler, úsala
-        if MinIOHandler:
-            handler = MinIOHandler(bucket_name=bucket)
-            pdfs: List[str] = handler.list_pdfs()
-            return {"ok": True, "pdfs": pdfs}
-
-        # 2) Si no existe, creamos cliente Minio "manualmente"
-        from minio import Minio
-
-        endpoint = os.getenv("MINIO_ENDPOINT") or os.getenv("MINIO_PUBLIC_ENDPOINT")
-        if not endpoint:
-            raise RuntimeError("No MINIO_ENDPOINT found in environment")
-
-        # Si endpoint tiene esquema, extraemos host:port para Minio constructor
-        if endpoint.startswith("http"):
-            parsed = urllib.parse.urlparse(endpoint)
-            endpoint_host = parsed.netloc
-            # preserve scheme for secure
-            secure = parsed.scheme == "https"
-        else:
-            endpoint_host = endpoint
-            secure = True
-
-        client = Minio(
-            endpoint_host,
-            access_key=os.getenv("MINIO_ROOT_USER"),
-            secret_key=os.getenv("MINIO_ROOT_PASSWORD"),
-            secure=secure,
-        )
-
-        pdfs = [obj.object_name for obj in client.list_objects(bucket)]
-        return {"ok": True, "pdfs": pdfs}
-
+        s3 = _s3()
+        keys: List[str] = []
+        paginator = s3.get_paginator("list_objects_v2")
+        for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+            for obj in page.get("Contents", []):
+                keys.append(obj["Key"])
+        return {"ok": True, "bucket": bucket, "prefix": prefix, "objects": keys}
     except Exception as e:
         return {"ok": False, "error": str(e)}

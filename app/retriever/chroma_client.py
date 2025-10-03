@@ -1,29 +1,37 @@
 # app/retriever/chroma_client.py
-from typing import Any
+from __future__ import annotations
+
+import os
+from typing import Any, Dict
+
 import chromadb
 from chromadb import PersistentClient
-from app.config import settings
+from chromadb.config import Settings
 
-# Create a single persistent Chroma client pointing to the same directory used at runtime
-_client: PersistentClient = chromadb.PersistentClient(path=settings.CHROMA_DB_DIR)
+# Support both new and legacy envs
+_PERSIST_DIR = os.getenv("CHROMA_PERSIST_DIR") or os.getenv("CHROMA_DB_DIR", "./data/chroma_db")
+_DEFAULT_COLLECTION = os.getenv("COLLECTION_NAME", "retie_docs")
 
-# Local cache of collections (per-process)
-_collections: dict[str, Any] = {}
+# Single persistent client for the process
+_client: PersistentClient = chromadb.PersistentClient(
+    path=_PERSIST_DIR,
+    settings=Settings(anonymized_telemetry=False),
+)
+
+# Per-process collection cache
+_collections: Dict[str, Any] = {}
 
 
 def get_collection(name: str | None = None):
     """
-    Returns or creates a collection by name and caches it in this process.
+    Get or create a Chroma collection by name; cached per process.
     IMPORTANT:
-      - Do NOT attach any embedding_function here to avoid EF conflicts
-        with persisted/default collection configuration.
-      - Distance space is set via metadata only.
+      - Do NOT attach embedding_function; we store embeddings explicitly.
+      - Use cosine space so distances are interpretable vs. a cosine threshold.
     """
-    col_name = name or settings.COLLECTION_NAME
+    col_name = name or _DEFAULT_COLLECTION
 
     if col_name not in _collections:
-        # Ensure collection exists WITHOUT embedding_function to prevent conflicts.
-        # Use cosine space so distances are comparable to cosine similarity thresholds.
         try:
             col = _client.get_collection(col_name)
         except Exception:
@@ -37,10 +45,10 @@ def get_collection(name: str | None = None):
 
 
 def drop_collection(name: str):
-    """Drops the collection entirely and clears local cache."""
+    """Drop the collection and clear local cache (safe if missing)."""
     try:
         _client.delete_collection(name)
         print(f"✅ Collection {name} deleted.")
     except Exception:
-        print(f"⚠ Collection {name} did not exist; continuing.")
+        print(f"⚠ Collection {name} not found; skipping delete.")
     _collections.pop(name, None)
