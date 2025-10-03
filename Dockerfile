@@ -1,6 +1,8 @@
 # syntax=docker/dockerfile:1.7
 FROM python:3.11-slim
 
+TEST-DEBUG, SE CONGELA EL SERVICIO POR EL MOMENTO
+
 # -------------------------------
 # System deps (include OCR/FFmpeg only if you use them)
 # -------------------------------
