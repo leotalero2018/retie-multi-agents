@@ -2,7 +2,7 @@
 FROM python:3.11-slim
 
 # -------------------------------
-# Dependencias del sistema
+# System deps (minimal, include OCR/FFmpeg if you use them)
 # -------------------------------
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
@@ -12,44 +12,48 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
  && rm -rf /var/lib/apt/lists/*
 
 # -------------------------------
-# Directorio de trabajo
+# Workdir
 # -------------------------------
 WORKDIR /app
 
 # -------------------------------
-# Variables de entorno útiles
+# Useful env (align both CHROMA_* paths)
 # -------------------------------
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_DEFAULT_TIMEOUT=100 \
     PIP_RETRIES=5 \
+    PYTHONUNBUFFERED=1 \
     PYTHONPATH=/app \
-    CHROMA_DB_DIR=/app/data/chroma_db \
+    CHROMA_DB_DIR=/data/chroma_db \
+    CHROMA_PERSIST_DIR=/data/chroma_db \
     COLLECTION_NAME=retie_docs \
     EMBEDDING_MODEL=text-embedding-3-small \
     CHAT_MODEL=gpt-4o-mini
 
 # -------------------------------
-# Copiar requirements primero para usar cache
+# Copy requirements first for layer cache
 # -------------------------------
 COPY requirements.txt .
 
 # -------------------------------
-# Instalar PyTorch CPU y demás dependencias
+# Install deps (incl. minio via requirements)
 # -------------------------------
 RUN python -m pip install --upgrade pip && \
     pip install --no-cache-dir torch==2.2.2+cpu -f https://download.pytorch.org/whl/cpu/torch_stable.html && \
     pip install --no-cache-dir -r requirements.txt --progress-bar off
 
 # -------------------------------
-# Copiar código fuente
+# Copy source
 # -------------------------------
 COPY . .
 
 # -------------------------------
-# Crear carpetas necesarias
+# Create needed dirs (mounted volume path)
 # -------------------------------
-RUN mkdir -p downloads data/chroma_db
+RUN mkdir -p /data/chroma_db /app/downloads
 
 # -------------------------------
-# No CMD aquí -> Railway usará Procfile
+# No CMD here if Railway uses a start command/Procfile.
+# Example start command in Railway:
+#   python -m app.bot.run_polling
 # -------------------------------
