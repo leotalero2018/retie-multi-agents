@@ -45,6 +45,27 @@ async def main() -> None:
     except Exception as e:
         logging.error("[CHK] ERROR checking collection: %s", e)
 
+    # Deep diag: listar todas las colecciones y sus counts en la BD en disco
+    try:
+        import chromadb
+        from app.config import settings
+
+        cli = chromadb.PersistentClient(path=settings.CHROMA_DB_DIR)
+        cols = cli.list_collections()
+        if not cols:
+            logging.error("[CHK2] No collections found in DB at %s", settings.CHROMA_DB_DIR)
+        else:
+            logging.info("[CHK2] Collections present in DB:")
+            for c in cols:
+                try:
+                    cnt = cli.get_collection(c.name).count()
+                except Exception as e:
+                    cnt = f"error: {e}"
+                logging.info("   - name=%s  count=%s", c.name, cnt)
+    except Exception as e:
+        logging.error("[CHK2] ERROR listing collections: %s", e)
+        
+
     # Token: support new TELEGRAM_BOT_TOKEN and legacy TELEGRAM_TOKEN
     token = os.environ.get("TELEGRAM_BOT_TOKEN") or os.environ.get("TELEGRAM_TOKEN")
     if not token:
