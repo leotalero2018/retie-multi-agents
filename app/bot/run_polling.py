@@ -6,52 +6,52 @@ import asyncio
 import logging
 import os
 
+from dotenv import load_dotenv
+
+# Load local env first (dev); pydantic-settings also loads .env but this is harmless
+load_dotenv()
+
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
-from dotenv import load_dotenv
+
 from app.config import settings
 from app.bootstrap_sync import sync_chroma_from_minio
 from app.bot.router import router
 
-os.makedirs(settings.CHROMA_PERSIST_DIR, exist_ok=True)
-sync_chroma_from_minio()
-
-# Load env (local dev)
-load_dotenv()
-
+# ------------------------------------------------------------------------
+# LOGGING
+# ------------------------------------------------------------------------
 logging.basicConfig(level=logging.INFO, force=True)
 
-# Optional: auto-sync Chroma from S3 bucket at startup
-def _maybe_sync_from_bucket():
-    if os.getenv("AUTO_SYNC_FROM_BUCKET", "false").lower() not in ("1", "true", "yes"):
-        return
-    try:
-        from app.services.storage_s3 import download_folder
-        bucket = os.getenv("S3_BUCKET_NAME")
-        prefix = os.getenv("S3_PREFIX", "chroma_db/")
-        persist = os.getenv("CHROMA_PERSIST_DIR", "./data/chroma_db")
-        if not bucket:
-            logging.warning("AUTO_SYNC_FROM_BUCKET is enabled but S3_BUCKET_NAME is missing.")
-            return
-        logging.info(f"🔄 Syncing Chroma from s3://{bucket}/{prefix} -> {persist}")
-        download_folder(bucket=bucket, prefix=prefix, local_dir=persist)
-        logging.info("✅ Sync complete.")
-    except Exception as e:
-        logging.error(f"⚠️ Could not sync from bucket: {e}")
-
+# Dispatcher + routes
 dp = Dispatcher()
 dp.include_router(router)
 
 async def main() -> None:
-    # Support both TELEGRAM_BOT_TOKEN (new) and TELEGRAM_TOKEN (legacy)
+    # Ensure persist dir exists (POSIX path on Railway)
+    os.makedirs(settings.CHROMA_PERSIST_DIR, exist_ok=True)
+
+    # Sync Chroma DB from MinIO (only downloads if DB isn't ready or MINIO_FORCE_SYNC=true)
+    sync_chroma_from_minio()
+
+    # Sanity check: print collection count so we know DB is actually there
+    try:
+        from app.retriever.chroma_client import get_collection
+        col = get_collection(settings.COLLECTION_NAME)
+        logging.info(
+            f"[CHK] Collection='{settings.COLLECTION_NAME}' "
+            f"count={col.count()}  dir={settings.CHROMA_PERSIST_DIR}"
+        )
+    except Exception as e:
+        logging.error("[CHK] ERROR checking collection: %s", e)
+
+    # Token: support new TELEGRAM_BOT_TOKEN and legacy TELEGRAM_TOKEN
     token = os.environ.get("TELEGRAM_BOT_TOKEN") or os.environ.get("TELEGRAM_TOKEN")
     if not token:
         logging.error("❌ Missing TELEGRAM_BOT_TOKEN (or TELEGRAM_TOKEN). Bot cannot start.")
-        # Keep process alive for container health checks without hammering CPU
+        # Keep process alive for health checks without CPU burn
         while True:
             await asyncio.sleep(60)
-
-    _maybe_sync_from_bucket()
 
     bot = Bot(token=token, default=DefaultBotProperties(parse_mode="HTML"))
     logging.info("🤖 Iniciando bot RETIE...")
