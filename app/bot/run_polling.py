@@ -109,7 +109,7 @@ async def main() -> None:
             await asyncio.sleep(60)
 
     bot = Bot(token=token, default=DefaultBotProperties(parse_mode="HTML"))
-    logging.info("🤖 Iniciando bot RETIE...")
+    logging.info("🤖 Iniciando bot RETIE..")
     await dp.start_polling(bot)
 
 
