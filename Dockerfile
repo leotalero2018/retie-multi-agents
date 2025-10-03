@@ -2,7 +2,7 @@
 FROM python:3.11-slim
 
 # -------------------------------
-# System deps (minimal, include OCR/FFmpeg if you use them)
+# System deps (include OCR/FFmpeg only if you use them)
 # -------------------------------
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
@@ -31,16 +31,17 @@ ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
     CHAT_MODEL=gpt-4o-mini
 
 # -------------------------------
-# Copy requirements first for layer cache
+# Copy requirements first (better cache)
 # -------------------------------
 COPY requirements.txt .
 
 # -------------------------------
-# Install deps (incl. minio via requirements)
+# Install deps (explicitly ensure minio is present)
 # -------------------------------
 RUN python -m pip install --upgrade pip && \
     pip install --no-cache-dir torch==2.2.2+cpu -f https://download.pytorch.org/whl/cpu/torch_stable.html && \
-    pip install --no-cache-dir -r requirements.txt --progress-bar off
+    pip install --no-cache-dir -r requirements.txt --progress-bar off && \
+    pip install --no-cache-dir minio==7.2.16
 
 # -------------------------------
 # Copy source
@@ -48,12 +49,10 @@ RUN python -m pip install --upgrade pip && \
 COPY . .
 
 # -------------------------------
-# Create needed dirs (mounted volume path)
+# Create runtime dirs
 # -------------------------------
 RUN mkdir -p /data/chroma_db /app/downloads
 
 # -------------------------------
-# No CMD here if Railway uses a start command/Procfile.
-# Example start command in Railway:
-#   python -m app.bot.run_polling
+# Start command is provided by Railway (e.g. python -m app.bot.run_polling)
 # -------------------------------
