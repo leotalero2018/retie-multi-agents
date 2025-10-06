@@ -9,6 +9,7 @@ from app.agent.retie_agent import RetieAgent  # new minimal agent
 from app.api.debug import router as debug_router
 from app.api import ingest
 
+
 # Optional observability: if not present, silently no-op
 try:
     from app.observability.obs import trace_ctx, span_ctx, log_generation
@@ -81,3 +82,26 @@ else:
     @app.post("/telegram/webhook")
     async def telegram_webhook_disabled(_: Request):
         return {"status": "disabled", "reason": "TELEGRAM_BOT_TOKEN not configured"}
+    
+# --- File serving (GridFS) ---
+from fastapi import HTTPException
+from fastapi.responses import Response
+try:
+    from app.services.mongo_store import get_image_bytes
+except Exception:
+    get_image_bytes = None  # degrade gracefully if Mongo not configured
+
+@app.get("/files/{file_id}")
+def get_file(file_id: str):
+    if get_image_bytes is None:
+        raise HTTPException(status_code=503, detail="File service disabled")
+    try:
+        data, ctype, fname = get_image_bytes(file_id)
+    except Exception:
+        raise HTTPException(status_code=404, detail="File not found")
+    return Response(
+        content=data,
+        media_type=ctype,
+        headers={"Content-Disposition": f'inline; filename="{fname}"'}
+    )
+   

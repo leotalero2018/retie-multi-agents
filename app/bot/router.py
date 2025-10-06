@@ -16,6 +16,9 @@ from aiogram.filters import CommandStart, Command
 from app.agent.retie_agent import RetieAgent
 from app.agent.registry import AGENTS as _AGENTS  # optional registry
 
+# Mongo GridFS saver (make sure MONGO_URI, MONGO_DB, MONGO_BUCKET are set)
+from app.services.mongo_store import save_image_from_path
+
 # --- create router FIRST (before any @router.message decorators) ---
 router = Router(name="telegram_router")
 
@@ -232,6 +235,91 @@ async def _download_image_best(bot, photo_sizes) -> Path:
     await bot.download_file(tg_file.file_path, destination=tmp)
     return tmp
 
+async def _download_image_document(bot, document) -> Path:
+    """Download an image sent as document into temp and return path."""
+    suffix = Path(document.file_name or "image.jpg").suffix or ".jpg"
+    tg_file = await bot.get_file(document.file_id)
+    tf = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+    tmp = Path(tf.name)
+    tf.close()
+    await bot.download_file(tg_file.file_path, destination=tmp)
+    return tmp
+
+async def _handle_image_common(message: Message, img_path: Path):
+    """Shared pipeline: save → read question → RAG answer."""
+    # 0) Persist to Mongo (best-effort)
+    mongo_id = None
+    try:
+        mongo_id = save_image_from_path(
+            img_path,
+            filename=f"tg_{message.chat.id}_{message.message_id}{img_path.suffix or '.jpg'}",
+            content_type="image/jpeg",
+            metadata={
+                "chat_id": message.chat.id,
+                "user_id": message.from_user.id if message.from_user else None,
+                "caption": message.caption or "",
+                "source": "telegram",
+            },
+        )
+    except Exception:
+        mongo_id = None
+
+    # 1) Try to read the user's question from the image (OCR → Vision fallback)
+    recognized_q = ""
+    try:
+        recognized_q = extract_question_from_image(img_path)
+    except Exception:
+        recognized_q = ""
+
+    if not recognized_q:
+        recognized_q = (message.caption or "").strip()
+        if not recognized_q:
+            try:
+                recognized_q = vision_extract_insights(img_path) or ""
+            except Exception:
+                recognized_q = ""
+
+    if not recognized_q:
+        return await message.answer(
+            "No pude leer claramente la pregunta de la imagen. "
+            "Prueba con una foto más nítida o envíala con mayor resolución."
+        )
+
+    agent_key = CHAT_AGENT.get(message.chat.id, DEFAULT_AGENT)
+    LAST_QUERY[message.chat.id] = recognized_q
+    is_admin = _is_admin(message.from_user.id if message.from_user else None)
+
+    # Optional: show what was read & GridFS link (admins only)
+    if is_admin:
+        text = f"🖼️ Leí esta pregunta:\n“{recognized_q}”"
+        if mongo_id:
+            text += f"\n💾 Guardada: /files/{mongo_id}"
+        await message.answer(text)
+
+    user_id = str(message.from_user.id) if message.from_user else None
+    meta = {"agent_key": agent_key, "chat_id": message.chat.id, "via": "image"}
+
+    with trace_ctx("telegram.image", user_id=user_id, metadata=meta) as tr:
+        with span_ctx(tr, "agent.answer", metadata={"question": recognized_q}):
+            loop = asyncio.get_running_loop()
+            raw = await loop.run_in_executor(
+                None,
+                lambda: _agent.answer(recognized_q, agent_key=agent_key, is_admin=is_admin),
+            )
+        try:
+            log_generation(
+                tr, name="openai.chat",
+                input_text=recognized_q,
+                output_text=raw,
+                model=getattr(settings, "CHAT_MODEL", "gpt-4o-mini"),
+                usage={}, metadata={"via": "image", "agent_key": agent_key},
+            )
+        except Exception:
+            pass
+
+    resp = _clean_for_user(raw, is_admin)
+    await message.answer(resp)
+
 
 # ----------------------- VOICE/AUDIO -----------------------
 
@@ -295,61 +383,14 @@ async def on_voice(message: Message):
     await message.answer(resp)
 
 
-# ----------------------- IMAGES (photo + image document) -----------------------
+# ----------------------- IMAGES -----------------------
 
 @router.message(F.photo)
 async def on_photo(message: Message):
     await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
-
     img_path = await _download_image_best(message.bot, message.photo)
-
     try:
-        # 1) try to read the user's question from the image (OCR → Vision fallback)
-        recognized_q = extract_question_from_image(img_path)
-        # 2) if we still have nothing, try a generic insights read (diagrams/tables)
-        if not recognized_q:
-            recognized_q = (message.caption or "").strip()
-            if not recognized_q:
-                recognized_q = vision_extract_insights(img_path) or ""
-
-        if not recognized_q:
-            return await message.answer(
-                "No pude leer claramente la pregunta de la imagen. "
-                "Prueba con una foto más nítida o envíala con mayor resolución."
-            )
-
-        agent_key = CHAT_AGENT.get(message.chat.id, DEFAULT_AGENT)
-        LAST_QUERY[message.chat.id] = recognized_q
-        is_admin = _is_admin(message.from_user.id if message.from_user else None)
-
-        # Optional: show what was read (only to admins)
-        if is_admin:
-            await message.answer(f"🖼️ Leí esta pregunta:\n“{recognized_q}”")
-
-        user_id = str(message.from_user.id) if message.from_user else None
-        meta = {"agent_key": agent_key, "chat_id": message.chat.id, "via": "image"}
-
-        with trace_ctx("telegram.photo", user_id=user_id, metadata=meta) as tr:
-            with span_ctx(tr, "agent.answer", metadata={"question": recognized_q}):
-                loop = asyncio.get_running_loop()
-                raw = await loop.run_in_executor(
-                    None,
-                    lambda: _agent.answer(recognized_q, agent_key=agent_key, is_admin=is_admin),
-                )
-            try:
-                log_generation(
-                    tr, name="openai.chat",
-                    input_text=recognized_q,
-                    output_text=raw,
-                    model=getattr(settings, "CHAT_MODEL", "gpt-4o-mini"),
-                    usage={}, metadata={"via": "image", "agent_key": agent_key},
-                )
-            except Exception:
-                pass
-
-        resp = _clean_for_user(raw, is_admin)
-        await message.answer(resp)
-
+        await _handle_image_common(message, img_path)
     finally:
         try:
             img_path.unlink(missing_ok=True)
@@ -361,8 +402,15 @@ async def on_image_document(message: Message):
     # Only handle if it's an image/*
     if not (message.document and message.document.mime_type and message.document.mime_type.startswith("image/")):
         return  # ignore other documents
-    # Reuse photo logic by fabricating a minimal Message-like object
-    return await on_photo(message)
+    await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
+    img_path = await _download_image_document(message.bot, message.document)
+    try:
+        await _handle_image_common(message, img_path)
+    finally:
+        try:
+            img_path.unlink(missing_ok=True)
+        except Exception:
+            pass
 
 
 # ----------------------- TEXT -----------------------
