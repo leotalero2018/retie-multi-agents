@@ -4,6 +4,8 @@ from __future__ import annotations
 import os
 import re
 import asyncio
+import tempfile
+from pathlib import Path
 from typing import Dict, Set, Optional, List
 
 from aiogram import Router, F
@@ -180,6 +182,122 @@ async def on_docs(message: Message):
     except Exception as e:
         await message.answer(f"⚠️ No se pudieron recuperar documentos: {e}")
 
+# ----------------------- VOICE/AUDIO HANDLER -----------------------
+
+from app.services.whisper import transcribe_audio
+
+async def _download_to_tmp(bot, file_id: str, suffix: str) -> Path:
+    """Download a Telegram file into a temp path and return the path."""
+    tf = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+    tmp_path = Path(tf.name)
+    tf.close()
+    tg_file = await bot.get_file(file_id)
+    await bot.download_file(tg_file.file_path, destination=tmp_path)
+    return tmp_path
+
+def _to_wav_if_needed(src: Path) -> Path:
+    """
+    Convert to 16kHz mono WAV if not already WAV, using ffmpeg (available in Dockerfile).
+    Falls back to original file on error.
+    """
+    try:
+        if src.suffix.lower() == ".wav":
+            return src
+        # Lazy import to keep startup fast
+        import ffmpeg  # ffmpeg-python
+        out = Path(tempfile.mkstemp(suffix=".wav")[1])
+        # 16kHz mono is a safe target for ASR
+        (
+            ffmpeg
+            .input(str(src))
+            .output(str(out), format="wav", ac=1, ar="16000")
+            .overwrite_output()
+            .run(quiet=True)
+        )
+        return out
+    except Exception:
+        # If conversion fails, just use original; Whisper can handle ogg/opus/mp3 too.
+        return src
+
+@router.message(F.voice | F.audio)
+async def on_voice(message: Message):
+    # Tell Telegram we're working
+    await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
+
+    # Pick the right object and default suffix
+    tg_obj = message.voice or message.audio
+    # Telegram voice notes are usually OGG/Opus
+    suffix = ".oga" if message.voice else (Path((tg_obj.file_name or "audio.mp3")).suffix or ".mp3")
+
+    # Download file
+    local_file = await _download_to_tmp(message.bot, tg_obj.file_id, suffix)
+
+    # Convert if necessary
+    wav_file: Optional[Path] = None
+    try:
+        wav_file = _to_wav_if_needed(local_file)
+
+        # Transcribe (español by default)
+        transcript = transcribe_audio(wav_file, language="es").strip()
+    except Exception as e:
+        # Clean temp files before returning
+        try:
+            local_file.unlink(missing_ok=True)
+            if wav_file and wav_file != local_file:
+                wav_file.unlink(missing_ok=True)
+        finally:
+            return await message.answer(f"⚠️ Error al transcribir el audio: {e}")
+
+    # Clean temp files (best-effort)
+    try:
+        local_file.unlink(missing_ok=True)
+        if wav_file and wav_file != local_file:
+            wav_file.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+    if not transcript:
+        return await message.answer("No pude entender el audio 😕")
+
+    # Echo detected text for transparency
+    await message.answer(f"🗣️ Detectado: <i>{transcript}</i>", parse_mode="HTML")
+
+    # Route to agent (same flow as text)
+    agent_key = CHAT_AGENT.get(message.chat.id, DEFAULT_AGENT)
+    LAST_QUERY[message.chat.id] = transcript
+    is_admin = _is_admin(message.from_user.id if message.from_user else None)
+    meta = {"agent_key": agent_key, "chat_id": message.chat.id, "via": "voice"}
+
+    with trace_ctx("telegram.voice", user_id=str(message.from_user.id) if message.from_user else None, metadata=meta) as tr:
+        with span_ctx(tr, "agent.answer", metadata={"question": transcript}):
+            loop = asyncio.get_running_loop()
+            raw_resp = await loop.run_in_executor(
+                None,
+                lambda: _agent.answer(
+                    transcript,
+                    agent_key=agent_key,
+                    is_admin=is_admin,
+                ),
+            )
+        # Optional: log the LLM generation
+        try:
+            log_generation(
+                tr,
+                name="openai.chat",
+                input_text=transcript,
+                output_text=raw_resp,
+                model=getattr(settings, "CHAT_MODEL", "gpt-4o-mini"),
+                usage={},
+                metadata={"agent_key": agent_key, "via": "voice"},
+            )
+        except Exception:
+            pass
+
+    resp = _clean_for_user(raw_resp, is_admin)
+    await message.answer(resp)
+
+# ----------------------- TEXT HANDLER -----------------------
+
 @router.message(F.text)
 async def on_text(message: Message):
     q = (message.text or "").strip()
@@ -202,7 +320,6 @@ async def on_text(message: Message):
                     is_admin=_is_admin(message.from_user.id if message.from_user else None),
                 ),
             )
-        # optional generation log
         try:
             log_generation(
                 tr,
