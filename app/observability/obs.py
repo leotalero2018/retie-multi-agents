@@ -1,15 +1,13 @@
 # app/observability/obs.py
-# Optional Langfuse observability with safe no-ops when disabled or when SDK API differs.
+# Langfuse v3 (OTel-based) helpers with safe no-ops when disabled.
 
 from __future__ import annotations
-
 from contextlib import contextmanager
 from typing import Optional, Any, Dict
 
 from app.config import settings
 
-# Cached client
-_langfuse_client = None
+_langfuse = None
 _enabled_cache: Optional[bool] = None
 
 
@@ -22,88 +20,75 @@ def _enabled() -> bool:
 
 
 def _get_client():
-    """Create (once) and return a Langfuse client, or None if disabled/unavailable."""
-    global _langfuse_client
+    """
+    Return the global v3 client (or None if disabled/unavailable).
+    v3 best practice is get_client(); env vars must be set.
+    """
     if not _enabled():
         return None
-    if _langfuse_client is not None:
-        return _langfuse_client
+    global _langfuse
+    if _langfuse is not None:
+        return _langfuse
     try:
-        from langfuse import Langfuse  # type: ignore
-        _langfuse_client = Langfuse(
-            public_key=getattr(settings, "LANGFUSE_PUBLIC_KEY", None),
-            secret_key=getattr(settings, "LANGFUSE_SECRET_KEY", None),
-            host=getattr(settings, "LANGFUSE_HOST", None),
-        )
-        return _langfuse_client
+        # v3 style
+        from langfuse import get_client  # type: ignore
+        _langfuse = get_client()  # initialized from env (PUBLIC_KEY, SECRET_KEY, HOST)
+        return _langfuse
     except Exception:
-        # Silently degrade to no-op
         return None
 
 
 @contextmanager
 def trace_ctx(name: str, user_id: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None):
     """
-    Usage:
-        with trace_ctx("query_docs", user_id="api", metadata={"agent":"pymupdf"}) as trace:
-            ...
-    When Langfuse is disabled/unavailable or the SDK API differs, yields None and does nothing.
+    Starts a root span; in v3 this implicitly creates the trace.
     """
     lf = _get_client()
     if lf is None:
         yield None
         return
 
-    trace_obj = None
     try:
-        # Preferred (older SDKs): client.trace(...)
-        if hasattr(lf, "trace"):
-            trace_obj = lf.trace(name=name, user_id=user_id, metadata=metadata or {})  # type: ignore[attr-defined]
-        # Newer SDKs may expose resource managers; if not present, just no-op
+        with lf.start_as_current_span(name=name) as span:
+            # set user_id / tags on the current trace
+            try:
+                if user_id:
+                    lf.update_current_trace(user_id=user_id)
+                if metadata:
+                    # You can also pass tags via metadata.get("tags", [...])
+                    lf.update_current_span(input=metadata)  # light enrichment
+            except Exception:
+                pass
+            yield span
     except Exception:
-        trace_obj = None
-
-    try:
-        yield trace_obj
-    finally:
-        try:
-            if trace_obj is not None and hasattr(trace_obj, "end"):
-                trace_obj.end()  # type: ignore[attr-defined]
-        except Exception:
-            pass
+        # degrade to no-op
+        yield None
 
 
 @contextmanager
 def span_ctx(trace, name: str, metadata: Optional[Dict[str, Any]] = None):
     """
-    Usage:
-        with span_ctx(trace, "agent_answer"):
-            ...
-    No-op if trace is None or if the SDK doesn't provide span().
+    Creates a child span under the currently active one (trace arg is unused but kept for API parity).
     """
-    if trace is None:
+    lf = _get_client()
+    if lf is None:
         yield None
         return
 
-    span_obj = None
     try:
-        if hasattr(trace, "span"):
-            span_obj = trace.span(name=name, metadata=metadata or {})  # type: ignore[attr-defined]
+        with lf.start_as_current_span(name=name) as span:
+            try:
+                if metadata:
+                    lf.update_current_span(input=metadata)
+            except Exception:
+                pass
+            yield span
     except Exception:
-        span_obj = None
-
-    try:
-        yield span_obj
-    finally:
-        try:
-            if span_obj is not None and hasattr(span_obj, "end"):
-                span_obj.end()  # type: ignore[attr-defined]
-        except Exception:
-            pass
+        yield None
 
 
 def log_generation(
-    trace,
+    trace,  # kept for API parity; unused in v3 helpers
     name: str,
     input_text: str,
     output_text: str,
@@ -112,26 +97,25 @@ def log_generation(
     metadata: Optional[Dict[str, Any]] = None,
 ) -> None:
     """
-    Record a single LLM generation attached to a trace.
-    Safe to call when observability is disabled or when the SDK API differs (no-op).
+    Records one LLM call as a Generation nested under the current span.
+    Safe no-op when disabled/unavailable.
     """
-    if trace is None:
+    lf = _get_client()
+    if lf is None:
         return
     try:
-        if hasattr(trace, "generation"):
-            gen = trace.generation(  # type: ignore[attr-defined]
-                name=name,
-                model=model or "",
-                input=input_text,
-                output=output_text,
-                metadata=metadata or {},
-                usage=usage or {},
-            )
+        with lf.start_as_current_generation(
+            name=name,
+            model=model or "",
+            input=input_text if isinstance(input_text, (str, bytes)) else str(input_text),
+        ) as gen:
             try:
-                if hasattr(gen, "end"):
-                    gen.end()  # type: ignore[attr-defined]
+                gen.update(
+                    output=output_text,
+                    usage_details=usage or {},
+                    metadata=metadata or {},
+                )
             except Exception:
                 pass
     except Exception:
-        # Swallow metrics errors; never fail the request flow
         pass
