@@ -14,6 +14,10 @@ from aiogram.filters import CommandStart, Command
 from app.agent.retie_agent import RetieAgent
 from app.agent.registry import AGENTS as _AGENTS  # optional registry (may be empty)
 
+# 🔎 Observability (safe no-op if disabled/misconfigured)
+from app.observability.obs import trace_ctx, span_ctx, log_generation
+from app.config import settings
+
 # Single agent instance
 _agent = RetieAgent()
 router = Router(name="telegram_router")
@@ -176,9 +180,6 @@ async def on_docs(message: Message):
 
     key = CHAT_AGENT.get(message.chat.id, DEFAULT_AGENT)
 
-    # Use the agent's retrieval via a tiny helper call (without LLM)
-    # We reuse the internal logic by calling answer with admin=True but not ideal for docs list.
-    # Instead, we expose a lightweight retrieval by importing the same search used by the agent:
     try:
         from app.retriever.retrieve import search  # same function agent uses
         from app.agent.retie_agent import _resolve_collection, _dedupe_hits
@@ -207,7 +208,7 @@ async def on_docs(message: Message):
         await message.answer(f"⚠️ No se pudieron recuperar documentos: {e}")
 
 # -----------------------------------------------------------------------------
-# Catch-all text (user questions)
+# Catch-all text (user questions)  — now with Langfuse trace/span/generation
 # -----------------------------------------------------------------------------
 @router.message(F.text)
 async def on_text(message: Message):
@@ -218,16 +219,41 @@ async def on_text(message: Message):
 
     LAST_QUERY[message.chat.id] = q
 
-    # typing action via the message's bot
     await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
 
-    # Offload blocking LLM call from event loop
-    loop = asyncio.get_running_loop()
-    raw_resp = await loop.run_in_executor(
-        None,
-        lambda: _agent.answer(q, agent_key=agent_key, is_admin=_is_admin(message.from_user.id if message.from_user else None)),
-    )
+    is_admin_flag = _is_admin(message.from_user.id if message.from_user else None)
 
-    is_admin = _is_admin(message.from_user.id if message.from_user else None)
-    resp = _clean_for_user(raw_resp, is_admin)
-    await message.answer(resp)
+    # End-to-end trace for this message
+    with trace_ctx(
+        "tg_message",
+        user_id=user_id,
+        metadata={
+            "chat_id": message.chat.id,
+            "agent_key": agent_key,
+            "admin": is_admin_flag,
+        },
+    ) as trace:
+        with span_ctx(trace, "agent_answer", {"provider": settings.CHAT_PROVIDER, "model": settings.CHAT_MODEL}):
+            loop = asyncio.get_running_loop()
+            raw_resp = await loop.run_in_executor(
+                None,
+                lambda: _agent.answer(q, agent_key=agent_key, is_admin=is_admin_flag),
+            )
+
+        resp = _clean_for_user(raw_resp, is_admin_flag)
+
+        # Log final generation (the text we actually return to user)
+        try:
+            log_generation(
+                trace,
+                name="final_answer",
+                input_text=q,
+                output_text=resp,
+                model=getattr(settings, "CHAT_MODEL", ""),
+                usage=None,
+                metadata={"admin": is_admin_flag, "agent_key": agent_key},
+            )
+        except Exception:
+            pass
+
+        await message.answer(resp)

@@ -37,6 +37,7 @@ class Settings(BaseSettings):
     WHISPER_MODEL: str = "gpt-4o-transcribe"       # or "whisper-1"
 
     # --- Observability (Langfuse) ---
+    # Accept typical string booleans; obs.py interprets them safely.
     LANGFUSE_ENABLED: str = "false"
     LANGFUSE_PUBLIC_KEY: Optional[str] = None
     LANGFUSE_SECRET_KEY: Optional[str] = None

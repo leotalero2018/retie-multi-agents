@@ -11,12 +11,14 @@ from app.api import ingest
 
 # Optional observability: if not present, silently no-op
 try:
-    from app.observability.obs import trace_ctx, span_ctx
+    from app.observability.obs import trace_ctx, span_ctx, log_generation
 except Exception:
     class _DummyCtx:
         def __call__(self, *a, **k): return self
         def __enter__(self): return self
         def __exit__(self, *a): return False
+    def log_generation(*a, **k):  # type: ignore
+        return
     trace_ctx = span_ctx = _DummyCtx()
 
 app = FastAPI(title="RETIE Agent API")
@@ -43,9 +45,14 @@ def query_docs(
     Answer a question using the embedded Chroma DB via RetieAgent.
     If `agent_key` is provided, it switches the collection (plumber/pymupdf).
     """
-    with trace_ctx(name="query_docs", user_id="api", metadata={"agent_key": agent_key, "q": q}) as tr:
+    with trace_ctx(name="api_query", user_id="api", metadata={"agent_key": agent_key, "q": q, "admin": admin}) as tr:
         with span_ctx(tr, "agent_answer"):
             answer = _agent.answer(q, agent_key=agent_key, is_admin=admin)
+        # record the final answer that the API returns
+        try:
+            log_generation(tr, "final_answer", q, answer, model="", usage=None, metadata={"agent_key": agent_key, "admin": admin})
+        except Exception:
+            pass
     return {"question": q, "answer": answer, "agent_key": agent_key, "admin": admin}
 
 app.include_router(router)
@@ -54,7 +61,6 @@ app.include_router(router)
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 if TELEGRAM_BOT_TOKEN:
     from aiogram import Bot, types
-    # Reuse your polling dispatcher only if you need; otherwise treat webhook as independent
     try:
         from app.bot.run_polling import dp
     except Exception:
