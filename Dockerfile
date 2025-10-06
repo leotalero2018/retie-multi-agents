@@ -7,6 +7,7 @@ FROM python:3.11-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     tesseract-ocr \
+    tesseract-ocr-spa \
     libglib2.0-0 \
     libgl1 \
   && rm -rf /var/lib/apt/lists/*
@@ -29,7 +30,9 @@ ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
     COLLECTION_NAME=retie_docs \
     EMBEDDING_MODEL=text-embedding-3-small \
     CHAT_MODEL=gpt-4o-mini \
-    CHROMADB_TELEMETRY=OFF
+    CHROMADB_TELEMETRY=OFF \
+    OCR_LANG=spa \
+    VISION_MODEL=gpt-4o-mini
 
 # -------------------------------
 # Copy requirements first (better cache)

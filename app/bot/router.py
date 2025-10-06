@@ -87,7 +87,14 @@ def _clean_for_user(raw: str, is_admin: bool) -> str:
 from app.observability.obs import trace_ctx, span_ctx, log_generation
 from app.config import settings
 
-# ----------------------- commands & handlers -----------------------
+# --- voice transcription ---
+from app.services.whisper import transcribe_audio
+
+# --- image OCR / vision ---
+from app.services.vision import ocr_image, vision_extract_insights
+
+
+# ----------------------- commands & admin -----------------------
 
 @router.message(CommandStart())
 async def on_start(message: Message):
@@ -182,9 +189,8 @@ async def on_docs(message: Message):
     except Exception as e:
         await message.answer(f"⚠️ No se pudieron recuperar documentos: {e}")
 
-# ----------------------- VOICE/AUDIO HANDLER -----------------------
 
-from app.services.whisper import transcribe_audio
+# ----------------------- helpers -----------------------
 
 async def _download_to_tmp(bot, file_id: str, suffix: str) -> Path:
     """Download a Telegram file into a temp path and return the path."""
@@ -196,63 +202,71 @@ async def _download_to_tmp(bot, file_id: str, suffix: str) -> Path:
     return tmp_path
 
 def _to_wav_if_needed(src: Path) -> Path:
-    """
-    Convert to normalized 16kHz mono WAV using ffmpeg.
-    If conversion fails, fall back to the original file.
-    """
+    """Normalize to 16kHz mono WAV using ffmpeg; fallback to original on error."""
     try:
-        if src.suffix.lower() == ".wav":
-            # even for .wav, consider normalizing & resampling for consistency
-            import ffmpeg
-            out = Path(tempfile.mkstemp(suffix=".wav")[1])
-            (
-                ffmpeg
-                .input(str(src))
-                # Simple compand/loudnorm can improve recognition on quiet clips
-                .filter("loudnorm", i=-16, tp=-1.5, lra=11)  # gentle normalization
-                .output(str(out), format="wav", ac=1, ar="16000")
-                .overwrite_output()
-                .run(quiet=True)
-            )
-            return out
-        else:
-            import ffmpeg
-            out = Path(tempfile.mkstemp(suffix=".wav")[1])
-            (
-                ffmpeg
-                .input(str(src))
-                .filter("loudnorm", i=-16, tp=-1.5, lra=11)
-                .output(str(out), format="wav", ac=1, ar="16000")
-                .overwrite_output()
-                .run(quiet=True)
-            )
-            return out
+        import ffmpeg
+        out = Path(tempfile.mkstemp(suffix=".wav")[1])
+        (
+            ffmpeg
+            .input(str(src))
+            .filter("loudnorm", i=-16, tp=-1.5, lra=11)
+            .output(str(out), format="wav", ac=1, ar="16000")
+            .overwrite_output()
+            .run(quiet=True)
+        )
+        return out
     except Exception:
         return src
 
+async def _download_image_to_tmp(message: Message) -> Optional[Path]:
+    """Download the highest-res photo or an image document to a temp file."""
+    # Photo payload
+    if message.photo:
+        photo = message.photo[-1]
+        fd, tmp_path = tempfile.mkstemp(suffix=".jpg")
+        Path(tmp_path).unlink(missing_ok=True)
+        dest = Path(tmp_path)
+        await message.bot.download(photo, destination=dest)
+        return dest
+    # Image as document
+    if message.document and message.document.mime_type and message.document.mime_type.startswith("image/"):
+        suffix = Path(message.document.file_name or "image.jpg").suffix or ".jpg"
+        fd, tmp_path = tempfile.mkstemp(suffix=suffix)
+        Path(tmp_path).unlink(missing_ok=True)
+        dest = Path(tmp_path)
+        await message.bot.download(message.document, destination=dest)
+        return dest
+    return None
+
+def _compose_question_from_image(caption: str, ocr_txt: str, vision_txt: str) -> str:
+    parts = []
+    if caption:
+        parts.append(f"Usuario dijo sobre la imagen: {caption.strip()}")
+    if ocr_txt:
+        parts.append(f"Texto detectado en la imagen:\n{ocr_txt.strip()}")
+    elif vision_txt:
+        parts.append(f"Contenido interpretado de la imagen:\n{vision_txt.strip()}")
+    if not parts:
+        parts.append("Interpreta la imagen y responde según RETIE.")
+    return "\n\nCon base en lo anterior, responde la consulta del usuario de forma breve y precisa."
+
+
+# ----------------------- VOICE/AUDIO -----------------------
 
 @router.message(F.voice | F.audio)
 async def on_voice(message: Message):
-    # Tell Telegram we're working
     await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
 
-    # Pick the right object and default suffix
     tg_obj = message.voice or message.audio
-    # Telegram voice notes are usually OGG/Opus
     suffix = ".oga" if message.voice else (Path((tg_obj.file_name or "audio.mp3")).suffix or ".mp3")
 
-    # Download file
     local_file = await _download_to_tmp(message.bot, tg_obj.file_id, suffix)
 
-    # Convert if necessary
     wav_file: Optional[Path] = None
     try:
         wav_file = _to_wav_if_needed(local_file)
-
-        # Transcribe (español by default)
         transcript = transcribe_audio(wav_file, language="es").strip()
     except Exception as e:
-        # Clean temp files before returning
         try:
             local_file.unlink(missing_ok=True)
             if wav_file and wav_file != local_file:
@@ -260,7 +274,6 @@ async def on_voice(message: Message):
         finally:
             return await message.answer(f"⚠️ Error al transcribir el audio: {e}")
 
-    # Clean temp files (best-effort)
     try:
         local_file.unlink(missing_ok=True)
         if wav_file and wav_file != local_file:
@@ -271,8 +284,6 @@ async def on_voice(message: Message):
     if not transcript:
         return await message.answer("No pude entender el audio 😕")
 
-
-    # Route to agent (same flow as text)
     agent_key = CHAT_AGENT.get(message.chat.id, DEFAULT_AGENT)
     LAST_QUERY[message.chat.id] = transcript
     is_admin = _is_admin(message.from_user.id if message.from_user else None)
@@ -283,13 +294,8 @@ async def on_voice(message: Message):
             loop = asyncio.get_running_loop()
             raw_resp = await loop.run_in_executor(
                 None,
-                lambda: _agent.answer(
-                    transcript,
-                    agent_key=agent_key,
-                    is_admin=is_admin,
-                ),
+                lambda: _agent.answer(transcript, agent_key=agent_key, is_admin=is_admin),
             )
-        # Optional: log the LLM generation
         try:
             log_generation(
                 tr,
@@ -306,7 +312,60 @@ async def on_voice(message: Message):
     resp = _clean_for_user(raw_resp, is_admin)
     await message.answer(resp)
 
-# ----------------------- TEXT HANDLER -----------------------
+
+# ----------------------- IMAGES (photo + image document) -----------------------
+
+@router.message(F.photo)
+async def on_photo(message: Message):
+    agent_key = CHAT_AGENT.get(message.chat.id, DEFAULT_AGENT)
+    await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
+
+    img_path = await _download_image_to_tmp(message)
+    if not img_path:
+        return await message.answer("No pude descargar la imagen.")
+
+    ocr_lang = os.getenv("OCR_LANG", "eng")  # set OCR_LANG=spa if you installed Spanish data
+    ocr_txt = ""
+    try:
+        ocr_txt = ocr_image(img_path, lang=ocr_lang)
+    except Exception:
+        ocr_txt = ""
+
+    vision_txt = ""
+    if not ocr_txt or len(ocr_txt) < 12:
+        try:
+            vision_txt = vision_extract_insights(img_path, user_prompt=message.caption or "", model=os.getenv("VISION_MODEL", "gpt-4o-mini"))
+        except Exception:
+            vision_txt = ""
+
+    question = _compose_question_from_image(message.caption or "", ocr_txt, vision_txt)
+    LAST_QUERY[message.chat.id] = question
+
+    with trace_ctx("telegram.image", user_id=str(message.from_user.id) if message.from_user else None,
+                   metadata={"agent_key": agent_key, "ocr_len": len(ocr_txt), "vision_len": len(vision_txt)}):
+        loop = asyncio.get_running_loop()
+        raw_resp = await loop.run_in_executor(
+            None,
+            lambda: _agent.answer(
+                question,
+                agent_key=agent_key,
+                is_admin=_is_admin(message.from_user.id if message.from_user else None),
+            ),
+        )
+
+    is_admin = _is_admin(message.from_user.id if message.from_user else None)
+    resp = _clean_for_user(raw_resp, is_admin)
+    await message.answer(resp)
+
+@router.message(F.document)
+async def on_image_document(message: Message):
+    # Only handle if it's an image/*
+    if not (message.document and message.document.mime_type and message.document.mime_type.startswith("image/")):
+        return  # ignore other documents
+    return await on_photo(message)  # reuse same logic
+
+
+# ----------------------- TEXT -----------------------
 
 @router.message(F.text)
 async def on_text(message: Message):
