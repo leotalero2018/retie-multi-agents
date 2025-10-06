@@ -1,6 +1,7 @@
 # app/bootstrap_sync.py
 from __future__ import annotations
 import os
+import stat
 import socket
 import logging
 from pathlib import Path
@@ -18,8 +19,7 @@ def _redact(v: Optional[str]) -> str:
     return v[:3] + "…" + v[-3:]
 
 def _dump_env():
-    log.info("[SYNC] ENV → "
-             "CHROMA_PERSIST_DIR=%s  CHROMA_DB_DIR=%s  COLLECTION_NAME=%s",
+    log.info("[SYNC] ENV → CHROMA_PERSIST_DIR=%s  CHROMA_DB_DIR=%s  COLLECTION_NAME=%s",
              os.getenv("CHROMA_PERSIST_DIR"), os.getenv("CHROMA_DB_DIR"),
              os.getenv("COLLECTION_NAME"))
     log.info("[SYNC] ENV → MINIO_BUCKET_NAME=%s  MINIO_PREFIX=%s",
@@ -56,8 +56,8 @@ def _ensure_dir(path: str) -> None:
 
 def _select_endpoint() -> Tuple[str, bool]:
     """
-    Returns (endpoint_host_port, secure)
-    Preference: PUBLIC → ENDPOINT → PRIVATE (for local you usually need PUBLIC).
+    Returns (endpoint_host_port, secure).
+    Preference: PUBLIC → ENDPOINT → PRIVATE.
     """
     endpoint = (os.getenv("MINIO_PUBLIC_ENDPOINT")
                 or os.getenv("MINIO_ENDPOINT")
@@ -90,15 +90,39 @@ def _minio_client():
 
     return Minio(endpoint, access_key=access, secret_key=secret, secure=secure)
 
+def _normalize_prefix(raw: Optional[str], default: str = "chroma_db/") -> str:
+    """
+    Trim spaces, drop leading slash, and ensure trailing slash.
+    Turns ' data/chroma_db ', '/data/chroma_db', 'data/chroma_db'
+    into 'data/chroma_db/'.
+    """
+    s = (raw if raw is not None else default).strip()
+    s = s.lstrip("/")
+    if s and not s.endswith("/"):
+        s += "/"
+    return s
+
+def _fix_permissions(root: str):
+    """
+    Make downloaded files readable/writable by the app user (and SQLite).
+    """
+    try:
+        for dp, dn, fn in os.walk(root):
+            os.chmod(dp, stat.S_IRWXU | stat.S_IRWXG | stat.S_IRWXO)
+            for f in fn:
+                p = os.path.join(dp, f)
+                os.chmod(p, stat.S_IRUSR | stat.S_IWUSR |
+                            stat.S_IRGRP | stat.S_IWGRP |
+                            stat.S_IROTH | stat.S_IWOTH)
+    except Exception as e:
+        log.warning("[SYNC] Could not fix permissions under %s: %s", root, e)
+
 def _download_prefix(minio_cli, bucket: str, prefix: str, local_dir: str) -> int:
     """
     Recursively download all objects under `prefix` into `local_dir`.
     Returns number of objects downloaded.
     """
     _ensure_dir(local_dir)
-    prefix = "" if prefix is None else prefix.lstrip("/")
-    if prefix and not prefix.endswith("/"):
-        prefix += "/"
 
     # Pre-flight checks
     try:
@@ -138,7 +162,7 @@ def sync_chroma_from_minio() -> None:
 
     persist_dir = os.getenv("CHROMA_PERSIST_DIR") or os.getenv("CHROMA_DB_DIR") or "./data/chroma_db"
     bucket = os.getenv("MINIO_BUCKET_NAME")
-    prefix = os.getenv("MINIO_PREFIX", "chroma_db/")
+    prefix = _normalize_prefix(os.getenv("MINIO_PREFIX"), default="chroma_db/")
     force = os.getenv("MINIO_FORCE_SYNC", "false").lower() in ("1", "true", "yes")
 
     _ensure_dir(persist_dir)
@@ -161,10 +185,19 @@ def sync_chroma_from_minio() -> None:
         log.info("[SYNC] Descargando minio://%s/%s -> %s (force=%s)", bucket, prefix, persist_dir, force)
         count = _download_prefix(client, bucket=bucket, prefix=prefix, local_dir=persist_dir)
         log.info("[SYNC] Descarga completa. Objetos descargados: %d", count)
-        if _chroma_dir_has_db(persist_dir):
-            log.info("[SYNC] Verificación OK: chroma.sqlite3 + *.db presentes en %s", persist_dir)
+
+        # Ensure the DB is writable for SQLite/HNSW
+        _fix_permissions(persist_dir)
+
+        # Verify markers
+        sqlite_ok = (Path(persist_dir) / "chroma.sqlite3").is_file()
+        shards = [d for d in Path(persist_dir).iterdir() if d.is_dir() and d.name.endswith(".db")]
+        if sqlite_ok and shards:
+            log.info("[SYNC] Verificación OK: sqlite y shard(s) presentes: %s", [s.name for s in shards])
         else:
-            log.warning("[SYNC] Descargado, pero faltan marcadores de DB (sqlite o shard).")
+            log.warning("[SYNC] Descargado, pero faltan marcadores de DB (sqlite=%s, shards=%s).",
+                        sqlite_ok, bool(shards))
+
     except Exception as e:
         log.error("[SYNC] Falló la descarga: %s", e)
         # Fall-through: app continues with whatever is local

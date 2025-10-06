@@ -17,7 +17,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 
 # -------------------------------
-# Env (align both CHROMA_* paths + disable telemetry)
+# Env (align CHROMA_* paths + disable telemetry)
 # -------------------------------
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_DEFAULT_TIMEOUT=100 \
@@ -32,12 +32,12 @@ ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
     CHROMADB_TELEMETRY=OFF
 
 # -------------------------------
-# Copy requirements first (better layer cache)
+# Copy requirements first (better cache)
 # -------------------------------
 COPY requirements.txt ./requirements.txt
 
 # -------------------------------
-# Install deps (ensure minio is present explicitly)
+# Install deps (ensure minio present)
 # -------------------------------
 RUN python -m pip install --upgrade pip && \
     pip install --no-cache-dir torch==2.2.2+cpu -f https://download.pytorch.org/whl/cpu/torch_stable.html && \
@@ -50,11 +50,12 @@ RUN python -m pip install --upgrade pip && \
 COPY . .
 
 # -------------------------------
-# Create runtime dirs
+# Create runtime dirs (writable)
 # -------------------------------
-RUN mkdir -p /data/chroma_db /app/downloads
+RUN mkdir -p /data/chroma_db /app/downloads && \
+    chmod -R 777 /data
 
 # -------------------------------
-# (Railway will set the start command; e.g.)
+# Railway will set the start command, e.g.:
 #   python -m app.bot.run_polling
 # -------------------------------
