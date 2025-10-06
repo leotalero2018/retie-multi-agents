@@ -58,7 +58,5 @@ COPY . .
 RUN mkdir -p /data/chroma_db /app/downloads && \
     chmod -R 777 /data
 
-# -------------------------------
 # Railway will set the start command, e.g.:
 #   python -m app.bot.run_polling
-# -------------------------------
