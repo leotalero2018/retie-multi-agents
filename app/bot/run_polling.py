@@ -19,6 +19,13 @@ from app.config import settings
 from app.bootstrap_sync import sync_chroma_from_minio
 from app.bot.router import router
 
+import os, logging
+from app.config import settings
+
+logging.info("[BOOT] Using COLLECTION_NAME=%s  CHROMA_DIR=%s",
+             settings.COLLECTION_NAME, settings.CHROMA_DB_DIR)
+
+
 # ------------------------------------------------------------------------
 # LOGGING
 # ------------------------------------------------------------------------
@@ -58,8 +65,15 @@ async def main() -> None:
     # If dir exists but has no real DB files, clear it to allow a clean sync
     _clear_if_placeholder(settings.CHROMA_PERSIST_DIR)
 
-    # Sync Chroma DB from MinIO (downloads if DB isn't ready or MINIO_FORCE_SYNC=true)
-    sync_chroma_from_minio()
+    # (3) Try to sync from MinIO; if it fails, continue with local DB
+    try:
+        logging.info("[SYNC] Intentando sincronizar Chroma DB desde MinIO...")
+        sync_chroma_from_minio()
+    except Exception as e:
+        logging.warning(
+            "[SYNC] Falló la sincronización desde MinIO (%s). Continuando con la base de datos local.",
+            e
+        )
 
     # List files present (helps diagnose prefix/path issues)
     try:
@@ -115,3 +129,4 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
+

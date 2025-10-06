@@ -1,17 +1,15 @@
 # syntax=docker/dockerfile:1.7
 FROM python:3.11-slim
 
-TEST-DEBUG, SE CONGELA EL SERVICIO POR EL MOMENTO
-
 # -------------------------------
-# System deps (include OCR/FFmpeg only if you use them)
+# System deps (only what you need)
 # -------------------------------
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     tesseract-ocr \
     libglib2.0-0 \
     libgl1 \
- && rm -rf /var/lib/apt/lists/*
+  && rm -rf /var/lib/apt/lists/*
 
 # -------------------------------
 # Workdir
@@ -19,7 +17,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 
 # -------------------------------
-# Useful env (align both CHROMA_* paths)
+# Env (align both CHROMA_* paths + disable telemetry)
 # -------------------------------
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_DEFAULT_TIMEOUT=100 \
@@ -30,15 +28,16 @@ ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
     CHROMA_PERSIST_DIR=/data/chroma_db \
     COLLECTION_NAME=retie_docs \
     EMBEDDING_MODEL=text-embedding-3-small \
-    CHAT_MODEL=gpt-4o-mini
+    CHAT_MODEL=gpt-4o-mini \
+    CHROMADB_TELEMETRY=OFF
 
 # -------------------------------
-# Copy requirements first (better cache)
+# Copy requirements first (better layer cache)
 # -------------------------------
-COPY requirements.txt .
+COPY requirements.txt ./requirements.txt
 
 # -------------------------------
-# Install deps (explicitly ensure minio is present)
+# Install deps (ensure minio is present explicitly)
 # -------------------------------
 RUN python -m pip install --upgrade pip && \
     pip install --no-cache-dir torch==2.2.2+cpu -f https://download.pytorch.org/whl/cpu/torch_stable.html && \
@@ -56,5 +55,6 @@ COPY . .
 RUN mkdir -p /data/chroma_db /app/downloads
 
 # -------------------------------
-# Start command is provided by Railway (e.g. python -m app.bot.run_polling)
+# (Railway will set the start command; e.g.)
+#   python -m app.bot.run_polling
 # -------------------------------
