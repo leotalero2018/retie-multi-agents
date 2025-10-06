@@ -259,8 +259,6 @@ async def on_voice(message: Message):
     if not transcript:
         return await message.answer("No pude entender el audio 😕")
 
-    # Echo detected text for transparency
-    await message.answer(f"🗣️ Detectado: <i>{transcript}</i>", parse_mode="HTML")
 
     # Route to agent (same flow as text)
     agent_key = CHAT_AGENT.get(message.chat.id, DEFAULT_AGENT)
