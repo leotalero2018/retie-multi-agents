@@ -197,27 +197,39 @@ async def _download_to_tmp(bot, file_id: str, suffix: str) -> Path:
 
 def _to_wav_if_needed(src: Path) -> Path:
     """
-    Convert to 16kHz mono WAV if not already WAV, using ffmpeg (available in Dockerfile).
-    Falls back to original file on error.
+    Convert to normalized 16kHz mono WAV using ffmpeg.
+    If conversion fails, fall back to the original file.
     """
     try:
         if src.suffix.lower() == ".wav":
-            return src
-        # Lazy import to keep startup fast
-        import ffmpeg  # ffmpeg-python
-        out = Path(tempfile.mkstemp(suffix=".wav")[1])
-        # 16kHz mono is a safe target for ASR
-        (
-            ffmpeg
-            .input(str(src))
-            .output(str(out), format="wav", ac=1, ar="16000")
-            .overwrite_output()
-            .run(quiet=True)
-        )
-        return out
+            # even for .wav, consider normalizing & resampling for consistency
+            import ffmpeg
+            out = Path(tempfile.mkstemp(suffix=".wav")[1])
+            (
+                ffmpeg
+                .input(str(src))
+                # Simple compand/loudnorm can improve recognition on quiet clips
+                .filter("loudnorm", i=-16, tp=-1.5, lra=11)  # gentle normalization
+                .output(str(out), format="wav", ac=1, ar="16000")
+                .overwrite_output()
+                .run(quiet=True)
+            )
+            return out
+        else:
+            import ffmpeg
+            out = Path(tempfile.mkstemp(suffix=".wav")[1])
+            (
+                ffmpeg
+                .input(str(src))
+                .filter("loudnorm", i=-16, tp=-1.5, lra=11)
+                .output(str(out), format="wav", ac=1, ar="16000")
+                .overwrite_output()
+                .run(quiet=True)
+            )
+            return out
     except Exception:
-        # If conversion fails, just use original; Whisper can handle ogg/opus/mp3 too.
         return src
+
 
 @router.message(F.voice | F.audio)
 async def on_voice(message: Message):
