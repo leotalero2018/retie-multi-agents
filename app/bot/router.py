@@ -14,7 +14,7 @@ from aiogram.types import Message
 from aiogram.filters import CommandStart, Command
 
 from app.agent.retie_agent import RetieAgent
-from app.agent.registry import AGENTS as _AGENTS  # optional registry (may be empty)
+from app.agent.registry import AGENTS as _AGENTS  # optional registry
 
 # --- create router FIRST (before any @router.message decorators) ---
 router = Router(name="telegram_router")
@@ -48,7 +48,10 @@ DEFAULT_AGENT = "plumber"
 LAST_QUERY: Dict[int, str] = {}
 
 # --- output cleaning for non-admins ---
-_SOURCES_HEADERS = (r"^\s*fuentes\s*:\s*$", r"^\s*referencias\s*:\s*$", r"^\s*sources\s*:\s*$", r"^\s*citas\s*:\s*$")
+_SOURCES_HEADERS = (
+    r"^\s*fuentes\s*:\s*$", r"^\s*referencias\s*:\s*$",
+    r"^\s*sources\s*:\s*$", r"^\s*citas\s*:\s*$"
+)
 _SOURCES_HEADERS_RE = re.compile("|".join(_SOURCES_HEADERS), re.IGNORECASE | re.MULTILINE)
 _INLINE_BRACKET_CITE_RE = re.compile(
     r"""
@@ -65,6 +68,7 @@ _INLINE_BRACKET_CITE_RE = re.compile(
     """,
     re.VERBOSE,
 )
+
 def _strip_sources_sections(text: str) -> str:
     m = _SOURCES_HEADERS_RE.search(text)
     if not m:
@@ -90,8 +94,8 @@ from app.config import settings
 # --- voice transcription ---
 from app.services.whisper import transcribe_audio
 
-# --- image OCR / vision ---
-from app.services.vision import ocr_image, vision_extract_insights
+# --- image OCR / vision (question-first path) ---
+from app.services.vision import extract_question_from_image, vision_extract_insights
 
 
 # ----------------------- commands & admin -----------------------
@@ -218,37 +222,15 @@ def _to_wav_if_needed(src: Path) -> Path:
     except Exception:
         return src
 
-async def _download_image_to_tmp(message: Message) -> Optional[Path]:
-    """Download the highest-res photo or an image document to a temp file."""
-    # Photo payload
-    if message.photo:
-        photo = message.photo[-1]
-        fd, tmp_path = tempfile.mkstemp(suffix=".jpg")
-        Path(tmp_path).unlink(missing_ok=True)
-        dest = Path(tmp_path)
-        await message.bot.download(photo, destination=dest)
-        return dest
-    # Image as document
-    if message.document and message.document.mime_type and message.document.mime_type.startswith("image/"):
-        suffix = Path(message.document.file_name or "image.jpg").suffix or ".jpg"
-        fd, tmp_path = tempfile.mkstemp(suffix=suffix)
-        Path(tmp_path).unlink(missing_ok=True)
-        dest = Path(tmp_path)
-        await message.bot.download(message.document, destination=dest)
-        return dest
-    return None
-
-def _compose_question_from_image(caption: str, ocr_txt: str, vision_txt: str) -> str:
-    parts = []
-    if caption:
-        parts.append(f"Usuario dijo sobre la imagen: {caption.strip()}")
-    if ocr_txt:
-        parts.append(f"Texto detectado en la imagen:\n{ocr_txt.strip()}")
-    elif vision_txt:
-        parts.append(f"Contenido interpretado de la imagen:\n{vision_txt.strip()}")
-    if not parts:
-        parts.append("Interpreta la imagen y responde según RETIE.")
-    return "\n\nCon base en lo anterior, responde la consulta del usuario de forma breve y precisa."
+async def _download_image_best(bot, photo_sizes) -> Path:
+    """Download the largest Telegram photo into temp and return path."""
+    biggest = max(photo_sizes, key=lambda p: p.file_size or 0)
+    tg_file = await bot.get_file(biggest.file_id)
+    tf = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
+    tmp = Path(tf.name)
+    tf.close()
+    await bot.download_file(tg_file.file_path, destination=tmp)
+    return tmp
 
 
 # ----------------------- VOICE/AUDIO -----------------------
@@ -317,52 +299,70 @@ async def on_voice(message: Message):
 
 @router.message(F.photo)
 async def on_photo(message: Message):
-    agent_key = CHAT_AGENT.get(message.chat.id, DEFAULT_AGENT)
     await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
 
-    img_path = await _download_image_to_tmp(message)
-    if not img_path:
-        return await message.answer("No pude descargar la imagen.")
+    img_path = await _download_image_best(message.bot, message.photo)
 
-    ocr_lang = os.getenv("OCR_LANG", "eng")  # set OCR_LANG=spa if you installed Spanish data
-    ocr_txt = ""
     try:
-        ocr_txt = ocr_image(img_path, lang=ocr_lang)
-    except Exception:
-        ocr_txt = ""
+        # 1) try to read the user's question from the image (OCR → Vision fallback)
+        recognized_q = extract_question_from_image(img_path)
+        # 2) if we still have nothing, try a generic insights read (diagrams/tables)
+        if not recognized_q:
+            recognized_q = (message.caption or "").strip()
+            if not recognized_q:
+                recognized_q = vision_extract_insights(img_path) or ""
 
-    vision_txt = ""
-    if not ocr_txt or len(ocr_txt) < 12:
+        if not recognized_q:
+            return await message.answer(
+                "No pude leer claramente la pregunta de la imagen. "
+                "Prueba con una foto más nítida o envíala con mayor resolución."
+            )
+
+        agent_key = CHAT_AGENT.get(message.chat.id, DEFAULT_AGENT)
+        LAST_QUERY[message.chat.id] = recognized_q
+        is_admin = _is_admin(message.from_user.id if message.from_user else None)
+
+        # Optional: show what was read (only to admins)
+        if is_admin:
+            await message.answer(f"🖼️ Leí esta pregunta:\n“{recognized_q}”")
+
+        user_id = str(message.from_user.id) if message.from_user else None
+        meta = {"agent_key": agent_key, "chat_id": message.chat.id, "via": "image"}
+
+        with trace_ctx("telegram.photo", user_id=user_id, metadata=meta) as tr:
+            with span_ctx(tr, "agent.answer", metadata={"question": recognized_q}):
+                loop = asyncio.get_running_loop()
+                raw = await loop.run_in_executor(
+                    None,
+                    lambda: _agent.answer(recognized_q, agent_key=agent_key, is_admin=is_admin),
+                )
+            try:
+                log_generation(
+                    tr, name="openai.chat",
+                    input_text=recognized_q,
+                    output_text=raw,
+                    model=getattr(settings, "CHAT_MODEL", "gpt-4o-mini"),
+                    usage={}, metadata={"via": "image", "agent_key": agent_key},
+                )
+            except Exception:
+                pass
+
+        resp = _clean_for_user(raw, is_admin)
+        await message.answer(resp)
+
+    finally:
         try:
-            vision_txt = vision_extract_insights(img_path, user_prompt=message.caption or "", model=os.getenv("VISION_MODEL", "gpt-4o-mini"))
+            img_path.unlink(missing_ok=True)
         except Exception:
-            vision_txt = ""
-
-    question = _compose_question_from_image(message.caption or "", ocr_txt, vision_txt)
-    LAST_QUERY[message.chat.id] = question
-
-    with trace_ctx("telegram.image", user_id=str(message.from_user.id) if message.from_user else None,
-                   metadata={"agent_key": agent_key, "ocr_len": len(ocr_txt), "vision_len": len(vision_txt)}):
-        loop = asyncio.get_running_loop()
-        raw_resp = await loop.run_in_executor(
-            None,
-            lambda: _agent.answer(
-                question,
-                agent_key=agent_key,
-                is_admin=_is_admin(message.from_user.id if message.from_user else None),
-            ),
-        )
-
-    is_admin = _is_admin(message.from_user.id if message.from_user else None)
-    resp = _clean_for_user(raw_resp, is_admin)
-    await message.answer(resp)
+            pass
 
 @router.message(F.document)
 async def on_image_document(message: Message):
     # Only handle if it's an image/*
     if not (message.document and message.document.mime_type and message.document.mime_type.startswith("image/")):
         return  # ignore other documents
-    return await on_photo(message)  # reuse same logic
+    # Reuse photo logic by fabricating a minimal Message-like object
+    return await on_photo(message)
 
 
 # ----------------------- TEXT -----------------------

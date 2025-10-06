@@ -8,6 +8,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     tesseract-ocr \
     tesseract-ocr-spa \
+    tesseract-ocr-eng \
     libglib2.0-0 \
     libgl1 \
   && rm -rf /var/lib/apt/lists/*
@@ -31,8 +32,8 @@ ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
     EMBEDDING_MODEL=text-embedding-3-small \
     CHAT_MODEL=gpt-4o-mini \
     CHROMADB_TELEMETRY=OFF \
-    OCR_LANG=spa \
-    VISION_MODEL=gpt-4o-mini
+    OCR_LANG=spa+eng \
+    VISION_MODEL=gpt-4o
 
 # -------------------------------
 # Copy requirements first (better cache)
