@@ -9,8 +9,6 @@ import glob
 from pathlib import Path
 
 from dotenv import load_dotenv
-
-# Load local env (dev). pydantic-settings also loads .env; harmless double-load.
 load_dotenv()
 
 from aiogram import Bot, Dispatcher
@@ -26,7 +24,6 @@ dp.include_router(router)
 
 
 def _clear_if_placeholder(path: str) -> None:
-    """If dir exists but lacks Chroma markers, wipe it so a sync can refill cleanly."""
     p = Path(path)
     sqlite = p / "chroma.sqlite3"
     has_shard = any(p.glob("*.db"))
@@ -44,36 +41,38 @@ def _clear_if_placeholder(path: str) -> None:
 
 
 async def main() -> None:
-    # 1) Sync Chroma from MinIO into a guaranteed-writable runtime dir
-    #    and point everything (env + settings) to that dir.
+    # 1) Sync from MinIO → returns the *runtime* directory we should use
+    runtime_dir = None
     try:
         runtime_dir = sync_chroma_from_minio()
     except Exception as e:
         logging.warning("[SYNC] MinIO sync raised: %s. Continuing with local paths.", e)
-        runtime_dir = settings.CHROMA_DB_DIR  # fallback to whatever is configured
 
     if not runtime_dir:
         runtime_dir = settings.CHROMA_DB_DIR
 
-    os.makedirs(runtime_dir, exist_ok=True)
-    _clear_if_placeholder(runtime_dir)
-
-    # Point Chroma paths to the writable runtime dir
     os.environ["CHROMA_DB_DIR"] = runtime_dir
     os.environ["CHROMA_PERSIST_DIR"] = runtime_dir
-    settings.CHROMA_DB_DIR = runtime_dir  # ensure all imports use the same path
+    settings.CHROMA_DB_DIR = runtime_dir  # pydantic settings in-memory value
+
+    # >>> Rebind Chroma client to the *new* path <<<
+    from app.retriever import chroma_client as cc
+    cc.set_persist_dir(runtime_dir)
+
+    os.makedirs(runtime_dir, exist_ok=True)
+    _clear_if_placeholder(runtime_dir)
 
     logging.info("[BOOT] Using COLLECTION_NAME=%s  CHROMA_DIR=%s",
                  settings.COLLECTION_NAME, settings.CHROMA_DB_DIR)
 
-    # 2) Quick listing (helps diagnose prefix/path issues)
+    # 2) Quick listing
     try:
         files = glob.glob(os.path.join(settings.CHROMA_DB_DIR, "*"))
         logging.info("[LS] %s -> %s", settings.CHROMA_DB_DIR, files[:30])
     except Exception as e:
         logging.error("[LS] ERROR listing files: %s", e)
 
-    # 3) Deep check: list all collections and counts from on-disk DB
+    # 3) Deep check: enumerate collections & counts
     try:
         import chromadb
         cli = chromadb.PersistentClient(path=settings.CHROMA_DB_DIR)
@@ -91,7 +90,7 @@ async def main() -> None:
     except Exception as e:
         logging.error("[CHK2] ERROR listing collections: %s", e)
 
-    # 4) Start Telegram bot (supports TELEGRAM_BOT_TOKEN or TELEGRAM_TOKEN)
+    # 4) Start Telegram bot
     token = os.environ.get("TELEGRAM_BOT_TOKEN") or os.environ.get("TELEGRAM_TOKEN")
     if not token:
         logging.error("❌ Missing TELEGRAM_BOT_TOKEN (or TELEGRAM_TOKEN). Bot cannot start.")

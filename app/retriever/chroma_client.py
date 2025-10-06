@@ -1,54 +1,76 @@
 # app/retriever/chroma_client.py
 from __future__ import annotations
-
+from typing import Any, Optional
 import os
-from typing import Any, Dict
-
 import chromadb
 from chromadb import PersistentClient
-from chromadb.config import Settings
+from chromadb.errors import NotFoundError
+from app.config import settings
 
-# Support both new and legacy envs
-_PERSIST_DIR = os.getenv("CHROMA_PERSIST_DIR") or os.getenv("CHROMA_DB_DIR", "./data/chroma_db")
-_DEFAULT_COLLECTION = os.getenv("COLLECTION_NAME", "retie_docs")
+# Lazily-initialized client bound to the *current* CHROMA_DB_DIR
+_client: Optional[PersistentClient] = None
+_client_path: Optional[str] = None
 
-# Single persistent client for the process
-_client: PersistentClient = chromadb.PersistentClient(
-    path=_PERSIST_DIR,
-    settings=Settings(anonymized_telemetry=False),
-)
+# If you really want to allow creating collections on the fly, set env ALLOW_CHROMA_CREATE=true
+_ALLOW_CREATE = os.getenv("ALLOW_CHROMA_CREATE", "false").lower() in ("1", "true", "yes")
 
-# Per-process collection cache
-_collections: Dict[str, Any] = {}
+
+def _ensure_client() -> PersistentClient:
+    """Create or re-create the PersistentClient if the path changed."""
+    global _client, _client_path
+    target_path = settings.CHROMA_DB_DIR
+    if not target_path:
+        # hard fallback
+        target_path = "./data/chroma_db"
+        settings.CHROMA_DB_DIR = target_path
+
+    if (_client is None) or (_client_path != target_path):
+        _client = chromadb.PersistentClient(path=target_path)
+        _client_path = target_path
+    return _client
+
+
+def set_persist_dir(new_path: str) -> None:
+    """
+    Re-point the client to a new directory (e.g., after MinIO sync).
+    Next call to _ensure_client() will open this path.
+    """
+    global _client, _client_path
+    if new_path and new_path != settings.CHROMA_DB_DIR:
+        settings.CHROMA_DB_DIR = new_path
+    # force re-create on next use
+    _client = None
+    _client_path = None
 
 
 def get_collection(name: str | None = None):
     """
-    Get or create a Chroma collection by name; cached per process.
-    IMPORTANT:
-      - Do NOT attach embedding_function; we store embeddings explicitly.
-      - Use cosine space so distances are interpretable vs. a cosine threshold.
+    Return an *existing* collection. By default, DO NOT create collections here to avoid
+    writing into a read-only/immutable DB. Opt-in creation with ALLOW_CHROMA_CREATE=true.
     """
-    col_name = name or _DEFAULT_COLLECTION
+    col_name = name or settings.COLLECTION_NAME
+    cli = _ensure_client()
 
-    if col_name not in _collections:
-        try:
-            col = _client.get_collection(col_name)
-        except Exception:
-            col = _client.create_collection(
+    try:
+        return cli.get_collection(col_name)
+    except NotFoundError:
+        if _ALLOW_CREATE:
+            # Only create if explicitly allowed
+            return cli.create_collection(
                 name=col_name,
                 metadata={"hnsw:space": "cosine"},
             )
-        _collections[col_name] = col
-
-    return _collections[col_name]
+        # Be explicit so callers know the DB is missing the expected collection
+        raise RuntimeError(
+            f"Chroma collection '{col_name}' not found at {settings.CHROMA_DB_DIR} "
+            f"(set ALLOW_CHROMA_CREATE=true if you intend to create it here)."
+        )
 
 
 def drop_collection(name: str):
-    """Drop the collection and clear local cache (safe if missing)."""
+    cli = _ensure_client()
     try:
-        _client.delete_collection(name)
+        cli.delete_collection(name)
         print(f"✅ Collection {name} deleted.")
     except Exception:
-        print(f"⚠ Collection {name} not found; skipping delete.")
-    _collections.pop(name, None)
+        print(f"⚠ Collection {name} did not exist; continuing.")
