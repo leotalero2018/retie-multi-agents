@@ -4,6 +4,7 @@ import os
 import stat
 import socket
 import logging
+import shutil
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -88,40 +89,24 @@ def _normalize_prefix(raw: Optional[str], default: str = "chroma_db/") -> str:
 def _fix_permissions(root: str):
     try:
         for dp, dn, fn in os.walk(root):
-            os.chmod(dp, stat.S_IRWXU | stat.S_IRWXG | stat.S_IRWXO)     # 777 for dirs
+            os.chmod(dp, stat.S_IRWXU | stat.S_IRWXG | stat.S_IRWXO)     # 777 dirs
             for f in fn:
                 p = os.path.join(dp, f)
-                os.chmod(p, stat.S_IRUSR | stat.S_IWUSR |               # 666 for files
+                os.chmod(p, stat.S_IRUSR | stat.S_IWUSR |
                              stat.S_IRGRP | stat.S_IWGRP |
-                             stat.S_IROTH | stat.S_IWOTH)
+                             stat.S_IROTH | stat.S_IWOTH)                # 666 files
     except Exception as e:
         log.warning("[SYNC] Could not fix permissions under %s: %s", root, e)
 
-def _rw_sanity(dirpath: str) -> Tuple[bool, str]:
-    """Try to create + delete a tiny temp file; report reason if it fails."""
-    p = Path(dirpath)
-    try:
-        p.mkdir(parents=True, exist_ok=True)
-        test = p / ".rw_test"
-        with open(test, "w") as fh:
-            fh.write("ok")
-        test.unlink()
-        return True, "RW OK"
-    except Exception as e:
-        return False, f"RW FAIL: {e}"
-
 def _markers(dirpath: str) -> Tuple[bool, bool, list[str]]:
-    """Return (sqlite_present, shards_present, shard_names). Shards = ANY directory (UUID or *.db)."""
     p = Path(dirpath)
     sqlite_ok = (p / "chroma.sqlite3").is_file()
     shard_dirs = [d.name for d in p.iterdir() if d.is_dir()] if p.exists() else []
-    # accept any directory name (UUID or UUID.db)
     shards_ok = len(shard_dirs) > 0
     return sqlite_ok, shards_ok, shard_dirs
 
 def _download_prefix(minio_cli, bucket: str, prefix: str, local_dir: str) -> int:
     _ensure_dir(local_dir)
-
     try:
         exists = minio_cli.bucket_exists(bucket)
         log.info("[SYNC] bucket_exists(%s) → %s", bucket, exists)
@@ -147,50 +132,49 @@ def _download_prefix(minio_cli, bucket: str, prefix: str, local_dir: str) -> int
         downloaded += 1
     return downloaded
 
-def sync_chroma_from_minio() -> None:
+def sync_chroma_from_minio() -> str:
+    """
+    Sync from MinIO into CHROMA_PERSIST_DIR, then copy into a guaranteed writable
+    runtime dir (MINIO_RUNTIME_DIR or /tmp/chroma_db). Return the final dir path
+    you should point Chroma to.
+    """
     _dump_env()
 
     persist_dir = os.getenv("CHROMA_PERSIST_DIR") or os.getenv("CHROMA_DB_DIR") or "./data/chroma_db"
+    runtime_dir = os.getenv("MINIO_RUNTIME_DIR", "/tmp/chroma_db")
     bucket = os.getenv("MINIO_BUCKET_NAME")
     prefix = _normalize_prefix(os.getenv("MINIO_PREFIX"), default="chroma_db/")
     force = os.getenv("MINIO_FORCE_SYNC", "false").lower() in ("1", "true", "yes")
 
     _ensure_dir(persist_dir)
+    _ensure_dir(runtime_dir)
 
-    # If already complete and not forced, skip
+    # If persist already complete and not forced, keep it
     sqlite_ok, shards_ok, shard_names = _markers(persist_dir)
-    if sqlite_ok and shards_ok and not force:
+    if not force and sqlite_ok and shards_ok:
         log.info("[SYNC] Local dir '%s' already complete; skipping download (shards=%s).",
                  persist_dir, shard_names)
-        return
-
-    if not bucket:
-        log.info("[SYNC] MINIO_BUCKET_NAME not set; skipping MinIO sync.")
-        return
-
-    try:
-        client = _minio_client()
-    except Exception as e:
-        log.error("[SYNC] MinIO client unavailable: %s", e)
-        return
-
-    try:
-        log.info("[SYNC] Descargando minio://%s/%s -> %s (force=%s)", bucket, prefix, persist_dir, force)
-        count = _download_prefix(client, bucket=bucket, prefix=prefix, local_dir=persist_dir)
-        log.info("[SYNC] Descarga completa. Objetos descargados: %d", count)
-
-        # perms and RW test
-        _fix_permissions(persist_dir)
-        ok, msg = _rw_sanity(persist_dir)
-        log.info("[SYNC] RW check for %s → %s", persist_dir, msg)
-
-        sqlite_ok, shards_ok, shard_names = _markers(persist_dir)
-        if sqlite_ok and shards_ok:
-            log.info("[SYNC] Verificación OK: sqlite y shard(s) presentes: %s", shard_names)
+    else:
+        if not bucket:
+            log.info("[SYNC] MINIO_BUCKET_NAME not set; skipping MinIO download.")
         else:
-            log.warning("[SYNC] Descargado, pero faltan marcadores de DB (sqlite=%s, shards=%s, found=%s).",
-                        sqlite_ok, shards_ok, shard_names)
+            try:
+                client = _minio_client()
+                log.info("[SYNC] Descargando minio://%s/%s -> %s (force=%s)", bucket, prefix, persist_dir, force)
+                count = _download_prefix(client, bucket=bucket, prefix=prefix, local_dir=persist_dir)
+                log.info("[SYNC] Descarga completa. Objetos descargados: %d", count)
+            except Exception as e:
+                log.error("[SYNC] Falló la descarga: %s", e)
 
+    # Always copy to runtime_dir (ensures fully writable location)
+    try:
+        if Path(runtime_dir).exists():
+            shutil.rmtree(runtime_dir)
+        shutil.copytree(persist_dir, runtime_dir)
+        _fix_permissions(runtime_dir)
+        s_ok, sh_ok, sh_names = _markers(runtime_dir)
+        log.info("[SYNC] Runtime copy ok → %s  (sqlite=%s, shards=%s, %s)", runtime_dir, s_ok, sh_ok, sh_names)
     except Exception as e:
-        log.error("[SYNC] Falló la descarga: %s", e)
-        # Fall-through to local
+        log.error("[SYNC] Runtime copy failed: %s", e)
+
+    return runtime_dir

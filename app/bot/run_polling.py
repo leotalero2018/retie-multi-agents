@@ -5,11 +5,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import glob
 from pathlib import Path
 
 from dotenv import load_dotenv
 
-# Load local env first (dev); pydantic-settings will also load .env
+# Load local env (dev). pydantic-settings also loads .env; harmless double-load.
 load_dotenv()
 
 from aiogram import Bot, Dispatcher
@@ -19,31 +20,15 @@ from app.config import settings
 from app.bootstrap_sync import sync_chroma_from_minio
 from app.bot.router import router
 
-import os, logging
-from app.config import settings
-
-logging.info("[BOOT] Using COLLECTION_NAME=%s  CHROMA_DIR=%s",
-             settings.COLLECTION_NAME, settings.CHROMA_DB_DIR)
-
-
-# ------------------------------------------------------------------------
-# LOGGING
-# ------------------------------------------------------------------------
 logging.basicConfig(level=logging.INFO, force=True)
-
-# Dispatcher + routes
 dp = Dispatcher()
 dp.include_router(router)
 
 
 def _clear_if_placeholder(path: str) -> None:
-    """
-    If the directory exists but does NOT contain a real Chroma DB marker,
-    wipe its contents so the sync can refill it cleanly.
-    """
+    """If dir exists but lacks Chroma markers, wipe it so a sync can refill cleanly."""
     p = Path(path)
     sqlite = p / "chroma.sqlite3"
-    # Additionally, check for shard folders like "<uuid>.db"
     has_shard = any(p.glob("*.db"))
     if p.exists() and p.is_dir() and (not sqlite.exists()) and (not has_shard):
         for child in p.iterdir():
@@ -59,44 +44,36 @@ def _clear_if_placeholder(path: str) -> None:
 
 
 async def main() -> None:
-    # Ensure persist dir exists (POSIX path on Railway)
-    os.makedirs(settings.CHROMA_PERSIST_DIR, exist_ok=True)
-
-    # If dir exists but has no real DB files, clear it to allow a clean sync
-    _clear_if_placeholder(settings.CHROMA_PERSIST_DIR)
-
-    # (3) Try to sync from MinIO; if it fails, continue with local DB
+    # 1) Sync Chroma from MinIO into a guaranteed-writable runtime dir
+    #    and point everything (env + settings) to that dir.
     try:
-        logging.info("[SYNC] Intentando sincronizar Chroma DB desde MinIO...")
-        sync_chroma_from_minio()
+        runtime_dir = sync_chroma_from_minio()
     except Exception as e:
-        logging.warning(
-            "[SYNC] Falló la sincronización desde MinIO (%s). Continuando con la base de datos local.",
-            e
-        )
+        logging.warning("[SYNC] MinIO sync raised: %s. Continuing with local paths.", e)
+        runtime_dir = settings.CHROMA_DB_DIR  # fallback to whatever is configured
 
-    # List files present (helps diagnose prefix/path issues)
+    if not runtime_dir:
+        runtime_dir = settings.CHROMA_DB_DIR
+
+    os.makedirs(runtime_dir, exist_ok=True)
+    _clear_if_placeholder(runtime_dir)
+
+    # Point Chroma paths to the writable runtime dir
+    os.environ["CHROMA_DB_DIR"] = runtime_dir
+    os.environ["CHROMA_PERSIST_DIR"] = runtime_dir
+    settings.CHROMA_DB_DIR = runtime_dir  # ensure all imports use the same path
+
+    logging.info("[BOOT] Using COLLECTION_NAME=%s  CHROMA_DIR=%s",
+                 settings.COLLECTION_NAME, settings.CHROMA_DB_DIR)
+
+    # 2) Quick listing (helps diagnose prefix/path issues)
     try:
-        import glob
-        files = glob.glob(os.path.join(settings.CHROMA_PERSIST_DIR, "*"))
-        logging.info("[LS] %s -> %s", settings.CHROMA_PERSIST_DIR, files[:20])
+        files = glob.glob(os.path.join(settings.CHROMA_DB_DIR, "*"))
+        logging.info("[LS] %s -> %s", settings.CHROMA_DB_DIR, files[:30])
     except Exception as e:
         logging.error("[LS] ERROR listing files: %s", e)
 
-    # Sanity check: print collection count so we know DB is actually there
-    try:
-        from app.retriever.chroma_client import get_collection
-        col = get_collection(settings.COLLECTION_NAME)
-        logging.info(
-            "[CHK] Collection='%s' count=%s  dir=%s",
-            settings.COLLECTION_NAME,
-            col.count(),
-            settings.CHROMA_PERSIST_DIR,
-        )
-    except Exception as e:
-        logging.error("[CHK] ERROR checking collection '%s': %s", settings.COLLECTION_NAME, e)
-
-    # Deep diag: list all collections and counts from the on-disk DB
+    # 3) Deep check: list all collections and counts from on-disk DB
     try:
         import chromadb
         cli = chromadb.PersistentClient(path=settings.CHROMA_DB_DIR)
@@ -114,11 +91,10 @@ async def main() -> None:
     except Exception as e:
         logging.error("[CHK2] ERROR listing collections: %s", e)
 
-    # Token: support new TELEGRAM_BOT_TOKEN and legacy TELEGRAM_TOKEN
+    # 4) Start Telegram bot (supports TELEGRAM_BOT_TOKEN or TELEGRAM_TOKEN)
     token = os.environ.get("TELEGRAM_BOT_TOKEN") or os.environ.get("TELEGRAM_TOKEN")
     if not token:
         logging.error("❌ Missing TELEGRAM_BOT_TOKEN (or TELEGRAM_TOKEN). Bot cannot start.")
-        # Keep process alive for health checks without CPU burn
         while True:
             await asyncio.sleep(60)
 
@@ -129,4 +105,3 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
-
