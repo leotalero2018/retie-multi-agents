@@ -105,15 +105,8 @@ async def _handle_image_common(message: Message, img_path: Path):
         result = analyze_question_image(img_path, agent_key)
         if "error" in result:
             return await message.answer(f"⚠️ {result['error']}")
-        verdict = "✅ Correcto" if result["is_correct"] else "❌ Incorrecto"
-        feedback = (
-            f"{result['verdict']}\n\n"
-            f"<b>Pregunta:</b> {result['question']}\n"
-            f"<b>Tu respuesta:</b> {result['user_answer']}\n"
-            f"<b>Respuesta esperada:</b> {result['expected_answer']}\n\n"
-            f"{result['explanation']}"
-        )
-        return await message.answer(feedback)
+        return await message.answer(result["explanation"])
+
 
     # 3️⃣ Generic vision fallback
     recognized_q = extract_question_from_image(img_path) or (message.caption or "").strip()

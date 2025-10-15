@@ -182,10 +182,10 @@ def is_question_image(txt: str) -> bool:
 
 def analyze_question_image(path: Path, agent_key: str) -> Dict[str, Any]:
     """
-    Final RETIE evaluator:
-    - Detects user answer (A/B/C/D or Verdadero/Falso)
-    - Finds correct answer from vector DB context
-    - Replies briefly: "La respuesta correcta es X, según RETIE..."
+    Final minimalist RETIE evaluator.
+    Detects user answer (A/B/C/D or Verdadero/Falso),
+    finds the correct one, and outputs only:
+        'La respuesta correcta es X. Según el RETIE, ...'
     """
     from app.retriever.retrieve import search
     from app.agent.retie_agent import _resolve_collection
@@ -194,7 +194,7 @@ def analyze_question_image(path: Path, agent_key: str) -> Dict[str, Any]:
     if not question_text:
         return {"error": "No se encontró ninguna pregunta legible."}
 
-    # Detect user's selected answer
+    # --- Detect user's selected answer ---
     txt_raw = ocr_image(path, lang="spa+eng")
     user_answer = ""
     for opt in ["A", "B", "C", "D", "TRUE", "FALSE", "VERDADERO", "FALSO"]:
@@ -202,7 +202,7 @@ def analyze_question_image(path: Path, agent_key: str) -> Dict[str, Any]:
             user_answer = opt.upper()
             break
 
-    # Retrieve RETIE references
+    # --- Retrieve supporting RETIE context ---
     coll = _resolve_collection(agent_key, explicit=None)
     hits = search(question_text, top_k=3, collection_name=coll)
     if not hits:
@@ -212,7 +212,6 @@ def analyze_question_image(path: Path, agent_key: str) -> Dict[str, Any]:
             "expected_answer": "?",
             "is_correct": False,
             "explanation": "No se encontró referencia en la base RETIE.",
-            "verdict": "❌ Sin referencia",
         }
 
     refs = []
@@ -224,16 +223,17 @@ def analyze_question_image(path: Path, agent_key: str) -> Dict[str, Any]:
         refs.append(f"{ctx}\n(Fuente: {os.path.basename(src)} pág. {page})")
     context_text = "\n\n".join(refs[:3])
 
-    # Ask model ONLY for correct option + justification
+    # --- Ask model for concise correct answer + justification ---
     try:
         client = _build_openai_client()
         mdl = os.getenv("QA_REASONING_MODEL") or getattr(settings, "CHAT_MODEL", "gpt-4o-mini")
 
         system = (
-            "Eres un evaluador del RETIE. "
-            "Analiza la pregunta y el texto del RETIE y responde SOLO en este formato:\n\n"
+            "Eres un examinador experto en el reglamento RETIE. "
+            "Analiza la pregunta y el contexto y responde ÚNICAMENTE en este formato:\n\n"
             "La respuesta correcta es <A/B/C/D o Verdadero/Falso>.\n"
-            "Según el RETIE, <breve explicación con base en el texto>."
+            "Según el RETIE, <breve explicación basada en el texto>.\n\n"
+            "No incluyas saludos, títulos ni texto adicional."
         )
 
         user_prompt = (
@@ -245,7 +245,7 @@ def analyze_question_image(path: Path, agent_key: str) -> Dict[str, Any]:
         r = client.chat.completions.create(
             model=mdl,
             temperature=0.0,
-            max_tokens=200,
+            max_tokens=180,
             messages=[
                 {"role": "system", "content": system},
                 {"role": "user", "content": user_prompt},
@@ -254,30 +254,18 @@ def analyze_question_image(path: Path, agent_key: str) -> Dict[str, Any]:
 
         reasoning = (r.choices[0].message.content or "").strip()
 
-        # Extract correct answer (A/B/C/D/True/False)
-        match = re.search(r"([A-D]|VERDADERO|FALSO|TRUE|FALSE)", reasoning, re.IGNORECASE)
-        expected = match.group(1).upper() if match else "?"
-
-        is_correct = expected == user_answer
-        verdict = "✅ Correcto" if is_correct else "❌ Incorrecto"
+        # Extract only the clean answer and justification text
+        clean_text = re.sub(r"^(✅|❌|\*\*|#|\s*Pregunta:.*|Tu respuesta:.*|Respuesta esperada:.*)", "", reasoning, flags=re.IGNORECASE | re.MULTILINE).strip()
 
         return {
             "question": question_text,
             "user_answer": user_answer or "?",
-            "expected_answer": expected,
-            "is_correct": is_correct,
-            "verdict": verdict,
-            "explanation": reasoning,
+            "explanation": clean_text,
         }
 
     except Exception as e:
         return {
             "question": question_text,
             "user_answer": user_answer or "?",
-            "expected_answer": "?",
-            "is_correct": False,
-            "verdict": "❌ Error",
             "explanation": f"No se pudo generar explicación ({e}).",
         }
-
-
