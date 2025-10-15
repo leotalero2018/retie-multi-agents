@@ -177,32 +177,49 @@ def extract_question_from_image(path: Path) -> str:
 def is_question_image(txt: str) -> bool:
     """Detect if OCR text likely belongs to a question image."""
     return bool(
-        re.search(r"(pregunta|verdadero|falso|marque|seleccione|opción\s+[A-D])", txt, re.IGNORECASE)
+        re.search(
+            r"(pregunta|verdadero|falso|marque|seleccione|opción\s+[A-D]|[a-d]\.)",
+            txt,
+            re.IGNORECASE,
+        )
     )
+
 
 def analyze_question_image(path: Path, agent_key: str) -> Dict[str, Any]:
     """
-    Final minimalist RETIE evaluator.
-    Detects user answer (A/B/C/D or Verdadero/Falso),
-    finds the correct one, and outputs only:
+    Improved RETIE evaluator:
+    Detects user's selected answer (A/B/C/D or Verdadero/Falso),
+    queries RETIE context, and outputs:
         'La respuesta correcta es X. Según el RETIE, ...'
     """
+
     from app.retriever.retrieve import search
     from app.agent.retie_agent import _resolve_collection
 
+    # --- 1️⃣ Extract question text ---
     question_text = extract_question_from_image(path)
     if not question_text:
         return {"error": "No se encontró ninguna pregunta legible."}
 
-    # --- Detect user's selected answer ---
+    # --- 2️⃣ OCR full text for options ---
     txt_raw = ocr_image(path, lang="spa+eng")
+
+    # Normalize characters
+    txt_raw = re.sub(r"[·•▪]", ".", txt_raw)
+    txt_raw = re.sub(r"\s+", " ", txt_raw)
+
+    # --- 3️⃣ Detect user's answer ---
     user_answer = ""
     for opt in ["A", "B", "C", "D", "TRUE", "FALSE", "VERDADERO", "FALSO"]:
         if re.search(rf"\b{opt}\b", txt_raw, re.IGNORECASE):
             user_answer = opt.upper()
             break
 
-    # --- Retrieve supporting RETIE context ---
+    # --- 4️⃣ Detect available options in text (A., B., C., D.) ---
+    option_lines = re.findall(r"([A-Da-d]\s*[\).\-:]\s*[^A-Da-d]+)", txt_raw)
+    options_formatted = "\n".join(option_lines) if option_lines else ""
+
+    # --- 5️⃣ Retrieve supporting RETIE context ---
     coll = _resolve_collection(agent_key, explicit=None)
     hits = search(question_text, top_k=3, collection_name=coll)
     if not hits:
@@ -223,21 +240,24 @@ def analyze_question_image(path: Path, agent_key: str) -> Dict[str, Any]:
         refs.append(f"{ctx}\n(Fuente: {os.path.basename(src)} pág. {page})")
     context_text = "\n\n".join(refs[:3])
 
-    # --- Ask model for concise correct answer + justification ---
+    # --- 6️⃣ Ask model for concise correct answer + justification ---
     try:
         client = _build_openai_client()
         mdl = os.getenv("QA_REASONING_MODEL") or getattr(settings, "CHAT_MODEL", "gpt-4o-mini")
 
         system = (
             "Eres un examinador experto en el reglamento RETIE. "
-            "Analiza la pregunta y el contexto y responde ÚNICAMENTE en este formato:\n\n"
+            "Analiza la pregunta y el contexto técnico. "
+            "Si hay opciones múltiples, elige UNA sola (A, B, C, D) o Verdadero/Falso. "
+            "Tu salida DEBE seguir exactamente este formato:\n\n"
             "La respuesta correcta es <A/B/C/D o Verdadero/Falso>.\n"
-            "Según el RETIE, <breve explicación basada en el texto>.\n\n"
-            "No incluyas saludos, títulos ni texto adicional."
+            "Según el RETIE, <explicación breve y técnica basada en el texto>.\n\n"
+            "No incluyas títulos, saludos, numeraciones ni texto adicional."
         )
 
         user_prompt = (
-            f"Pregunta: {question_text}\n"
+            f"Pregunta detectada:\n{question_text}\n\n"
+            f"Opciones detectadas:\n{options_formatted or 'No claras'}\n\n"
             f"Respuesta marcada por el usuario: {user_answer or 'Desconocida'}\n\n"
             f"Fragmentos del RETIE:\n{context_text}"
         )
@@ -245,7 +265,7 @@ def analyze_question_image(path: Path, agent_key: str) -> Dict[str, Any]:
         r = client.chat.completions.create(
             model=mdl,
             temperature=0.0,
-            max_tokens=180,
+            max_tokens=200,
             messages=[
                 {"role": "system", "content": system},
                 {"role": "user", "content": user_prompt},
@@ -254,8 +274,17 @@ def analyze_question_image(path: Path, agent_key: str) -> Dict[str, Any]:
 
         reasoning = (r.choices[0].message.content or "").strip()
 
-        # Extract only the clean answer and justification text
-        clean_text = re.sub(r"^(✅|❌|\*\*|#|\s*Pregunta:.*|Tu respuesta:.*|Respuesta esperada:.*)", "", reasoning, flags=re.IGNORECASE | re.MULTILINE).strip()
+        # --- 7️⃣ Clean format ---
+        clean_text = re.sub(
+            r"^(✅|❌|\*\*|#|\s*Pregunta:.*|Tu respuesta:.*|Respuesta esperada:.*)",
+            "",
+            reasoning,
+            flags=re.IGNORECASE | re.MULTILINE,
+        ).strip()
+
+        # If model returns just “B” or “Verdadero”, normalize it
+        if not clean_text.lower().startswith("la respuesta correcta"):
+            clean_text = f"La respuesta correcta es {clean_text.strip('.')}."
 
         return {
             "question": question_text,
