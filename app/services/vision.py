@@ -183,17 +183,20 @@ def is_question_image(txt: str) -> bool:
 
 def analyze_question_image(path: Path, agent_key: str) -> Dict[str, Any]:
     """
-    Analyze a multiple-choice or True/False question image.
-    Returns a structured dictionary with correctness.
+    Enhanced QA analysis:
+    - Detects question and user's answer (A/B/C/D/True/False)
+    - Searches vector DB for expected answer
+    - Uses GPT reasoning for contextual explanation
     """
     from app.retriever.retrieve import search
     from app.agent.retie_agent import _resolve_collection
 
+    # 1️⃣ Extract the visible question
     question_text = extract_question_from_image(path)
     if not question_text:
         return {"error": "No se encontró ninguna pregunta legible."}
 
-    # 1️⃣ Extract possible selected answer (A/B/C/D or True/False)
+    # 2️⃣ Detect user-marked answer (A/B/C/D/True/False)
     txt_raw = ocr_image(path, lang="spa+eng")
     user_answer = ""
     for opt in ["A", "B", "C", "D", "TRUE", "FALSE", "VERDADERO", "FALSO"]:
@@ -201,24 +204,89 @@ def analyze_question_image(path: Path, agent_key: str) -> Dict[str, Any]:
             user_answer = opt.upper()
             break
 
-    # 2️⃣ Retrieve expected answer from Chroma
+    # 3️⃣ Retrieve references from vector DB
     coll = _resolve_collection(agent_key, explicit=None)
     hits = search(question_text, top_k=3, collection_name=coll)
     if not hits:
-        return {"question": question_text, "user_answer": user_answer, "error": "No se encontró referencia en la base."}
+        return {
+            "question": question_text,
+            "user_answer": user_answer,
+            "error": "No se encontró referencia en la base de conocimiento.",
+        }
 
-    best = hits[0]
-    context = best.get("page_content", "")
-    match = re.search(r"(verdadero|falso|true|false|[A-D])", context, re.IGNORECASE)
-    expected = match.group(0).upper() if match else "?"
+    # 4️⃣ Aggregate best context
+    contexts = []
+    for h in hits:
+        ctx = h.get("page_content", "")
+        meta = h.get("meta", {})
+        src = meta.get("source", "")
+        page = meta.get("page_number", "")
+        contexts.append(f"Documento: {os.path.basename(src)} (pág. {page})\n{ctx}")
 
-    correct = user_answer and expected != "?" and user_answer == expected
-    explanation = f"La respuesta correcta es {expected}. Según la referencia: {context[:400]}..."
+    combined_context = "\n\n".join(contexts[:3])
 
-    return {
-        "question": question_text,
-        "user_answer": user_answer,
-        "expected_answer": expected,
-        "is_correct": correct,
-        "explanation": explanation,
-    }
+    # 5️⃣ Ask OpenAI model to determine correctness + reason
+    try:
+        client = _build_openai_client()
+        system_prompt = (
+            "Eres un evaluador experto en el reglamento RETIE. "
+            "Se te dará una pregunta de examen, la respuesta marcada por el usuario, "
+            "y referencias oficiales del RETIE. Debes:\n"
+            "1. Indicar si la respuesta es correcta o incorrecta.\n"
+            "2. Especificar la respuesta correcta (A, B, C, D, Verdadero o Falso).\n"
+            "3. Justificar brevemente con base en la referencia.\n"
+            "4. Si la respuesta está parcialmente correcta, acláralo.\n"
+            "Responde de forma estructurada y clara en español."
+        )
+        user_prompt = (
+            f"Pregunta: {question_text}\n"
+            f"Respuesta del usuario: {user_answer or 'Desconocida'}\n\n"
+            f"Referencias del RETIE:\n{combined_context}\n\n"
+            "Evalúa cuidadosamente según el contenido del RETIE."
+        )
+
+        mdl = os.getenv("QA_REASONING_MODEL") or getattr(settings, "CHAT_MODEL", "gpt-4o-mini")
+        r = client.chat.completions.create(
+            model=mdl,
+            temperature=0.2,
+            max_tokens=400,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+        )
+
+        reasoning = (r.choices[0].message.content or "").strip()
+
+        # Extract verdict (✅ or ❌)
+        verdict_match = re.search(r"(correcta|incorrecta|parcialmente)", reasoning, re.IGNORECASE)
+        verdict = "❌ Incorrecto"
+        if verdict_match:
+            word = verdict_match.group(1).lower()
+            if "parcial" in word:
+                verdict = "🟡 Parcialmente correcta"
+            elif "correcta" in word:
+                verdict = "✅ Correcta"
+
+        # Try to detect expected answer
+        exp_match = re.search(r"(?:respuesta\s+correcta\s*(?:es|:)\s*)([A-D]|verdadero|falso)", reasoning, re.IGNORECASE)
+        expected = exp_match.group(1).upper() if exp_match else "?"
+
+        return {
+            "question": question_text,
+            "user_answer": user_answer or "?",
+            "expected_answer": expected,
+            "is_correct": "✅" in verdict,
+            "explanation": reasoning,
+            "verdict": verdict,
+        }
+
+    except Exception as e:
+        return {
+            "question": question_text,
+            "user_answer": user_answer or "?",
+            "expected_answer": "?",
+            "is_correct": False,
+            "explanation": f"No se pudo generar explicación detallada ({e}).",
+            "verdict": "❌ Error",
+        }
