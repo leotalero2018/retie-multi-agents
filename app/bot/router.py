@@ -89,6 +89,19 @@ async def on_admin(message: Message):
     else:
         await message.answer("❌ Contraseña incorrecta.")
 
+@router.message(Command("logout"))
+async def on_logout(message: Message):
+    """
+    Ends the current admin session for this Telegram user.
+    """
+    uid = message.from_user.id
+    if uid in RUNTIME_ADMINS:
+        RUNTIME_ADMINS.remove(uid)
+        await message.answer("🔓 Modo administrador desactivado.")
+    else:
+        await message.answer("No estabas en modo administrador.")
+
+
 # ---------------- Image Handling ----------------
 async def _download_image_best(bot, photo_sizes) -> Path:
     biggest = max(photo_sizes, key=lambda p: p.file_size or 0)
