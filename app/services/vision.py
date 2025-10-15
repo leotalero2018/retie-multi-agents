@@ -180,12 +180,12 @@ def is_question_image(txt: str) -> bool:
         re.search(r"(pregunta|verdadero|falso|marque|seleccione|opción\s+[A-D])", txt, re.IGNORECASE)
     )
 
-
 def analyze_question_image(path: Path, agent_key: str) -> Dict[str, Any]:
     """
-    Enhanced QA evaluator for RETIE questions.
-    Produces structured, contextual feedback (A/B/C/D or True/False)
-    with justification citing the RETIE reference text.
+    Final RETIE evaluator:
+    - Detects user answer (A/B/C/D or Verdadero/Falso)
+    - Finds correct answer from vector DB context
+    - Replies briefly: "La respuesta correcta es X, según RETIE..."
     """
     from app.retriever.retrieve import search
     from app.agent.retie_agent import _resolve_collection
@@ -194,7 +194,7 @@ def analyze_question_image(path: Path, agent_key: str) -> Dict[str, Any]:
     if not question_text:
         return {"error": "No se encontró ninguna pregunta legible."}
 
-    # --- Detect user's marked answer ---
+    # Detect user's selected answer
     txt_raw = ocr_image(path, lang="spa+eng")
     user_answer = ""
     for opt in ["A", "B", "C", "D", "TRUE", "FALSE", "VERDADERO", "FALSO"]:
@@ -202,7 +202,7 @@ def analyze_question_image(path: Path, agent_key: str) -> Dict[str, Any]:
             user_answer = opt.upper()
             break
 
-    # --- Retrieve supporting context from Chroma ---
+    # Retrieve RETIE references
     coll = _resolve_collection(agent_key, explicit=None)
     hits = search(question_text, top_k=3, collection_name=coll)
     if not hits:
@@ -211,7 +211,7 @@ def analyze_question_image(path: Path, agent_key: str) -> Dict[str, Any]:
             "user_answer": user_answer or "?",
             "expected_answer": "?",
             "is_correct": False,
-            "explanation": "No se encontró referencia en la base de conocimiento RETIE.",
+            "explanation": "No se encontró referencia en la base RETIE.",
             "verdict": "❌ Sin referencia",
         }
 
@@ -221,76 +221,53 @@ def analyze_question_image(path: Path, agent_key: str) -> Dict[str, Any]:
         meta = h.get("meta", {})
         src = meta.get("source", "")
         page = meta.get("page_number", "")
-        refs.append(f"Documento: {os.path.basename(src)} (pág. {page})\n{ctx}")
+        refs.append(f"{ctx}\n(Fuente: {os.path.basename(src)} pág. {page})")
     context_text = "\n\n".join(refs[:3])
 
-    # --- Query OpenAI for reasoning ---
+    # Ask model ONLY for correct option + justification
     try:
         client = _build_openai_client()
         mdl = os.getenv("QA_REASONING_MODEL") or getattr(settings, "CHAT_MODEL", "gpt-4o-mini")
 
         system = (
-            "Eres un evaluador experto en el reglamento RETIE. "
-            "Analiza la pregunta y la respuesta marcada, usando los fragmentos del RETIE proporcionados. "
-            "Responde SIEMPRE en el formato:\n\n"
-            "1. Respuesta correcta o incorrecta: <Correcta/Incorrecta/Parcialmente correcta>\n"
-            "2. Respuesta correcta: <A/B/C/D/Verdadero/Falso>\n"
-            "3. Artículo o referencia: <si existe>\n"
-            "4. Justificación: <breve explicación basada en el texto>\n\n"
-            "Sé preciso, cita artículos o secciones si aparecen, y usa tono institucional."
+            "Eres un evaluador del RETIE. "
+            "Analiza la pregunta y el texto del RETIE y responde SOLO en este formato:\n\n"
+            "La respuesta correcta es <A/B/C/D o Verdadero/Falso>.\n"
+            "Según el RETIE, <breve explicación con base en el texto>."
         )
 
-        user = (
+        user_prompt = (
             f"Pregunta: {question_text}\n"
-            f"Respuesta del usuario: {user_answer or 'Desconocida'}\n\n"
-            f"Fragmentos del RETIE y contexto:\n{context_text}"
+            f"Respuesta marcada por el usuario: {user_answer or 'Desconocida'}\n\n"
+            f"Fragmentos del RETIE:\n{context_text}"
         )
 
         r = client.chat.completions.create(
             model=mdl,
-            temperature=0.1,
-            max_tokens=500,
+            temperature=0.0,
+            max_tokens=200,
             messages=[
                 {"role": "system", "content": system},
-                {"role": "user", "content": user},
+                {"role": "user", "content": user_prompt},
             ],
         )
 
         reasoning = (r.choices[0].message.content or "").strip()
 
-        # --- Parse model output ---
-        correct_re = re.search(r"respuesta\s+correcta\s*:\s*(\w+)", reasoning, re.IGNORECASE)
-        expected = correct_re.group(1).upper() if correct_re else "?"
-        status_re = re.search(r"(correcta|incorrecta|parcial)", reasoning, re.IGNORECASE)
-        status = status_re.group(1).lower() if status_re else "incorrecta"
-        is_correct = "correcta" in status and "parcial" not in status
-        verdict = (
-            "✅ Correcta" if is_correct else
-            ("🟡 Parcialmente correcta" if "parcial" in status else "❌ Incorrecta")
-        )
+        # Extract correct answer (A/B/C/D/True/False)
+        match = re.search(r"([A-D]|VERDADERO|FALSO|TRUE|FALSE)", reasoning, re.IGNORECASE)
+        expected = match.group(1).upper() if match else "?"
 
-        # Extract article if present
-        art_match = re.search(r"(art[ií]culo\s+\d+[.\d]*)", reasoning, re.IGNORECASE)
-        article = art_match.group(1) if art_match else ""
-
-        # Extract justification text
-        justif_match = re.search(r"(?:(?:justificación|explicación)[:\-]\s*)(.*)", reasoning, re.IGNORECASE | re.DOTALL)
-        justification = justif_match.group(1).strip() if justif_match else reasoning
-
-        # Build explanation paragraph
-        explanation = (
-            f"La respuesta correcta es {expected}. "
-            f"{('Según ' + article + ', ' if article else 'Según el RETIE, ')}"
-            f"{justification}"
-        )
+        is_correct = expected == user_answer
+        verdict = "✅ Correcto" if is_correct else "❌ Incorrecto"
 
         return {
             "question": question_text,
             "user_answer": user_answer or "?",
             "expected_answer": expected,
-            "is_correct": is_correct or "parcial" in status,
-            "explanation": explanation,
+            "is_correct": is_correct,
             "verdict": verdict,
+            "explanation": reasoning,
         }
 
     except Exception as e:
@@ -299,6 +276,8 @@ def analyze_question_image(path: Path, agent_key: str) -> Dict[str, Any]:
             "user_answer": user_answer or "?",
             "expected_answer": "?",
             "is_correct": False,
-            "explanation": f"No se pudo generar explicación ({e}).",
             "verdict": "❌ Error",
+            "explanation": f"No se pudo generar explicación ({e}).",
         }
+
+

@@ -107,7 +107,7 @@ async def _handle_image_common(message: Message, img_path: Path):
             return await message.answer(f"⚠️ {result['error']}")
         verdict = "✅ Correcto" if result["is_correct"] else "❌ Incorrecto"
         feedback = (
-            f"{verdict}\n\n"
+            f"{result['verdict']}\n\n"
             f"<b>Pregunta:</b> {result['question']}\n"
             f"<b>Tu respuesta:</b> {result['user_answer']}\n"
             f"<b>Respuesta esperada:</b> {result['expected_answer']}\n\n"
