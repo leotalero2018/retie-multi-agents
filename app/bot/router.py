@@ -72,6 +72,22 @@ async def on_agent(message: Message):
     CHAT_AGENT[message.chat.id] = key
     await message.answer(f"✅ Agente establecido: {key}")
 
+@router.message(Command("admin"))
+async def on_admin(message: Message):
+    """
+    Permite que un usuario autorizado se convierta en administrador temporal.
+    Uso: /admin <contraseña>
+    """
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) < 2:
+        return await message.answer("Formato: /admin <contraseña>")
+
+    provided = parts[1].strip()
+    if provided == ADMIN_PASSWORD:
+        RUNTIME_ADMINS.add(message.from_user.id)
+        await message.answer("🔐 Modo administrador activado para esta sesión.")
+    else:
+        await message.answer("❌ Contraseña incorrecta.")
 
 # ---------------- Image Handling ----------------
 async def _download_image_best(bot, photo_sizes) -> Path:
