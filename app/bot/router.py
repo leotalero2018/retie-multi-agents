@@ -178,11 +178,19 @@ async def on_photo(message: Message):
 # ---------------- Text ----------------
 @router.message(F.text)
 async def on_text(message: Message):
-    q = (message.text or "").strip()
+    q = (message.text or "").strip().lower()
     agent_key = CHAT_AGENT.get(message.chat.id, DEFAULT_AGENT)
     LAST_QUERY[message.chat.id] = q
     await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
 
+    if any(word in q for word in ["hola", "buenas", "hey", "saludos"]):
+        return await message.answer("👋 ¡Hola! Qué gusto saludarte 😊. ¿En qué puedo ayudarte hoy?")
+    if any(word in q for word in ["gracias", "thank you", "te agradezco"]):
+        return await message.answer("🙏 ¡Con gusto! Si necesitas otra consulta sobre el RETIE, aquí estaré 😉")
+    if any(word in q for word in ["adiós", "bye", "chao", "nos vemos", "hasta luego"]):
+        return await message.answer("👋 ¡Hasta luego! Espero haberte ayudado con tu consulta🔌")
+
+    # --- regular flow (technical questions) ---
     is_admin = _is_admin(message.from_user.id if message.from_user else None)
     user_id = str(message.from_user.id) if message.from_user else None
     meta = {"agent_key": agent_key, "chat_id": message.chat.id}
@@ -199,3 +207,4 @@ async def on_text(message: Message):
             pass
 
     await message.answer(_clean_for_user(raw, is_admin))
+
