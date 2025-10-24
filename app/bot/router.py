@@ -14,199 +14,244 @@ from aiogram.types import Message
 from aiogram.filters import CommandStart, Command
 
 from app.agent.retie_agent import RetieAgent
-from app.agent.registry import AGENTS as _AGENTS
-from app.services.mongo_store import save_image_from_path
+from app.agent.registry import AGENTS as _AGENTS  # optional registry (may be empty)
 
-from app.services.vision import (
-    extract_question_from_image,
-    vision_extract_insights,
-    ocr_image,
-    analyze_question_image,
-    is_question_image,
-)
-
-from app.observability.obs import trace_ctx, span_ctx, log_generation
-from app.config import settings
-from app.services.whisper import transcribe_audio
-
+# --- create router FIRST (before any @router.message decorators) ---
 router = Router(name="telegram_router")
+
+# --- single agent instance ---
 _agent = RetieAgent()
 
+# --- admin controls ---
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "changeme")
 _raw_ids = os.getenv("ADMIN_USER_IDS", "").strip()
-STATIC_ADMIN_IDS: Set[int] = {int(x) for x in _raw_ids.split(",") if x.strip().isdigit()} if _raw_ids else set()
+STATIC_ADMIN_IDS: Set[int] = {
+    int(x) for x in _raw_ids.split(",") if x.strip().isdigit()
+} if _raw_ids else set()
 RUNTIME_ADMINS: Set[int] = set()
 
+def _is_admin(user_id: Optional[int]) -> bool:
+    if user_id is None:
+        return False
+    return (user_id in STATIC_ADMIN_IDS) or (user_id in RUNTIME_ADMINS)
+
+def _require_admin(message: Message) -> bool:
+    uid = message.from_user.id if message.from_user else None
+    if not _is_admin(uid):
+        asyncio.create_task(message.answer("⛔ Comando solo para administradores."))
+        return False
+    return True
+
+# --- chat state ---
 CHAT_AGENT: Dict[int, str] = {}
 DEFAULT_AGENT = "plumber"
 LAST_QUERY: Dict[int, str] = {}
 
+# --- output cleaning for non-admins ---
+_SOURCES_HEADERS = (r"^\s*fuentes\s*:\s*$", r"^\s*referencias\s*:\s*$", r"^\s*sources\s*:\s*$", r"^\s*citas\s*:\s*$")
+_SOURCES_HEADERS_RE = re.compile("|".join(_SOURCES_HEADERS), re.IGNORECASE | re.MULTILINE)
+_INLINE_BRACKET_CITE_RE = re.compile(
+    r"""
+    \[
+        \s*
+        (?:
+            \d{1,3}
+            (?:\s*[-–]\s*\d{1,3})?
+            (?:\s*,\s*(?:p|pp)\.?\s*\d+)?      # page refs
+            (?:\s*,\s*\d{1,3})*                # extra cites
+        )
+        \s*
+    \]
+    """,
+    re.VERBOSE,
+)
+def _strip_sources_sections(text: str) -> str:
+    m = _SOURCES_HEADERS_RE.search(text)
+    if not m:
+        return text
+    return text[: m.start()].rstrip()
 
-def _is_admin(uid: Optional[int]) -> bool:
-    return bool(uid and (uid in STATIC_ADMIN_IDS or uid in RUNTIME_ADMINS))
+def _strip_inline_citations(text: str) -> str:
+    return _INLINE_BRACKET_CITE_RE.sub("", text)
 
-
-# --- helper cleaning for users ---
 def _clean_for_user(raw: str, is_admin: bool) -> str:
     if is_admin:
         return raw
-    text = re.sub(r"\[.*?\]", "", raw)
-    text = re.sub(r"[ \t]{2,}", " ", text)
-    text = re.sub(r"\n{3,}", "\n\n", text)
-    return text.strip()
+    cleaned = _strip_sources_sections(raw)
+    cleaned = _strip_inline_citations(cleaned)
+    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+    return cleaned
+
+# --- observability (Langfuse v3 wrappers) ---
+from app.observability.obs import trace_ctx, span_ctx, log_generation
+from app.config import settings
+
+# --- voice transcription ---
+from app.services.whisper import transcribe_audio
+
+# --- image OCR / vision ---
+from app.services.vision import ocr_image, vision_extract_insights
 
 
-# ---------------- Commands ----------------
+# ----------------------- commands & admin -----------------------
+
 @router.message(CommandStart())
 async def on_start(message: Message):
     CHAT_AGENT[message.chat.id] = DEFAULT_AGENT
     await message.answer("¡Hola! Soy tu bot RETIE, ¿en qué puedo ayudarte?")
 
-
 @router.message(Command("agent"))
 async def on_agent(message: Message):
-    parts = (message.text or "").split()
+    parts = (message.text or "").strip().split()
     if len(parts) < 2:
-        return await message.answer("Formato: /agent <nombre>")
+        return await message.answer("Formato: /agent <key>")
     key = parts[1].lower()
+    if _AGENTS and key not in _AGENTS:
+        return await message.answer("Agente inválido.")
     CHAT_AGENT[message.chat.id] = key
-    await message.answer(f"✅ Agente establecido: {key}")
+    if _AGENTS and key in _AGENTS:
+        cfg = _AGENTS[key]
+        return await message.answer(
+            f"✅ Agente: {key} (modelo={cfg.resolved_chat_model()}, colección={cfg.collection})"
+        )
+    await message.answer(f"✅ Agente: {key}")
+
+@router.message(Command("who"))
+async def on_who(message: Message):
+    key = CHAT_AGENT.get(message.chat.id, DEFAULT_AGENT)
+    if _AGENTS and key in _AGENTS:
+        cfg = _AGENTS[key]
+        return await message.answer(
+            f"Agente actual: {key} (modelo={cfg.resolved_chat_model()}, colección={cfg.collection})"
+        )
+    await message.answer(f"Agente actual: {key}")
 
 @router.message(Command("admin"))
-async def on_admin(message: Message):
-    """
-    Permite que un usuario autorizado se convierta en administrador temporal.
-    Uso: /admin <contraseña>
-    """
-    parts = (message.text or "").split(maxsplit=1)
+async def on_admin_login(message: Message):
+    parts = (message.text or "").strip().split()
     if len(parts) < 2:
         return await message.answer("Formato: /admin <contraseña>")
-
-    provided = parts[1].strip()
-    if provided == ADMIN_PASSWORD:
+    password = parts[1]
+    if password != ADMIN_PASSWORD:
+        return await message.answer("❌ Contraseña incorrecta")
+    if message.from_user:
         RUNTIME_ADMINS.add(message.from_user.id)
-        await message.answer("🔐 Modo administrador activado para esta sesión.")
-    else:
-        await message.answer("❌ Contraseña incorrecta.")
+    await message.answer("✅ Acceso administrador concedido en esta sesión.")
 
 @router.message(Command("logout"))
-async def on_logout(message: Message):
-    """
-    Ends the current admin session for this Telegram user.
-    """
-    uid = message.from_user.id
-    if uid in RUNTIME_ADMINS:
-        RUNTIME_ADMINS.remove(uid)
-        await message.answer("🔓 Modo administrador desactivado.")
-    else:
-        await message.answer("No estabas en modo administrador.")
+async def on_admin_logout(message: Message):
+    if message.from_user and message.from_user.id in RUNTIME_ADMINS:
+        RUNTIME_ADMINS.discard(message.from_user.id)
+        return await message.answer("👋 Sesión de administrador cerrada.")
+    return await message.answer("No hay sesión de administrador activa.")
+
+@router.message(Command("docs"))
+async def on_docs(message: Message):
+    if not _require_admin(message):
+        return
+    parts = (message.text or "").strip().split()
+    try:
+        k = int(parts[1]) if len(parts) >= 2 else 5
+        k = max(1, min(20, k))
+    except ValueError:
+        k = 5
+
+    last_q = LAST_QUERY.get(message.chat.id)
+    if not last_q:
+        return await message.answer("No hay una consulta previa en este chat. Envía una pregunta primero.")
+
+    key = CHAT_AGENT.get(message.chat.id, DEFAULT_AGENT)
+    try:
+        from app.retriever.retrieve import search
+        from app.agent.retie_agent import _resolve_collection, _dedupe_hits
+
+        coll = _resolve_collection(agent_key=key, explicit=None)
+        hits = _dedupe_hits(search(last_q, top_k=k, collection_name=coll))
+
+        if not hits:
+            return await message.answer("No se encontraron documentos para la última consulta.")
+
+        seen = set()
+        lines: List[str] = []
+        for i, h in enumerate(hits, start=1):
+            meta = h.get("meta", {})
+            src = meta.get("source", "desconocido")
+            page = meta.get("page", meta.get("page_number", ""))
+            title = meta.get("title", os.path.basename(src) if isinstance(src, str) else "desconocido")
+            key_uniq = (src, page, title)
+            if key_uniq in seen:
+                continue
+            seen.add(key_uniq)
+            lines.append(f"{i}. {title}  (src={src}, page={page})")
+
+        await message.answer("📄 Documentos más relevantes para la última consulta:\n" + "\n".join(lines))
+    except Exception as e:
+        await message.answer(f"⚠️ No se pudieron recuperar documentos: {e}")
 
 
-# ---------------- Image Handling ----------------
-async def _download_image_best(bot, photo_sizes) -> Path:
-    biggest = max(photo_sizes, key=lambda p: p.file_size or 0)
-    tg_file = await bot.get_file(biggest.file_id)
-    tf = tempfile.NamedTemporaryFile(delete=False, suffix=".jpg")
-    tmp = Path(tf.name)
+# ----------------------- helpers -----------------------
+
+async def _download_to_tmp(bot, file_id: str, suffix: str) -> Path:
+    """Download a Telegram file into a temp path and return the path."""
+    tf = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+    tmp_path = Path(tf.name)
     tf.close()
-    await bot.download_file(tg_file.file_path, destination=tmp)
-    return tmp
+    tg_file = await bot.get_file(file_id)
+    await bot.download_file(tg_file.file_path, destination=tmp_path)
+    return tmp_path
 
-
-async def _handle_image_common(message: Message, img_path: Path):
-    """Main image handler: saves, OCRs, and decides flow."""
-    agent_key = CHAT_AGENT.get(message.chat.id, DEFAULT_AGENT)
-
-    # 1️⃣ Persist image (optional)
+def _to_wav_if_needed(src: Path) -> Path:
+    """Normalize to 16kHz mono WAV using ffmpeg; fallback to original on error."""
     try:
-        save_image_from_path(
-            img_path,
-            filename=f"tg_{message.chat.id}_{message.message_id}.jpg",
-            content_type="image/jpeg",
-            metadata={"chat_id": message.chat.id, "caption": message.caption or "", "source": "telegram"},
+        import ffmpeg
+        out = Path(tempfile.mkstemp(suffix=".wav")[1])
+        (
+            ffmpeg
+            .input(str(src))
+            .filter("loudnorm", i=-16, tp=-1.5, lra=11)
+            .output(str(out), format="wav", ac=1, ar="16000")
+            .overwrite_output()
+            .run(quiet=True)
         )
+        return out
     except Exception:
-        pass
+        return src
 
-    # 2️⃣ OCR preview
-    txt_raw = ocr_image(img_path)
-    if is_question_image(txt_raw):
-        result = analyze_question_image(img_path, agent_key)
-        if "error" in result:
-            return await message.answer(f"⚠️ {result['error']}")
-        return await message.answer(result["explanation"])
+async def _download_image_to_tmp(message: Message) -> Optional[Path]:
+    """Download the highest-res photo or an image document to a temp file."""
+    # Photo payload
+    if message.photo:
+        photo = message.photo[-1]
+        fd, tmp_path = tempfile.mkstemp(suffix=".jpg")
+        Path(tmp_path).unlink(missing_ok=True)
+        dest = Path(tmp_path)
+        await message.bot.download(photo, destination=dest)
+        return dest
+    # Image as document
+    if message.document and message.document.mime_type and message.document.mime_type.startswith("image/"):
+        suffix = Path(message.document.file_name or "image.jpg").suffix or ".jpg"
+        fd, tmp_path = tempfile.mkstemp(suffix=suffix)
+        Path(tmp_path).unlink(missing_ok=True)
+        dest = Path(tmp_path)
+        await message.bot.download(message.document, destination=dest)
+        return dest
+    return None
 
-
-    # 3️⃣ Generic vision fallback
-    recognized_q = extract_question_from_image(img_path) or (message.caption or "").strip()
-    if not recognized_q:
-        recognized_q = vision_extract_insights(img_path)
-
-    if not recognized_q:
-        return await message.answer("No pude leer la pregunta ni el contenido de la imagen 😕")
-
-    LAST_QUERY[message.chat.id] = recognized_q
-    is_admin = _is_admin(message.from_user.id if message.from_user else None)
-    user_id = str(message.from_user.id) if message.from_user else None
-    meta = {"agent_key": agent_key, "chat_id": message.chat.id, "via": "image"}
-
-    with trace_ctx("telegram.image", user_id=user_id, metadata=meta) as tr:
-        with span_ctx(tr, "agent.answer", metadata={"question": recognized_q}):
-            loop = asyncio.get_running_loop()
-            raw = await loop.run_in_executor(None, lambda: _agent.answer(recognized_q, agent_key=agent_key, is_admin=is_admin))
-        try:
-            log_generation(tr, "openai.chat", recognized_q, raw, getattr(settings, "CHAT_MODEL", "gpt-4o-mini"), {}, meta)
-        except Exception:
-            pass
-
-    await message.answer(_clean_for_user(raw, is_admin))
-
-
-@router.message(F.photo)
-async def on_photo(message: Message):
-    await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
-    img_path = await _download_image_best(message.bot, message.photo)
-    try:
-        await _handle_image_common(message, img_path)
-    finally:
-        try:
-            img_path.unlink(missing_ok=True)
-        except Exception:
-            pass
+def _compose_question_from_image(caption: str, ocr_txt: str, vision_txt: str) -> str:
+    parts = []
+    if caption:
+        parts.append(f"Usuario dijo sobre la imagen: {caption.strip()}")
+    if ocr_txt:
+        parts.append(f"Texto detectado en la imagen:\n{ocr_txt.strip()}")
+    elif vision_txt:
+        parts.append(f"Contenido interpretado de la imagen:\n{vision_txt.strip()}")
+    if not parts:
+        parts.append("Interpreta la imagen y responde según RETIE.")
+    return "\n\nCon base en lo anterior, responde la consulta del usuario de forma breve y precisa."
 
 
-# ---------------- Text ----------------
-@router.message(F.text)
-async def on_text(message: Message):
-    q = (message.text or "").strip().lower()
-    agent_key = CHAT_AGENT.get(message.chat.id, DEFAULT_AGENT)
-    LAST_QUERY[message.chat.id] = q
-    await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
-
-    if any(word in q for word in ["hola", "buenas", "hey", "saludos"]):
-        return await message.answer("👋 ¡Hola! Qué gusto saludarte 😊. ¿En qué puedo ayudarte hoy?")
-    if any(word in q for word in ["gracias", "thank you", "te agradezco"]):
-        return await message.answer("🙏 ¡Con gusto! Si necesitas otra consulta sobre el RETIE, aquí estaré 😉")
-    if any(word in q for word in ["adiós", "bye", "chao", "nos vemos", "hasta luego"]):
-        return await message.answer("👋 ¡Hasta luego! Espero haberte ayudado con tu consulta🔌")
-
-    # --- regular flow (technical questions) ---
-    is_admin = _is_admin(message.from_user.id if message.from_user else None)
-    user_id = str(message.from_user.id) if message.from_user else None
-    meta = {"agent_key": agent_key, "chat_id": message.chat.id}
-
-    with trace_ctx("telegram.message", user_id=user_id, metadata=meta) as tr:
-        with span_ctx(tr, "agent.answer", metadata={"question": q}):
-            loop = asyncio.get_running_loop()
-            raw = await loop.run_in_executor(
-                None, lambda: _agent.answer(q, agent_key=agent_key, is_admin=is_admin)
-            )
-        try:
-            log_generation(tr, "openai.chat", q, raw, getattr(settings, "CHAT_MODEL", "gpt-4o-mini"), {}, meta)
-        except Exception:
-            pass
-
-    await message.answer(_clean_for_user(raw, is_admin))
+# ----------------------- VOICE/AUDIO -----------------------
 
 @router.message(F.voice | F.audio)
 async def on_voice(message: Message):
@@ -264,5 +309,99 @@ async def on_voice(message: Message):
         except Exception:
             pass
 
+    resp = _clean_for_user(raw_resp, is_admin)
+    await message.answer(resp)
+
+
+# ----------------------- IMAGES (photo + image document) -----------------------
+
+@router.message(F.photo)
+async def on_photo(message: Message):
+    agent_key = CHAT_AGENT.get(message.chat.id, DEFAULT_AGENT)
+    await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
+
+    img_path = await _download_image_to_tmp(message)
+    if not img_path:
+        return await message.answer("No pude descargar la imagen.")
+
+    ocr_lang = os.getenv("OCR_LANG", "eng")  # set OCR_LANG=spa if you installed Spanish data
+    ocr_txt = ""
+    try:
+        ocr_txt = ocr_image(img_path, lang=ocr_lang)
+    except Exception:
+        ocr_txt = ""
+
+    vision_txt = ""
+    if not ocr_txt or len(ocr_txt) < 12:
+        try:
+            vision_txt = vision_extract_insights(img_path, user_prompt=message.caption or "", model=os.getenv("VISION_MODEL", "gpt-4o-mini"))
+        except Exception:
+            vision_txt = ""
+
+    question = _compose_question_from_image(message.caption or "", ocr_txt, vision_txt)
+    LAST_QUERY[message.chat.id] = question
+
+    with trace_ctx("telegram.image", user_id=str(message.from_user.id) if message.from_user else None,
+                   metadata={"agent_key": agent_key, "ocr_len": len(ocr_txt), "vision_len": len(vision_txt)}):
+        loop = asyncio.get_running_loop()
+        raw_resp = await loop.run_in_executor(
+            None,
+            lambda: _agent.answer(
+                question,
+                agent_key=agent_key,
+                is_admin=_is_admin(message.from_user.id if message.from_user else None),
+            ),
+        )
+
+    is_admin = _is_admin(message.from_user.id if message.from_user else None)
+    resp = _clean_for_user(raw_resp, is_admin)
+    await message.answer(resp)
+
+@router.message(F.document)
+async def on_image_document(message: Message):
+    # Only handle if it's an image/*
+    if not (message.document and message.document.mime_type and message.document.mime_type.startswith("image/")):
+        return  # ignore other documents
+    return await on_photo(message)  # reuse same logic
+
+
+# ----------------------- TEXT -----------------------
+
+@router.message(F.text)
+async def on_text(message: Message):
+    q = (message.text or "").strip()
+    agent_key = CHAT_AGENT.get(message.chat.id, DEFAULT_AGENT)
+    LAST_QUERY[message.chat.id] = q
+
+    await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
+
+    user_id = str(message.from_user.id) if message.from_user else None
+    meta = {"agent_key": agent_key, "chat_id": message.chat.id}
+
+    with trace_ctx("telegram.message", user_id=user_id, metadata=meta) as tr:
+        with span_ctx(tr, "agent.answer", metadata={"question": q}):
+            loop = asyncio.get_running_loop()
+            raw_resp = await loop.run_in_executor(
+                None,
+                lambda: _agent.answer(
+                    q,
+                    agent_key=agent_key,
+                    is_admin=_is_admin(message.from_user.id if message.from_user else None),
+                ),
+            )
+        try:
+            log_generation(
+                tr,
+                name="openai.chat",
+                input_text=q,
+                output_text=raw_resp,
+                model=getattr(settings, "CHAT_MODEL", "gpt-4o-mini"),
+                usage={},
+                metadata={"agent_key": agent_key},
+            )
+        except Exception:
+            pass
+
+    is_admin = _is_admin(message.from_user.id if message.from_user else None)
     resp = _clean_for_user(raw_resp, is_admin)
     await message.answer(resp)
