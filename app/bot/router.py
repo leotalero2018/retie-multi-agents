@@ -208,3 +208,61 @@ async def on_text(message: Message):
 
     await message.answer(_clean_for_user(raw, is_admin))
 
+@router.message(F.voice | F.audio)
+async def on_voice(message: Message):
+    await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
+
+    tg_obj = message.voice or message.audio
+    suffix = ".oga" if message.voice else (Path((tg_obj.file_name or "audio.mp3")).suffix or ".mp3")
+
+    local_file = await _download_to_tmp(message.bot, tg_obj.file_id, suffix)
+
+    wav_file: Optional[Path] = None
+    try:
+        wav_file = _to_wav_if_needed(local_file)
+        transcript = transcribe_audio(wav_file, language="es").strip()
+    except Exception as e:
+        try:
+            local_file.unlink(missing_ok=True)
+            if wav_file and wav_file != local_file:
+                wav_file.unlink(missing_ok=True)
+        finally:
+            return await message.answer(f"⚠️ Error al transcribir el audio: {e}")
+
+    try:
+        local_file.unlink(missing_ok=True)
+        if wav_file and wav_file != local_file:
+            wav_file.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+    if not transcript:
+        return await message.answer("No pude entender el audio 😕")
+
+    agent_key = CHAT_AGENT.get(message.chat.id, DEFAULT_AGENT)
+    LAST_QUERY[message.chat.id] = transcript
+    is_admin = _is_admin(message.from_user.id if message.from_user else None)
+    meta = {"agent_key": agent_key, "chat_id": message.chat.id, "via": "voice"}
+
+    with trace_ctx("telegram.voice", user_id=str(message.from_user.id) if message.from_user else None, metadata=meta) as tr:
+        with span_ctx(tr, "agent.answer", metadata={"question": transcript}):
+            loop = asyncio.get_running_loop()
+            raw_resp = await loop.run_in_executor(
+                None,
+                lambda: _agent.answer(transcript, agent_key=agent_key, is_admin=is_admin),
+            )
+        try:
+            log_generation(
+                tr,
+                name="openai.chat",
+                input_text=transcript,
+                output_text=raw_resp,
+                model=getattr(settings, "CHAT_MODEL", "gpt-4o-mini"),
+                usage={},
+                metadata={"agent_key": agent_key, "via": "voice"},
+            )
+        except Exception:
+            pass
+
+    resp = _clean_for_user(raw_resp, is_admin)
+    await message.answer(resp)
