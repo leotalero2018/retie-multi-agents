@@ -272,7 +272,7 @@ async def on_voice(message: Message):
             if wav_file and wav_file != local_file:
                 wav_file.unlink(missing_ok=True)
         finally:
-            return await message.answer(f"⚠️ Error al transcribir el audio: {e}")
+            return await message.answer(f"⚠️ audio inaudible")
 
     try:
         local_file.unlink(missing_ok=True)
