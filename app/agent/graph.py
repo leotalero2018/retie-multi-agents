@@ -142,7 +142,7 @@ def _node_answer(state: GraphState) -> GraphState:
         except Exception:
             pass
 
-        return {"answer": answer}
+        return {"answer": answer, "route": "answer_node"}
 
 
 def _node_no_context(state: GraphState) -> GraphState:
@@ -154,7 +154,7 @@ def _node_no_context(state: GraphState) -> GraphState:
                 lf.update_current_span(output={"answer_preview": "No tengo evidencia en los documentos."})
         except Exception:
             pass
-        return {"answer": "No tengo evidencia en los documentos."}
+        return {"answer": "No tengo evidencia en los documentos.", "route": "no_context"}
 
 
 # ---------- Graph builder (singleton compiled) ----------

@@ -123,26 +123,38 @@ def log_generation(
 
 # ----------------- New helpers for root preview / graph mini-diagram -----------------
 
-def set_root_preview(*, output: Optional[Dict[str, Any]] = None, input: Optional[Dict[str, Any]] = None,
-                     metadata: Optional[Dict[str, Any]] = None) -> None:
+def set_root_preview(
+    *, output: Optional[Dict[str, Any]] = None,
+    input: Optional[Dict[str, Any]] = None,
+    metadata: Optional[Dict[str, Any]] = None
+) -> None:
     """
-    Update the *current root span* with preview fields. Some Langfuse UIs render
-    'output' directly in the right panel.
+    Update the *current root span* with preview fields.
+    IMPORTANT: only send fields that are provided, otherwise we'd overwrite
+    existing 'input'/'output' on the span with empty dicts.
     """
     lf = _get_client()
     if lf is None:
         return
     try:
-        if input or output or metadata:
-            lf.update_current_span(input=input or {}, output=output or {}, metadata=metadata or {})
+        kwargs: Dict[str, Any] = {}
+        if input is not None:
+            kwargs["input"] = input
+        if output is not None:
+            kwargs["output"] = output
+        if metadata is not None:
+            kwargs["metadata"] = metadata
+        if kwargs:
+            lf.update_current_span(**kwargs)
     except Exception:
         pass
-    # Defensive: also attach to trace metadata for UIs that read from trace
+    # Defensive: also attach to the trace metadata for UIs that read from trace
     try:
-        if metadata:
+        if metadata is not None:
             lf.update_current_trace(metadata=metadata)
     except Exception:
         pass
+
 
 
 def set_graph_preview(graph_spec: Dict[str, Any]) -> None:
