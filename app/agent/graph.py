@@ -15,7 +15,7 @@ from app.agent.retie_agent import (
     _resolve_collection,
     _resolve_model,
 )
-from app.observability.obs import trace_ctx, span_ctx, log_generation
+from app.observability.obs import trace_ctx, span_ctx, log_generation  # _get_client imported inside run_graph
 
 
 # ---------- State ----------
@@ -45,7 +45,7 @@ def make_state(
     }
 
 
-# ---------- Low-level LLM client (re-usa tu config) ----------
+# ---------- Low-level LLM client (re-uses your config) ----------
 
 _client = OpenAI(api_key=getattr(settings, "OPENAI_API_KEY", None))
 
@@ -58,9 +58,21 @@ def _node_retrieve(state: GraphState) -> GraphState:
     coll = _resolve_collection(agent_key, explicit=None)
     top_k = getattr(settings, "TOP_K", 4)
 
-    # Cada nodo abre su span para Langfuse
     with span_ctx(None, "retrieve", {"q": q, "collection": coll, "top_k": top_k}):
         hits = _dedupe_hits(search(q, top_k=top_k, collection_name=coll))
+
+        # enrich span preview
+        try:
+            from app.observability.obs import _get_client
+            lf = _get_client()
+            if lf:
+                lf.update_current_span(
+                    input={"question": q, "collection": coll, "top_k": top_k},
+                    output={"hits_count": len(hits)},
+                )
+        except Exception:
+            pass
+
         return {"hits": hits}
 
 
@@ -68,16 +80,21 @@ def _node_router(state: GraphState) -> GraphState:
     hits = state.get("hits") or []
     route = "answer_node" if len(hits) > 0 else "no_context"
     with span_ctx(None, "router", {"hits": len(hits), "route": route}):
+        try:
+            from app.observability.obs import _get_client
+            lf = _get_client()
+            if lf:
+                lf.update_current_span(input={"hits_count": len(hits)}, output={"route": route})
+        except Exception:
+            pass
         return {"route": route}
 
 
 def _node_answer(state: GraphState) -> GraphState:
     q = state["question"]
     agent_key = state.get("agent_key")
-
     hits = state.get("hits") or []
     if not hits:
-        # Normalmente no llegamos aquí si router decide "no_context", pero lo dejamos defensivo
         return {"answer": "No tengo evidencia en los documentos."}
 
     model = _resolve_model(agent_key, explicit=None)
@@ -96,7 +113,7 @@ def _node_answer(state: GraphState) -> GraphState:
         )
         answer = (resp.choices[0].message.content or "").strip()
 
-        # Guarda la generación en la traza (aparece como "Generation" en Langfuse)
+        # log generation
         try:
             usage = getattr(resp, "usage", None)
             usage_dict = {
@@ -116,23 +133,37 @@ def _node_answer(state: GraphState) -> GraphState:
         except Exception:
             pass
 
+        # enrich span preview
+        try:
+            from app.observability.obs import _get_client
+            lf = _get_client()
+            if lf:
+                lf.update_current_span(input={"model": model}, output={"answer_preview": answer[:140]})
+        except Exception:
+            pass
+
         return {"answer": answer}
 
 
 def _node_no_context(state: GraphState) -> GraphState:
     with span_ctx(None, "answer_node", {"route": "no_context"}):
+        try:
+            from app.observability.obs import _get_client
+            lf = _get_client()
+            if lf:
+                lf.update_current_span(output={"answer_preview": "No tengo evidencia en los documentos."})
+        except Exception:
+            pass
         return {"answer": "No tengo evidencia en los documentos."}
 
 
-# ---------- Graph builder (singleton compilado) ----------
+# ---------- Graph builder (singleton compiled) ----------
 
 @dataclass
 class _Compiled:
     app: Any
 
-
 _COMPILED: Optional[_Compiled] = None
-
 
 def build_graph():
     global _COMPILED
@@ -166,6 +197,23 @@ def build_graph():
 
 # ---------- Public runner ----------
 
+def _graph_spec(route_value: str) -> Dict[str, Any]:
+    """
+    Build a tiny graph descriptor for Langfuse previews.
+    Some Langfuse versions show the mini-diagram when metadata.graph is present.
+    """
+    nodes = ["_start_", "retrieve", "router", "answer_node", "no_context", "END"]
+    edges = [
+        {"from": "_start_", "to": "retrieve"},
+        {"from": "retrieve", "to": "router"},
+        {"from": "router", "to": route_value},
+        {"from": route_value, "to": "END"},
+    ]
+    # remove impossible edge if route is answer_node/no_context only
+    if route_value not in ("answer_node", "no_context"):
+        edges = [e for e in edges if not (e["from"] == "router" and e["to"] == route_value)]
+    return {"nodes": nodes, "edges": edges}
+
 def run_graph(
     question: str,
     user_id: str = "anon",
@@ -177,7 +225,7 @@ def run_graph(
     """
     Ejecuta el grafo con instrumentación Langfuse. Devuelve sólo el texto final.
     """
-    from app.observability.obs import trace_ctx, span_ctx, log_generation, _get_client  # <- import _get_client
+    from app.observability.obs import trace_ctx, span_ctx, _get_client
 
     with trace_ctx(
         name="LangGraph",
@@ -189,26 +237,29 @@ def run_graph(
             **(metadata or {}),
         },
     ):
-        # 1) Span inicial para que salga el bloque verde "_start_"
+        # 1) little green start box
         with span_ctx(None, "_start_"):
             pass
 
-        # 2) Ejecutar el grafo
+        # 2) run the compiled graph
         app = build_graph()
         out = app.invoke(make_state(question, user_id=user_id, session=session, agent_key=agent_key))
+        route_value = out.get("route", "answer_node")
 
-        # 3) (Opcional) mostrar "answer" y "route" en el preview del root trace
+        # 3) set root preview (answer + route) AND attach a graph spec
         lf = _get_client()
         if lf:
             try:
                 lf.update_current_span(
                     output={
                         "answer": out.get("answer"),
-                        "route": out.get("route", "answer_node"),
-                    }
+                        "route": route_value,
+                    },
+                    metadata={
+                        "graph": _graph_spec(route_value)  # <-- mini-diagram hint
+                    },
                 )
             except Exception:
                 pass
 
         return out.get("answer", "No tengo evidencia en los documentos.")
-
