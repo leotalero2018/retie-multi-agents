@@ -177,8 +177,8 @@ def run_graph(
     """
     Ejecuta el grafo con instrumentación Langfuse. Devuelve sólo el texto final.
     """
-    # IMPORTANTE: nombramos la traza raíz "LangGraph" para que en Langfuse
-    # el listado salga exactamente como en la captura.
+    from app.observability.obs import trace_ctx, span_ctx, log_generation, _get_client  # <- import _get_client
+
     with trace_ctx(
         name="LangGraph",
         user_id=user_id,
@@ -189,6 +189,26 @@ def run_graph(
             **(metadata or {}),
         },
     ):
+        # 1) Span inicial para que salga el bloque verde "_start_"
+        with span_ctx(None, "_start_"):
+            pass
+
+        # 2) Ejecutar el grafo
         app = build_graph()
         out = app.invoke(make_state(question, user_id=user_id, session=session, agent_key=agent_key))
+
+        # 3) (Opcional) mostrar "answer" y "route" en el preview del root trace
+        lf = _get_client()
+        if lf:
+            try:
+                lf.update_current_span(
+                    output={
+                        "answer": out.get("answer"),
+                        "route": out.get("route", "answer_node"),
+                    }
+                )
+            except Exception:
+                pass
+
         return out.get("answer", "No tengo evidencia en los documentos.")
+
