@@ -223,9 +223,27 @@ def run_graph(
     metadata: Optional[Dict[str, Any]] = None,
 ) -> str:
     """
-    Ejecuta el grafo con instrumentación Langfuse. Devuelve sólo el texto final.
+    Ejecuta el grafo con instrumentación Langfuse y devuelve el texto final.
+    Muestra _start_ y adjunta un pequeño 'graph spec' para que el UI pueda
+    renderizar el mini diagrama cuando esté disponible.
     """
-    from app.observability.obs import trace_ctx, span_ctx, _get_client
+    from app.observability.obs import trace_ctx, span_ctx
+
+    # Prefer helper APIs if present; otherwise fallback to direct client update
+    _has_helpers = False
+    set_root_preview = None
+    set_graph_preview = None
+    _get_client = None
+    try:
+        from app.observability.obs import set_root_preview as _srp, set_graph_preview as _sgp  # type: ignore
+        set_root_preview, set_graph_preview = _srp, _sgp
+        _has_helpers = True
+    except Exception:
+        try:
+            from app.observability.obs import _get_client as _gc  # type: ignore
+            _get_client = _gc
+        except Exception:
+            _get_client = lambda: None  # type: ignore
 
     with trace_ctx(
         name="LangGraph",
@@ -237,29 +255,41 @@ def run_graph(
             **(metadata or {}),
         },
     ):
-        # 1) little green start box
+        # 1) Bloque verde inicial
         with span_ctx(None, "_start_"):
             pass
 
-        # 2) run the compiled graph
+        # 2) Ejecutar el grafo compilado
         app = build_graph()
         out = app.invoke(make_state(question, user_id=user_id, session=session, agent_key=agent_key))
         route_value = out.get("route", "answer_node")
 
-        # 3) set root preview (answer + route) AND attach a graph spec
-        lf = _get_client()
-        if lf:
+        # 3) Preview + mini diagrama
+        nodes = ["_start_", "retrieve", "router", "answer_node", "no_context", "END"]
+        edges = [
+            {"from": "_start_", "to": "retrieve"},
+            {"from": "retrieve", "to": "router"},
+            {"from": "router", "to": route_value},
+            {"from": route_value, "to": "END"},
+        ]
+        graph_spec = {"nodes": nodes, "edges": edges}
+
+        if _has_helpers and set_root_preview and set_graph_preview:
             try:
-                lf.update_current_span(
-                    output={
-                        "answer": out.get("answer"),
-                        "route": route_value,
-                    },
-                    metadata={
-                        "graph": _graph_spec(route_value)  # <-- mini-diagram hint
-                    },
-                )
+                set_root_preview(output={"answer": out.get("answer"), "route": route_value})
+                set_graph_preview(graph_spec)
+            except Exception:
+                pass
+        else:
+            try:
+                lf = _get_client() if _get_client else None
+                if lf:
+                    lf.update_current_span(
+                        output={"answer": out.get("answer"), "route": route_value},
+                        metadata={"graph": graph_spec},
+                    )
             except Exception:
                 pass
 
         return out.get("answer", "No tengo evidencia en los documentos.")
+

@@ -119,3 +119,48 @@ def log_generation(
                 pass
     except Exception:
         pass
+
+
+# ----------------- New helpers for root preview / graph mini-diagram -----------------
+
+def set_root_preview(*, output: Optional[Dict[str, Any]] = None, input: Optional[Dict[str, Any]] = None,
+                     metadata: Optional[Dict[str, Any]] = None) -> None:
+    """
+    Update the *current root span* with preview fields. Some Langfuse UIs render
+    'output' directly in the right panel.
+    """
+    lf = _get_client()
+    if lf is None:
+        return
+    try:
+        if input or output or metadata:
+            lf.update_current_span(input=input or {}, output=output or {}, metadata=metadata or {})
+    except Exception:
+        pass
+    # Defensive: also attach to trace metadata for UIs that read from trace
+    try:
+        if metadata:
+            lf.update_current_trace(metadata=metadata)
+    except Exception:
+        pass
+
+
+def set_graph_preview(graph_spec: Dict[str, Any]) -> None:
+    """
+    Attach a minimal DAG definition to the root span/trace. Many Langfuse builds
+    render a mini diagram when a 'graph' object is present.
+    graph_spec example:
+      {"nodes": ["_start_","retrieve","router","answer_node","END"],
+       "edges": [{"from":"_start_","to":"retrieve"}, ...]}
+    """
+    lf = _get_client()
+    if lf is None:
+        return
+    try:
+        lf.update_current_span(metadata={"graph": graph_spec})
+    except Exception:
+        pass
+    try:
+        lf.update_current_trace(metadata={"graph": graph_spec})
+    except Exception:
+        pass
