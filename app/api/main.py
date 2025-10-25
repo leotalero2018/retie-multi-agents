@@ -8,21 +8,9 @@ import os
 from fastapi import FastAPI, Request, Query, APIRouter, HTTPException
 from fastapi.responses import Response, HTMLResponse
 
-from app.agent.retie_agent import RetieAgent
+from app.agent.graph import run_graph
 from app.api.debug import router as debug_router
 from app.api import ingest
-
-# Optional observability: if not present, silently no-op
-try:
-    from app.observability.obs import trace_ctx, span_ctx, log_generation
-except Exception:
-    class _DummyCtx:
-        def __call__(self, *a, **k): return self
-        def __enter__(self): return self
-        def __exit__(self, *a): return False
-    def log_generation(*a, **k):  # type: ignore
-        return
-    trace_ctx = span_ctx = _DummyCtx()
 
 app = FastAPI(title="RETIE Agent API")
 
@@ -31,7 +19,6 @@ app.include_router(debug_router)
 app.include_router(ingest.router)
 
 router = APIRouter()
-_agent = RetieAgent()
 
 @app.get("/health")
 async def health():
@@ -41,20 +28,19 @@ async def health():
 def query_docs(
     q: str = Query(..., description="User question"),
     agent_key: str | None = Query(default=None, description="Route to a specific collection (e.g., plumber|pymupdf)"),
-    admin: bool = Query(default=False, description="If true, include sources in the answer"),
+    admin: bool = Query(default=False, description="(ignorado; el grafo responde modo usuario)"),
 ):
     """
-    Answer a question using the embedded Chroma DB via RetieAgent.
+    Answer a question using the LangGraph pipeline (instrumented for Langfuse).
     If `agent_key` is provided, it switches the collection.
     """
-    with trace_ctx(name="api_query", user_id="api", metadata={"agent_key": agent_key, "q": q, "admin": admin}) as tr:
-        with span_ctx(tr, "agent_answer"):
-            answer = _agent.answer(q, agent_key=agent_key, is_admin=admin)
-        try:
-            log_generation(tr, "final_answer", q, answer, model="", usage=None,
-                           metadata={"agent_key": agent_key, "admin": admin})
-        except Exception:
-            pass
+    answer = run_graph(
+        q,
+        user_id="api",
+        session="api_query",
+        agent_key=agent_key,
+        metadata={"via": "http"},
+    )
     return {"question": q, "answer": answer, "agent_key": agent_key, "admin": admin}
 
 app.include_router(router)
@@ -73,12 +59,10 @@ if TELEGRAM_BOT_TOKEN:
     @app.post("/telegram/webhook")
     async def telegram_webhook(request: Request):
         body = await request.json()
-        with trace_ctx(name="telegram_webhook",
-                       user_id=str(body.get("message", {}).get("from", {}).get("id", ""))):
-            if dp is None:
-                return {"status": "disabled", "reason": "dp not available"}
-            update = types.Update.model_validate(body)
-            await dp.feed_update(bot, update)
+        if dp is None:
+            return {"status": "disabled", "reason": "dp not available"}
+        update = types.Update.model_validate(body)
+        await dp.feed_update(bot, update)
         return {"status": "ok"}
 else:
     @app.post("/telegram/webhook")

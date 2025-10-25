@@ -1,124 +1,194 @@
 # app/agent/graph.py
-from typing import Dict, List, Literal, TypedDict, Optional
+from __future__ import annotations
+
+from typing import TypedDict, Optional, List, Dict, Any
+from dataclasses import dataclass
+
 from langgraph.graph import StateGraph, END
-from langfuse.langchain import CallbackHandler
-from langchain_core.runnables.config import RunnableConfig
+from openai import OpenAI
 
 from app.config import settings
 from app.retriever.retrieve import search
 from app.agent.prompt import make_prompt
-from app.llm.provider import chat_answer
-from app.agent.registry import AGENTS
-from app.agent.orchestrator import _dedupe_hits
+from app.agent.retie_agent import (
+    _dedupe_hits,
+    _resolve_collection,
+    _resolve_model,
+)
+from app.observability.obs import trace_ctx, span_ctx, log_generation
 
 
-# ---- State definition ----
-class GraphState(TypedDict):
+# ---------- State ----------
+
+class GraphState(TypedDict, total=False):
     question: str
-    hits: List[Dict]
-    prompt: str
-    answer: str
-    route: Literal["extractive_bot", "openai_bot"]
+    user_id: str
+    session: str
     agent_key: Optional[str]
+    hits: List[Dict[str, Any]]
+    route: str
+    answer: str
 
 
-# ---- Nodes ----
-def node_retrieve(state: GraphState) -> GraphState:
+def make_state(
+    question: str,
+    *,
+    user_id: str = "anon",
+    session: str = "default",
+    agent_key: Optional[str] = None,
+) -> GraphState:
+    return {
+        "question": (question or "").strip(),
+        "user_id": user_id or "anon",
+        "session": session or "default",
+        "agent_key": agent_key,
+    }
+
+
+# ---------- Low-level LLM client (re-usa tu config) ----------
+
+_client = OpenAI(api_key=getattr(settings, "OPENAI_API_KEY", None))
+
+
+# ---------- Nodes ----------
+
+def _node_retrieve(state: GraphState) -> GraphState:
     q = state["question"]
     agent_key = state.get("agent_key")
-    collection_name: Optional[str] = None
+    coll = _resolve_collection(agent_key, explicit=None)
+    top_k = getattr(settings, "TOP_K", 4)
 
-    # Si hay agente, usamos su colección; si no, la default de settings
-    if agent_key and agent_key in AGENTS:
-        collection_name = AGENTS[agent_key].collection
-
-    raw_hits = search(q, top_k=settings.TOP_K, collection_name=collection_name)
-    hits = _dedupe_hits(raw_hits)
-    state["hits"] = hits
-    state["prompt"] = make_prompt(hits, q)
-    return state
+    # Cada nodo abre su span para Langfuse
+    with span_ctx(None, "retrieve", {"q": q, "collection": coll, "top_k": top_k}):
+        hits = _dedupe_hits(search(q, top_k=top_k, collection_name=coll))
+        return {"hits": hits}
 
 
-def node_router(state: GraphState) -> GraphState:
-    """Decide qué 'bot' usar"""
-    provider = getattr(settings, "CHAT_PROVIDER", "extractive").lower()
-    state["route"] = "openai_bot" if provider == "openai" else "extractive_bot"
-    return state
+def _node_router(state: GraphState) -> GraphState:
+    hits = state.get("hits") or []
+    route = "answer_node" if len(hits) > 0 else "no_context"
+    with span_ctx(None, "router", {"hits": len(hits), "route": route}):
+        return {"route": route}
 
 
-def node_build_prompt(state: GraphState) -> GraphState:
+def _node_answer(state: GraphState) -> GraphState:
     q = state["question"]
-    hits = state["hits"]
-    state["prompt"] = make_prompt(hits, q)
-    return state
+    agent_key = state.get("agent_key")
+
+    hits = state.get("hits") or []
+    if not hits:
+        # Normalmente no llegamos aquí si router decide "no_context", pero lo dejamos defensivo
+        return {"answer": "No tengo evidencia en los documentos."}
+
+    model = _resolve_model(agent_key, explicit=None)
+    sys = "Eres un asistente útil."
+    prompt = make_prompt(hits, q, is_admin=False)
+
+    with span_ctx(None, "answer_node", {"model": model, "hits": len(hits)}):
+        resp = _client.chat.completions.create(
+            model=model,
+            temperature=0.0,
+            max_tokens=getattr(settings, "MAX_TOKENS", 600),
+            messages=[
+                {"role": "system", "content": sys},
+                {"role": "user", "content": prompt},
+            ],
+        )
+        answer = (resp.choices[0].message.content or "").strip()
+
+        # Guarda la generación en la traza (aparece como "Generation" en Langfuse)
+        try:
+            usage = getattr(resp, "usage", None)
+            usage_dict = {
+                "prompt_tokens": getattr(usage, "prompt_tokens", None),
+                "completion_tokens": getattr(usage, "completion_tokens", None),
+                "total_tokens": getattr(usage, "total_tokens", None),
+            }
+            log_generation(
+                None,
+                name="openai.chat",
+                input_text=prompt,
+                output_text=answer,
+                model=model,
+                usage=usage_dict,
+                metadata={"agent_key": agent_key},
+            )
+        except Exception:
+            pass
+
+        return {"answer": answer}
 
 
-def node_answer(state: GraphState) -> GraphState:
-    ans = chat_answer(state["prompt"], state["hits"], state["question"])
-    state["answer"] = ans
-    return state
+def _node_no_context(state: GraphState) -> GraphState:
+    with span_ctx(None, "answer_node", {"route": "no_context"}):
+        return {"answer": "No tengo evidencia en los documentos."}
 
 
-# ---- Graph build ----
-def build_graph() -> StateGraph:
+# ---------- Graph builder (singleton compilado) ----------
+
+@dataclass
+class _Compiled:
+    app: Any
+
+
+_COMPILED: Optional[_Compiled] = None
+
+
+def build_graph():
+    global _COMPILED
+    if _COMPILED is not None:
+        return _COMPILED.app
+
     g = StateGraph(GraphState)
 
-    # Añadimos nodos
-    g.add_node("retrieve", node_retrieve)
-    g.add_node("router", node_router)
-    g.add_node("build_prompt", node_build_prompt)
-    g.add_node("answer", node_answer)
+    g.add_node("retrieve", _node_retrieve)
+    g.add_node("router", _node_router)
+    g.add_node("answer_node", _node_answer)
+    g.add_node("no_context", _node_no_context)
 
-    # Definimos flujo
     g.set_entry_point("retrieve")
     g.add_edge("retrieve", "router")
-    g.add_edge("router", "build_prompt")
-    g.add_edge("build_prompt", "answer")
-    g.add_edge("answer", END)
+    g.add_conditional_edges(
+        "router",
+        lambda s: s.get("route", "no_context"),
+        {
+            "answer_node": "answer_node",
+            "no_context": "no_context",
+        },
+    )
+    g.add_edge("answer_node", END)
+    g.add_edge("no_context", END)
 
-    return g.compile()
+    app = g.compile()
+    _COMPILED = _Compiled(app=app)
+    return app
 
 
-# ---- Public API ----
-_graph: Optional[StateGraph] = None
-
+# ---------- Public runner ----------
 
 def run_graph(
     question: str,
     user_id: str = "anon",
     session: str = "default",
     agent_key: Optional[str] = None,
+    *,
+    metadata: Optional[Dict[str, Any]] = None,
 ) -> str:
-    global _graph
-    if _graph is None:
-        _graph = build_graph()
-
-    initial_state: GraphState = {
-        "question": question,
-        "hits": [],
-        "prompt": "",
-        "answer": "",
-        "route": "extractive_bot",
-        "agent_key": agent_key,
-    }
-
-    # Configuración de Langfuse Callback
-    lf_handler = CallbackHandler()
-    cfg: RunnableConfig = {
-        "callbacks": [lf_handler],
-        "tags": ["retie-agent", "graph"] + ([f"agent:{agent_key}"] if agent_key else []),
-        "metadata": {
+    """
+    Ejecuta el grafo con instrumentación Langfuse. Devuelve sólo el texto final.
+    """
+    # IMPORTANTE: nombramos la traza raíz "LangGraph" para que en Langfuse
+    # el listado salga exactamente como en la captura.
+    with trace_ctx(
+        name="LangGraph",
+        user_id=user_id,
+        metadata={
             "component": "agent_graph",
-            "user_id": user_id,
-            "session": session,
-            "user_question": question,
-            "agent_key": agent_key,
-        },
-        "configurable": {
-            "user_id": user_id,
+            "tags": ["retie-agent", "graph"],
             "session_id": session,
+            **(metadata or {}),
         },
-    }
-
-    final_state = _graph.invoke(initial_state, cfg)
-    return final_state["answer"]
+    ):
+        app = build_graph()
+        out = app.invoke(make_state(question, user_id=user_id, session=session, agent_key=agent_key))
+        return out.get("answer", "No tengo evidencia en los documentos.")

@@ -5,6 +5,7 @@ import os
 import re
 import asyncio
 import tempfile
+import contextvars
 from pathlib import Path
 from typing import Dict, Set, Optional, List
 
@@ -13,14 +14,12 @@ from aiogram.enums import ChatAction
 from aiogram.types import Message
 from aiogram.filters import CommandStart, Command
 
-from app.agent.retie_agent import RetieAgent
+# Run the LangGraph pipeline (instrumented for Langfuse)
+from app.agent.graph import run_graph
 from app.agent.registry import AGENTS as _AGENTS  # optional registry (may be empty)
 
 # --- create router FIRST (before any @router.message decorators) ---
 router = Router(name="telegram_router")
-
-# --- single agent instance ---
-_agent = RetieAgent()
 
 # --- admin controls ---
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "changeme")
@@ -83,15 +82,17 @@ def _clean_for_user(raw: str, is_admin: bool) -> str:
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
     return cleaned
 
-# --- observability (Langfuse v3 wrappers) ---
-from app.observability.obs import trace_ctx, span_ctx, log_generation
-from app.config import settings
-
 # --- voice transcription ---
 from app.services.whisper import transcribe_audio
 
 # --- image OCR / vision ---
 from app.services.vision import ocr_image, vision_extract_insights
+
+# Helper: run blocking code in executor **while preserving contextvars** so OTel/Langfuse spans keep parentage
+async def _to_thread_ctx(func, *args, **kwargs):
+    ctx = contextvars.copy_context()
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, lambda: ctx.run(func, *args, **kwargs))
 
 
 # ----------------------- commands & admin -----------------------
@@ -148,6 +149,7 @@ async def on_admin_logout(message: Message):
 
 @router.message(Command("docs"))
 async def on_docs(message: Message):
+    """Muestra documentos top-k de la última consulta (solo admins)."""
     if not _require_admin(message):
         return
     parts = (message.text or "").strip().split()
@@ -266,7 +268,7 @@ async def on_voice(message: Message):
     try:
         wav_file = _to_wav_if_needed(local_file)
         transcript = transcribe_audio(wav_file, language="es").strip()
-    except Exception as e:
+    except Exception:
         try:
             local_file.unlink(missing_ok=True)
             if wav_file and wav_file != local_file:
@@ -286,29 +288,18 @@ async def on_voice(message: Message):
 
     agent_key = CHAT_AGENT.get(message.chat.id, DEFAULT_AGENT)
     LAST_QUERY[message.chat.id] = transcript
+
+    # Ejecuta LangGraph (con su propia traza 'LangGraph')
+    raw_resp = await _to_thread_ctx(
+        run_graph,
+        transcript,
+        user_id=str(message.from_user.id) if message.from_user else "anon",
+        session=f"telegram-chat-{message.chat.id}",
+        agent_key=agent_key,
+        metadata={"via": "voice"},
+    )
+
     is_admin = _is_admin(message.from_user.id if message.from_user else None)
-    meta = {"agent_key": agent_key, "chat_id": message.chat.id, "via": "voice"}
-
-    with trace_ctx("telegram.voice", user_id=str(message.from_user.id) if message.from_user else None, metadata=meta) as tr:
-        with span_ctx(tr, "agent.answer", metadata={"question": transcript}):
-            loop = asyncio.get_running_loop()
-            raw_resp = await loop.run_in_executor(
-                None,
-                lambda: _agent.answer(transcript, agent_key=agent_key, is_admin=is_admin),
-            )
-        try:
-            log_generation(
-                tr,
-                name="openai.chat",
-                input_text=transcript,
-                output_text=raw_resp,
-                model=getattr(settings, "CHAT_MODEL", "gpt-4o-mini"),
-                usage={},
-                metadata={"agent_key": agent_key, "via": "voice"},
-            )
-        except Exception:
-            pass
-
     resp = _clean_for_user(raw_resp, is_admin)
     await message.answer(resp)
 
@@ -341,17 +332,14 @@ async def on_photo(message: Message):
     question = _compose_question_from_image(message.caption or "", ocr_txt, vision_txt)
     LAST_QUERY[message.chat.id] = question
 
-    with trace_ctx("telegram.image", user_id=str(message.from_user.id) if message.from_user else None,
-                   metadata={"agent_key": agent_key, "ocr_len": len(ocr_txt), "vision_len": len(vision_txt)}):
-        loop = asyncio.get_running_loop()
-        raw_resp = await loop.run_in_executor(
-            None,
-            lambda: _agent.answer(
-                question,
-                agent_key=agent_key,
-                is_admin=_is_admin(message.from_user.id if message.from_user else None),
-            ),
-        )
+    raw_resp = await _to_thread_ctx(
+        run_graph,
+        question,
+        user_id=str(message.from_user.id) if message.from_user else "anon",
+        session=f"telegram-chat-{message.chat.id}",
+        agent_key=agent_key,
+        metadata={"via": "image", "ocr_len": len(ocr_txt), "vision_len": len(vision_txt)},
+    )
 
     is_admin = _is_admin(message.from_user.id if message.from_user else None)
     resp = _clean_for_user(raw_resp, is_admin)
@@ -375,32 +363,14 @@ async def on_text(message: Message):
 
     await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
 
-    user_id = str(message.from_user.id) if message.from_user else None
-    meta = {"agent_key": agent_key, "chat_id": message.chat.id}
-
-    with trace_ctx("telegram.message", user_id=user_id, metadata=meta) as tr:
-        with span_ctx(tr, "agent.answer", metadata={"question": q}):
-            loop = asyncio.get_running_loop()
-            raw_resp = await loop.run_in_executor(
-                None,
-                lambda: _agent.answer(
-                    q,
-                    agent_key=agent_key,
-                    is_admin=_is_admin(message.from_user.id if message.from_user else None),
-                ),
-            )
-        try:
-            log_generation(
-                tr,
-                name="openai.chat",
-                input_text=q,
-                output_text=raw_resp,
-                model=getattr(settings, "CHAT_MODEL", "gpt-4o-mini"),
-                usage={},
-                metadata={"agent_key": agent_key},
-            )
-        except Exception:
-            pass
+    raw_resp = await _to_thread_ctx(
+        run_graph,
+        q,
+        user_id=str(message.from_user.id) if message.from_user else "anon",
+        session=f"telegram-chat-{message.chat.id}",
+        agent_key=agent_key,
+        metadata={"via": "text"},
+    )
 
     is_admin = _is_admin(message.from_user.id if message.from_user else None)
     resp = _clean_for_user(raw_resp, is_admin)
