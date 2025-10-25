@@ -223,27 +223,32 @@ def run_graph(
     metadata: Optional[Dict[str, Any]] = None,
 ) -> str:
     """
-    Ejecuta el grafo con instrumentación Langfuse y devuelve el texto final.
-    Muestra _start_ y adjunta un pequeño 'graph spec' para que el UI pueda
-    renderizar el mini diagrama cuando esté disponible.
+    Ejecuta el grafo con instrumentación Langfuse y, si está habilitado,
+    también envía la ejecución a LangSmith para obtener el diagrama de LangGraph.
     """
-    from app.observability.obs import trace_ctx, span_ctx
+    from app.observability.obs import trace_ctx, span_ctx, set_root_preview, set_graph_preview
 
-    # Prefer helper APIs if present; otherwise fallback to direct client update
-    _has_helpers = False
-    set_root_preview = None
-    set_graph_preview = None
-    _get_client = None
+    # --- (Opcional) envoltorio LangSmith para que aparezca el grafo ---
+    # Si langsmith no está instalado o no hay API key, esto queda como no-op.
+    def _identity_invoke(app, state):
+        return app.invoke(state)
+
+    _ls_invoke = _identity_invoke
     try:
-        from app.observability.obs import set_root_preview as _srp, set_graph_preview as _sgp  # type: ignore
-        set_root_preview, set_graph_preview = _srp, _sgp
-        _has_helpers = True
+        import os
+        from langsmith import traceable
+
+        _LANGSMITH_ON = str(os.getenv("LANGSMITH_TRACING", "")).lower() in ("1", "true", "yes")
+
+        @traceable(name="LangGraph")  # run raíz que LangSmith mostrará con grafo
+        def _ls_invoke(app, state):
+            # Nota: LangGraph + LangSmith detectan los nodos de StateGraph automáticamente.
+            return app.invoke(state)
+
+        if not _LANGSMITH_ON:
+            _ls_invoke = _identity_invoke  # respeta feature flag
     except Exception:
-        try:
-            from app.observability.obs import _get_client as _gc  # type: ignore
-            _get_client = _gc
-        except Exception:
-            _get_client = lambda: None  # type: ignore
+        _ls_invoke = _identity_invoke  # langsmith no disponible
 
     with trace_ctx(
         name="LangGraph",
@@ -255,41 +260,33 @@ def run_graph(
             **(metadata or {}),
         },
     ):
-        # 1) Bloque verde inicial
+        # 1) Bloque verde inicial en Langfuse
         with span_ctx(None, "_start_"):
             pass
 
-        # 2) Ejecutar el grafo compilado
+        # 2) Ejecutar grafo
         app = build_graph()
-        out = app.invoke(make_state(question, user_id=user_id, session=session, agent_key=agent_key))
+        state = make_state(question, user_id=user_id, session=session, agent_key=agent_key)
+
+        # -> Si LangSmith está activo, esta llamada queda trazada allí con diagrama.
+        out = _ls_invoke(app, state)
+
+        # 3) Preview + 'hint' de grafo para Langfuse (si alguna build lo soporta)
         route_value = out.get("route", "answer_node")
-
-        # 3) Preview + mini diagrama
-        nodes = ["_start_", "retrieve", "router", "answer_node", "no_context", "END"]
-        edges = [
-            {"from": "_start_", "to": "retrieve"},
-            {"from": "retrieve", "to": "router"},
-            {"from": "router", "to": route_value},
-            {"from": route_value, "to": "END"},
-        ]
-        graph_spec = {"nodes": nodes, "edges": edges}
-
-        if _has_helpers and set_root_preview and set_graph_preview:
-            try:
-                set_root_preview(output={"answer": out.get("answer"), "route": route_value})
-                set_graph_preview(graph_spec)
-            except Exception:
-                pass
-        else:
-            try:
-                lf = _get_client() if _get_client else None
-                if lf:
-                    lf.update_current_span(
-                        output={"answer": out.get("answer"), "route": route_value},
-                        metadata={"graph": graph_spec},
-                    )
-            except Exception:
-                pass
+        try:
+            set_root_preview(output={"answer": out.get("answer"), "route": route_value})
+            set_graph_preview({
+                "nodes": ["_start_", "retrieve", "router", "answer_node", "no_context", "END"],
+                "edges": [
+                    {"from": "_start_", "to": "retrieve"},
+                    {"from": "retrieve", "to": "router"},
+                    {"from": "router", "to": route_value},
+                    {"from": route_value, "to": "END"},
+                ],
+            })
+        except Exception:
+            pass
 
         return out.get("answer", "No tengo evidencia en los documentos.")
+
 
