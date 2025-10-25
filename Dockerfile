@@ -19,7 +19,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 
 # -------------------------------
-# Env (align CHROMA_* paths + disable telemetry)
+# Env (align CHROMA_* paths + disable LangSmith; enable Langfuse)
 # -------------------------------
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_DEFAULT_TIMEOUT=100 \
@@ -33,11 +33,11 @@ ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
     CHAT_MODEL=gpt-4o-mini \
     CHROMADB_TELEMETRY=OFF \
     OCR_LANG=spa+eng \
-    VISION_MODEL=gpt-4o
+    VISION_MODEL=gpt-4o \
     LANGFUSE_ENABLED=true \
-    LANGFUSE_PUBLIC_KEY=... \
-    LANGFUSE_SECRET_KEY=... \
-    LANGFUSE_HOST=https://cloud.langfuse.com \
+    LANGFUSE_PUBLIC_KEY=${LANGFUSE_PUBLIC_KEY} \
+    LANGFUSE_SECRET_KEY=${LANGFUSE_SECRET_KEY} \
+    LANGFUSE_HOST=${LANGFUSE_HOST:-https://cloud.langfuse.com} \
     LANGCHAIN_TRACING_V2=false \
     LANGSMITH_TRACING=false \
     LANGCHAIN_ENDPOINT= \
