@@ -1,6 +1,5 @@
 # app/agent/graph.py
 from __future__ import annotations
-
 from typing import TypedDict, Optional, List, Dict, Any
 from dataclasses import dataclass
 
@@ -10,16 +9,10 @@ from openai import OpenAI
 from app.config import settings
 from app.retriever.retrieve import search
 from app.agent.prompt import make_prompt
-from app.agent.retie_agent import (
-    _dedupe_hits,
-    _resolve_collection,
-    _resolve_model,
-)
-from app.observability.obs import trace_ctx, span_ctx, log_generation  # _get_client imported inside run_graph
-
+from app.agent.retie_agent import _dedupe_hits, _resolve_collection, _resolve_model
+from app.observability.obs import trace_ctx, span_ctx, log_generation
 
 # ---------- State ----------
-
 class GraphState(TypedDict, total=False):
     question: str
     user_id: str
@@ -29,14 +22,7 @@ class GraphState(TypedDict, total=False):
     route: str
     answer: str
 
-
-def make_state(
-    question: str,
-    *,
-    user_id: str = "anon",
-    session: str = "default",
-    agent_key: Optional[str] = None,
-) -> GraphState:
+def make_state(question: str, *, user_id: str = "anon", session: str = "default", agent_key: Optional[str] = None) -> GraphState:
     return {
         "question": (question or "").strip(),
         "user_id": user_id or "anon",
@@ -44,51 +30,26 @@ def make_state(
         "agent_key": agent_key,
     }
 
-
-# ---------- Low-level LLM client (re-uses your config) ----------
-
 _client = OpenAI(api_key=getattr(settings, "OPENAI_API_KEY", None))
 
-
 # ---------- Nodes ----------
-
 def _node_retrieve(state: GraphState) -> GraphState:
     q = state["question"]
     agent_key = state.get("agent_key")
     coll = _resolve_collection(agent_key, explicit=None)
     top_k = getattr(settings, "TOP_K", 4)
 
-    with span_ctx(None, "retrieve", {"q": q, "collection": coll, "top_k": top_k}):
+    # Make this a "retriever" observation so Langfuse can draw the graph.
+    with span_ctx(None, "retrieve", {"collection": coll, "top_k": top_k}, as_type="retriever", span_input={"q": q}):
         hits = _dedupe_hits(search(q, top_k=top_k, collection_name=coll))
-
-        # enrich span preview
-        try:
-            from app.observability.obs import _get_client
-            lf = _get_client()
-            if lf:
-                lf.update_current_span(
-                    input={"question": q, "collection": coll, "top_k": top_k},
-                    output={"hits_count": len(hits)},
-                )
-        except Exception:
-            pass
-
         return {"hits": hits}
-
 
 def _node_router(state: GraphState) -> GraphState:
     hits = state.get("hits") or []
     route = "answer_node" if len(hits) > 0 else "no_context"
-    with span_ctx(None, "router", {"hits": len(hits), "route": route}):
-        try:
-            from app.observability.obs import _get_client
-            lf = _get_client()
-            if lf:
-                lf.update_current_span(input={"hits_count": len(hits)}, output={"route": route})
-        except Exception:
-            pass
+    # Mark as a generic "chain" step
+    with span_ctx(None, "router", {"hits": len(hits), "route": route}, as_type="chain"):
         return {"route": route}
-
 
 def _node_answer(state: GraphState) -> GraphState:
     q = state["question"]
@@ -101,19 +62,15 @@ def _node_answer(state: GraphState) -> GraphState:
     sys = "Eres un asistente útil."
     prompt = make_prompt(hits, q, is_admin=False)
 
-    with span_ctx(None, "answer_node", {"model": model, "hits": len(hits)}):
+    with span_ctx(None, "answer_node", {"model": model, "hits": len(hits)}, as_type="chain"):
         resp = _client.chat.completions.create(
             model=model,
             temperature=0.0,
             max_tokens=getattr(settings, "MAX_TOKENS", 600),
-            messages=[
-                {"role": "system", "content": sys},
-                {"role": "user", "content": prompt},
-            ],
+            messages=[{"role": "system", "content": sys}, {"role": "user", "content": prompt}],
         )
         answer = (resp.choices[0].message.content or "").strip()
 
-        # log generation
         try:
             usage = getattr(resp, "usage", None)
             usage_dict = {
@@ -121,44 +78,17 @@ def _node_answer(state: GraphState) -> GraphState:
                 "completion_tokens": getattr(usage, "completion_tokens", None),
                 "total_tokens": getattr(usage, "total_tokens", None),
             }
-            log_generation(
-                None,
-                name="openai.chat",
-                input_text=prompt,
-                output_text=answer,
-                model=model,
-                usage=usage_dict,
-                metadata={"agent_key": agent_key},
-            )
+            log_generation(None, name="openai.chat", input_text=prompt, output_text=answer, model=model, usage=usage_dict, metadata={"agent_key": agent_key})
         except Exception:
             pass
 
-        # enrich span preview
-        try:
-            from app.observability.obs import _get_client
-            lf = _get_client()
-            if lf:
-                lf.update_current_span(input={"model": model}, output={"answer_preview": answer[:140]})
-        except Exception:
-            pass
-
-        return {"answer": answer, "route": "answer_node"}
-
+        return {"answer": answer}
 
 def _node_no_context(state: GraphState) -> GraphState:
-    with span_ctx(None, "answer_node", {"route": "no_context"}):
-        try:
-            from app.observability.obs import _get_client
-            lf = _get_client()
-            if lf:
-                lf.update_current_span(output={"answer_preview": "No tengo evidencia en los documentos."})
-        except Exception:
-            pass
-        return {"answer": "No tengo evidencia en los documentos.", "route": "no_context"}
+    with span_ctx(None, "answer_node", {"route": "no_context"}, as_type="chain"):
+        return {"answer": "No tengo evidencia en los documentos."}
 
-
-# ---------- Graph builder (singleton compiled) ----------
-
+# ---------- Graph builder ----------
 @dataclass
 class _Compiled:
     app: Any
@@ -171,7 +101,6 @@ def build_graph():
         return _COMPILED.app
 
     g = StateGraph(GraphState)
-
     g.add_node("retrieve", _node_retrieve)
     g.add_node("router", _node_router)
     g.add_node("answer_node", _node_answer)
@@ -182,10 +111,7 @@ def build_graph():
     g.add_conditional_edges(
         "router",
         lambda s: s.get("route", "no_context"),
-        {
-            "answer_node": "answer_node",
-            "no_context": "no_context",
-        },
+        {"answer_node": "answer_node", "no_context": "no_context"},
     )
     g.add_edge("answer_node", END)
     g.add_edge("no_context", END)
@@ -194,26 +120,7 @@ def build_graph():
     _COMPILED = _Compiled(app=app)
     return app
 
-
-# ---------- Public runner ----------
-
-def _graph_spec(route_value: str) -> Dict[str, Any]:
-    """
-    Build a tiny graph descriptor for Langfuse previews.
-    Some Langfuse versions show the mini-diagram when metadata.graph is present.
-    """
-    nodes = ["_start_", "retrieve", "router", "answer_node", "no_context", "END"]
-    edges = [
-        {"from": "_start_", "to": "retrieve"},
-        {"from": "retrieve", "to": "router"},
-        {"from": "router", "to": route_value},
-        {"from": route_value, "to": "END"},
-    ]
-    # remove impossible edge if route is answer_node/no_context only
-    if route_value not in ("answer_node", "no_context"):
-        edges = [e for e in edges if not (e["from"] == "router" and e["to"] == route_value)]
-    return {"nodes": nodes, "edges": edges}
-
+# ---------- Runner ----------
 def run_graph(
     question: str,
     user_id: str = "anon",
@@ -223,70 +130,27 @@ def run_graph(
     metadata: Optional[Dict[str, Any]] = None,
 ) -> str:
     """
-    Ejecuta el grafo con instrumentación Langfuse y, si está habilitado,
-    también envía la ejecución a LangSmith para obtener el diagrama de LangGraph.
+    Ejecuta el grafo con instrumentación Langfuse. Devuelve sólo el texto final.
     """
-    from app.observability.obs import trace_ctx, span_ctx, set_root_preview, set_graph_preview
-
-    # --- (Opcional) envoltorio LangSmith para que aparezca el grafo ---
-    # Si langsmith no está instalado o no hay API key, esto queda como no-op.
-    def _identity_invoke(app, state):
-        return app.invoke(state)
-
-    _ls_invoke = _identity_invoke
-    try:
-        import os
-        from langsmith import traceable
-
-        _LANGSMITH_ON = str(os.getenv("LANGSMITH_TRACING", "")).lower() in ("1", "true", "yes")
-
-        @traceable(name="LangGraph")  # run raíz que LangSmith mostrará con grafo
-        def _ls_invoke(app, state):
-            # Nota: LangGraph + LangSmith detectan los nodos de StateGraph automáticamente.
-            return app.invoke(state)
-
-        if not _LANGSMITH_ON:
-            _ls_invoke = _identity_invoke  # respeta feature flag
-    except Exception:
-        _ls_invoke = _identity_invoke  # langsmith no disponible
-
     with trace_ctx(
         name="LangGraph",
         user_id=user_id,
-        metadata={
-            "component": "agent_graph",
-            "tags": ["retie-agent", "graph"],
-            "session_id": session,
-            **(metadata or {}),
-        },
+        metadata={"component": "agent_graph", "tags": ["retie-agent", "graph"], "session_id": session, **(metadata or {})},
+        trace_input={"user_question": question, "agent_key": agent_key or "", "session_id": session, "via": "text"},
     ):
-        # 1) Bloque verde inicial en Langfuse
-        with span_ctx(None, "_start_"):
+        # Small green start box as an 'agent' node (helps Agent Graph)
+        with span_ctx(None, "_start_", as_type="agent"):
             pass
 
-        # 2) Ejecutar grafo
         app = build_graph()
-        state = make_state(question, user_id=user_id, session=session, agent_key=agent_key)
+        out = app.invoke(make_state(question, user_id=user_id, session=session, agent_key=agent_key))
 
-        # -> Si LangSmith está activo, esta llamada queda trazada allí con diagrama.
-        out = _ls_invoke(app, state)
-
-        # 3) Preview + 'hint' de grafo para Langfuse (si alguna build lo soporta)
-        route_value = out.get("route", "answer_node")
+        # Put final answer & route on the root preview
         try:
-            set_root_preview(output={"answer": out.get("answer"), "route": route_value})
-            set_graph_preview({
-                "nodes": ["_start_", "retrieve", "router", "answer_node", "no_context", "END"],
-                "edges": [
-                    {"from": "_start_", "to": "retrieve"},
-                    {"from": "retrieve", "to": "router"},
-                    {"from": "router", "to": route_value},
-                    {"from": route_value, "to": "END"},
-                ],
-            })
+            lf = __import__("app.observability.obs", fromlist=["_get_client"])._get_client()  # lazy import
+            if lf:
+                lf.update_current_span(output={"answer": out.get("answer"), "route": out.get("route", "answer_node")})
         except Exception:
             pass
 
         return out.get("answer", "No tengo evidencia en los documentos.")
-
-
