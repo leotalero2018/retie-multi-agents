@@ -132,18 +132,15 @@ def run_graph(
     metadata: Optional[Dict[str, Any]] = None,
 ) -> str:
     """
-    Ejecuta el grafo trazándolo con Langfuse (callback de LangChain) y
-    retorna sólo el texto final.
-    - Usa .stream(...) para que Langfuse reciba los eventos del grafo (necesario para el diagrama).
-    - Añade run_name y tags para agrupar en la UI.
+    Ejecuta el grafo con streaming + Langfuse callback y devuelve el texto final.
+    Mantiene el stream para el diagrama y agrega correctamente el estado final.
     """
-    # 1) compilar (o reutilizar) el grafo ya construido
     app = build_graph()
 
-    # 2) handler oficial de Langfuse para LangChain/LangGraph
+    # Handler oficial de Langfuse para LangChain/LangGraph
     langfuse_handler = CallbackHandler()
 
-    # 3) estado inicial
+    # Estado inicial
     state_in = make_state(
         question,
         user_id=user_id,
@@ -151,22 +148,42 @@ def run_graph(
         agent_key=agent_key,
     )
 
-    # 4) ejecuta *streaming* con callbacks → esto es lo que habilita el diagrama
-    final_state: Dict[str, Any] = {}
-    for _chunk in app.stream(
+    # Acumuladores
+    final_answer: Optional[str] = None
+    final_route: Optional[str] = None
+    last_answer_node: Optional[Dict[str, Any]] = None
+
+    # Ejecuta *streaming* con callbacks → habilita el diagrama
+    for step in app.stream(
         state_in,
         config={
             "callbacks": [langfuse_handler],
             "run_name": "LangGraph",
             "tags": ["retie-agent", "graph", f"user:{user_id}", f"session:{session}"],
-            # (opcional) metadatos visibles en el root run de LangChain
             "metadata": {**(metadata or {}), "agent_key": agent_key},
         },
     ):
-        # Cada _chunk es un dict incremental del estado. Nos quedamos con el último.
-        for _k, _v in _chunk.items():
-            final_state[_k] = _v
+      # step es un dict con un único par {nombre_nodo: update} o {"__end__": state}
+        node_name, node_update = next(iter(step.items()))
 
-    # 5) salida final
-    return final_state.get("answer", "No tengo evidencia en los documentos.")
+        if node_name == "__end__":
+            # Estado completo y aplanado
+            if isinstance(node_update, dict):
+                final_answer = node_update.get("answer", final_answer)
+                final_route = node_update.get("route", final_route)
+            break
 
+        # Guarda datos útiles de cualquier nodo
+        if isinstance(node_update, dict):
+            if "route" in node_update:
+                final_route = node_update["route"]
+            if node_name == "answer_node":
+                last_answer_node = node_update
+                if "answer" in node_update:
+                    final_answer = node_update["answer"]
+
+    # Fallback en caso de que no haya __end__ pero sí respuesta del nodo
+    if final_answer is None and last_answer_node and "answer" in last_answer_node:
+        final_answer = last_answer_node["answer"]
+
+    return final_answer or "No tengo evidencia en los documentos."
