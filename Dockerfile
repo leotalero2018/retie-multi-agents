@@ -19,7 +19,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /app
 
 # -------------------------------
-# Env (align CHROMA_* paths + disable LangSmith; enable Langfuse)
+# Env (align CHROMA_* paths + enable Langfuse, disable LangSmith)
+# *NO* metas secretos en la imagen; pásalos en runtime (Railway/ENV).
 # -------------------------------
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_DEFAULT_TIMEOUT=100 \
@@ -35,15 +36,8 @@ ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
     OCR_LANG=spa+eng \
     VISION_MODEL=gpt-4o \
     LANGFUSE_ENABLED=true \
-    LANGFUSE_PUBLIC_KEY=${LANGFUSE_PUBLIC_KEY} \
-    LANGFUSE_SECRET_KEY=${LANGFUSE_SECRET_KEY} \
-    LANGFUSE_HOST=${LANGFUSE_HOST:-https://cloud.langfuse.com} \
-    LANGCHAIN_TRACING_V2=false \
-    LANGSMITH_TRACING=false \
-    LANGCHAIN_ENDPOINT= \
-    LANGCHAIN_API_KEY= \
-    LANGSMITH_API_KEY= \
-    LANGSMITH_ENDPOINT=
+    # El SDK de Langfuse lee estas 3 vars en runtime:
+    LANGFUSE_BASE_URL=https://cloud.langfuse.com
 
 # -------------------------------
 # Copy requirements first (better cache)
@@ -51,11 +45,18 @@ ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
 COPY requirements.txt ./requirements.txt
 
 # -------------------------------
-# Install deps (ensure minio present)
+# Install deps
+# - requirements.txt del repo
+# - más: langgraph + langchain + langchain-openai (para CallbackHandler)
+# - minio client
 # -------------------------------
 RUN python -m pip install --upgrade pip && \
     pip install --no-cache-dir torch==2.2.2+cpu -f https://download.pytorch.org/whl/cpu/torch_stable.html && \
     pip install --no-cache-dir -r requirements.txt --progress-bar off && \
+    pip install --no-cache-dir \
+        langgraph==1.* \
+        langchain==0.3.* \
+        langchain-openai==0.2.* && \
     pip install --no-cache-dir minio==7.2.16
 
 # -------------------------------
@@ -69,5 +70,3 @@ COPY . .
 RUN mkdir -p /data/chroma_db /app/downloads && \
     chmod -R 777 /data
 
-# Railway will set the start command, e.g.:
-#   python -m app.bot.run_polling

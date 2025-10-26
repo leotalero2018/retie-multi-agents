@@ -121,6 +121,8 @@ def build_graph():
     return app
 
 # ---------- Runner ----------
+from langfuse.langchain import CallbackHandler
+
 def run_graph(
     question: str,
     user_id: str = "anon",
@@ -130,27 +132,41 @@ def run_graph(
     metadata: Optional[Dict[str, Any]] = None,
 ) -> str:
     """
-    Ejecuta el grafo con instrumentación Langfuse. Devuelve sólo el texto final.
+    Ejecuta el grafo trazándolo con Langfuse (callback de LangChain) y
+    retorna sólo el texto final.
+    - Usa .stream(...) para que Langfuse reciba los eventos del grafo (necesario para el diagrama).
+    - Añade run_name y tags para agrupar en la UI.
     """
-    with trace_ctx(
-        name="LangGraph",
+    # 1) compilar (o reutilizar) el grafo ya construido
+    app = build_graph()
+
+    # 2) handler oficial de Langfuse para LangChain/LangGraph
+    langfuse_handler = CallbackHandler()
+
+    # 3) estado inicial
+    state_in = make_state(
+        question,
         user_id=user_id,
-        metadata={"component": "agent_graph", "tags": ["retie-agent", "graph"], "session_id": session, **(metadata or {})},
-        trace_input={"user_question": question, "agent_key": agent_key or "", "session_id": session, "via": "text"},
+        session=session,
+        agent_key=agent_key,
+    )
+
+    # 4) ejecuta *streaming* con callbacks → esto es lo que habilita el diagrama
+    final_state: Dict[str, Any] = {}
+    for _chunk in app.stream(
+        state_in,
+        config={
+            "callbacks": [langfuse_handler],
+            "run_name": "LangGraph",
+            "tags": ["retie-agent", "graph", f"user:{user_id}", f"session:{session}"],
+            # (opcional) metadatos visibles en el root run de LangChain
+            "metadata": {**(metadata or {}), "agent_key": agent_key},
+        },
     ):
-        # Small green start box as an 'agent' node (helps Agent Graph)
-        with span_ctx(None, "_start_", as_type="agent"):
-            pass
+        # Cada _chunk es un dict incremental del estado. Nos quedamos con el último.
+        for _k, _v in _chunk.items():
+            final_state[_k] = _v
 
-        app = build_graph()
-        out = app.invoke(make_state(question, user_id=user_id, session=session, agent_key=agent_key))
+    # 5) salida final
+    return final_state.get("answer", "No tengo evidencia en los documentos.")
 
-        # Put final answer & route on the root preview
-        try:
-            lf = __import__("app.observability.obs", fromlist=["_get_client"])._get_client()  # lazy import
-            if lf:
-                lf.update_current_span(output={"answer": out.get("answer"), "route": out.get("route", "answer_node")})
-        except Exception:
-            pass
-
-        return out.get("answer", "No tengo evidencia en los documentos.")
