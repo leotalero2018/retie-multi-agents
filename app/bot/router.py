@@ -29,10 +29,12 @@ STATIC_ADMIN_IDS: Set[int] = {
 } if _raw_ids else set()
 RUNTIME_ADMINS: Set[int] = set()
 
+
 def _is_admin(user_id: Optional[int]) -> bool:
     if user_id is None:
         return False
     return (user_id in STATIC_ADMIN_IDS) or (user_id in RUNTIME_ADMINS)
+
 
 def _require_admin(message: Message) -> bool:
     uid = message.from_user.id if message.from_user else None
@@ -41,13 +43,20 @@ def _require_admin(message: Message) -> bool:
         return False
     return True
 
+
 # --- chat state ---
 CHAT_AGENT: Dict[int, str] = {}
-DEFAULT_AGENT = "plumber"
+DEFAULT_AGENT = "plumber"  # este se forzará a default collection con _safe_agent_key
 LAST_QUERY: Dict[int, str] = {}
 
+
 # --- output cleaning for non-admins ---
-_SOURCES_HEADERS = (r"^\s*fuentes\s*:\s*$", r"^\s*referencias\s*:\s*$", r"^\s*sources\s*:\s*$", r"^\s*citas\s*:\s*$")
+_SOURCES_HEADERS = (
+    r"^\s*fuentes\s*:\s*$",
+    r"^\s*referencias\s*:\s*$",
+    r"^\s*sources\s*:\s*$",
+    r"^\s*citas\s*:\s*$",
+)
 _SOURCES_HEADERS_RE = re.compile("|".join(_SOURCES_HEADERS), re.IGNORECASE | re.MULTILINE)
 _INLINE_BRACKET_CITE_RE = re.compile(
     r"""
@@ -64,14 +73,18 @@ _INLINE_BRACKET_CITE_RE = re.compile(
     """,
     re.VERBOSE,
 )
+
+
 def _strip_sources_sections(text: str) -> str:
     m = _SOURCES_HEADERS_RE.search(text)
     if not m:
         return text
     return text[: m.start()].rstrip()
 
+
 def _strip_inline_citations(text: str) -> str:
     return _INLINE_BRACKET_CITE_RE.sub("", text)
+
 
 def _clean_for_user(raw: str, is_admin: bool) -> str:
     if is_admin:
@@ -82,25 +95,37 @@ def _clean_for_user(raw: str, is_admin: bool) -> str:
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
     return cleaned
 
+
 # --- voice transcription ---
 from app.services.whisper import transcribe_audio
 
 # --- image OCR / vision ---
 from app.services.vision import ocr_image, vision_extract_insights
 
-# Helper: run blocking code in executor **while preserving contextvars** so OTel/Langfuse spans keep parentage
+
+# Helper: run blocking code in executor **while preserving contextvars**
+# so OTel/Langfuse spans keep parentage
 async def _to_thread_ctx(func, *args, **kwargs):
     ctx = contextvars.copy_context()
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, lambda: ctx.run(func, *args, **kwargs))
 
 
-# ----------------------- commands & admin -----------------------
+# Force agent keys without collection (e.g. "plumber", "pymupdf") to default collection
+def _safe_agent_key(k: Optional[str]) -> Optional[str]:
+    if not k:
+        return None
+    if k.lower() in {"plumber", "pymupdf"}:
+        return None
+    return k
 
+
+# ----------------------- commands & admin -----------------------
 @router.message(CommandStart())
 async def on_start(message: Message):
     CHAT_AGENT[message.chat.id] = DEFAULT_AGENT
     await message.answer("¡Hola! Soy tu bot RETIE, ¿en qué puedo ayudarte?")
+
 
 @router.message(Command("agent"))
 async def on_agent(message: Message):
@@ -118,6 +143,7 @@ async def on_agent(message: Message):
         )
     await message.answer(f"✅ Agente: {key}")
 
+
 @router.message(Command("who"))
 async def on_who(message: Message):
     key = CHAT_AGENT.get(message.chat.id, DEFAULT_AGENT)
@@ -127,6 +153,7 @@ async def on_who(message: Message):
             f"Agente actual: {key} (modelo={cfg.resolved_chat_model()}, colección={cfg.collection})"
         )
     await message.answer(f"Agente actual: {key}")
+
 
 @router.message(Command("admin"))
 async def on_admin_login(message: Message):
@@ -140,12 +167,14 @@ async def on_admin_login(message: Message):
         RUNTIME_ADMINS.add(message.from_user.id)
     await message.answer("✅ Acceso administrador concedido en esta sesión.")
 
+
 @router.message(Command("logout"))
 async def on_admin_logout(message: Message):
     if message.from_user and message.from_user.id in RUNTIME_ADMINS:
         RUNTIME_ADMINS.discard(message.from_user.id)
         return await message.answer("👋 Sesión de administrador cerrada.")
     return await message.answer("No hay sesión de administrador activa.")
+
 
 @router.message(Command("docs"))
 async def on_docs(message: Message):
@@ -168,7 +197,7 @@ async def on_docs(message: Message):
         from app.retriever.retrieve import search
         from app.agent.retie_agent import _resolve_collection, _dedupe_hits
 
-        coll = _resolve_collection(agent_key=key, explicit=None)
+        coll = _resolve_collection(agent_key=_safe_agent_key(key), explicit=None)
         hits = _dedupe_hits(search(last_q, top_k=k, collection_name=coll))
 
         if not hits:
@@ -193,7 +222,6 @@ async def on_docs(message: Message):
 
 
 # ----------------------- helpers -----------------------
-
 async def _download_to_tmp(bot, file_id: str, suffix: str) -> Path:
     """Download a Telegram file into a temp path and return the path."""
     tf = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
@@ -202,6 +230,7 @@ async def _download_to_tmp(bot, file_id: str, suffix: str) -> Path:
     tg_file = await bot.get_file(file_id)
     await bot.download_file(tg_file.file_path, destination=tmp_path)
     return tmp_path
+
 
 def _to_wav_if_needed(src: Path) -> Path:
     """Normalize to 16kHz mono WAV using ffmpeg; fallback to original on error."""
@@ -219,6 +248,7 @@ def _to_wav_if_needed(src: Path) -> Path:
         return out
     except Exception:
         return src
+
 
 async def _download_image_to_tmp(message: Message) -> Optional[Path]:
     """Download the highest-res photo or an image document to a temp file."""
@@ -240,8 +270,10 @@ async def _download_image_to_tmp(message: Message) -> Optional[Path]:
         return dest
     return None
 
+
 def _compose_question_from_image(caption: str, ocr_txt: str, vision_txt: str) -> str:
-    parts = []
+    """Ensures the OCR/vision content is included in the prompt to the agent."""
+    parts: List[str] = []
     if caption:
         parts.append(f"Usuario dijo sobre la imagen: {caption.strip()}")
     if ocr_txt:
@@ -249,12 +281,13 @@ def _compose_question_from_image(caption: str, ocr_txt: str, vision_txt: str) ->
     elif vision_txt:
         parts.append(f"Contenido interpretado de la imagen:\n{vision_txt.strip()}")
     if not parts:
-        parts.append("Interpreta la imagen y responde según RETIE.")
-    return "\n\nCon base en lo anterior, responde la consulta del usuario de forma breve y precisa."
+        parts.append("Interpreta la imagen y responde según el RETIE.")
+
+    parts.append("Con base en lo anterior, responde la consulta del usuario de forma breve y precisa.")
+    return "\n\n".join(parts)
 
 
 # ----------------------- VOICE/AUDIO -----------------------
-
 @router.message(F.voice | F.audio)
 async def on_voice(message: Message):
     await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
@@ -274,7 +307,7 @@ async def on_voice(message: Message):
             if wav_file and wav_file != local_file:
                 wav_file.unlink(missing_ok=True)
         finally:
-            return await message.answer(f"⚠️ audio inaudible")
+            return await message.answer("⚠️ audio inaudible")
 
     try:
         local_file.unlink(missing_ok=True)
@@ -295,7 +328,7 @@ async def on_voice(message: Message):
         transcript,
         user_id=str(message.from_user.id) if message.from_user else "anon",
         session=f"telegram-chat-{message.chat.id}",
-        agent_key=agent_key,
+        agent_key=_safe_agent_key(agent_key),
         metadata={"via": "voice"},
     )
 
@@ -305,7 +338,6 @@ async def on_voice(message: Message):
 
 
 # ----------------------- IMAGES (photo + image document) -----------------------
-
 @router.message(F.photo)
 async def on_photo(message: Message):
     agent_key = CHAT_AGENT.get(message.chat.id, DEFAULT_AGENT)
@@ -325,7 +357,11 @@ async def on_photo(message: Message):
     vision_txt = ""
     if not ocr_txt or len(ocr_txt) < 12:
         try:
-            vision_txt = vision_extract_insights(img_path, user_prompt=message.caption or "", model=os.getenv("VISION_MODEL", "gpt-4o-mini"))
+            vision_txt = vision_extract_insights(
+                img_path,
+                user_prompt=message.caption or "",
+                model=os.getenv("VISION_MODEL", "gpt-4o-mini"),
+            )
         except Exception:
             vision_txt = ""
 
@@ -337,13 +373,14 @@ async def on_photo(message: Message):
         question,
         user_id=str(message.from_user.id) if message.from_user else "anon",
         session=f"telegram-chat-{message.chat.id}",
-        agent_key=agent_key,
+        agent_key=_safe_agent_key(agent_key),
         metadata={"via": "image", "ocr_len": len(ocr_txt), "vision_len": len(vision_txt)},
     )
 
     is_admin = _is_admin(message.from_user.id if message.from_user else None)
     resp = _clean_for_user(raw_resp, is_admin)
     await message.answer(resp)
+
 
 @router.message(F.document)
 async def on_image_document(message: Message):
@@ -354,7 +391,6 @@ async def on_image_document(message: Message):
 
 
 # ----------------------- TEXT -----------------------
-
 @router.message(F.text)
 async def on_text(message: Message):
     q = (message.text or "").strip()
@@ -368,7 +404,7 @@ async def on_text(message: Message):
         q,
         user_id=str(message.from_user.id) if message.from_user else "anon",
         session=f"telegram-chat-{message.chat.id}",
-        agent_key=agent_key,
+        agent_key=_safe_agent_key(agent_key),
         metadata={"via": "text"},
     )
 
