@@ -54,10 +54,11 @@ RUN python -m pip install --upgrade pip && \
     pip install --no-cache-dir torch==2.2.2+cpu -f https://download.pytorch.org/whl/cpu/torch_stable.html && \
     pip install --no-cache-dir -r requirements.txt --progress-bar off && \
     pip install --no-cache-dir \
-        langgraph==1.* \
-        langchain==0.3.* \
-        langchain-openai==0.2.* && \
-    pip install --no-cache-dir minio==7.2.16
+        langchain==0.3.26 \
+        langchain-openai==0.2.14 \
+        langgraph==1.0.2 \
+        minio==7.2.16
+
 
 # -------------------------------
 # Copy source
