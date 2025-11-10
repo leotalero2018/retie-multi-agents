@@ -88,6 +88,33 @@ def _node_no_context(state: GraphState) -> GraphState:
     with span_ctx(None, "answer_node", {"route": "no_context"}, as_type="chain"):
         return {"answer": "No tengo evidencia en los documentos."}
 
+
+from app.agent.enrichment_assistant import EnrichmentAssistant
+
+ENRICHMENT_ASSISTANT_ID = os.getenv("ENRICHMENT_ASSISTANT_ID", "asst_qthy1ZfTpr2ps0mruX30zVlc")
+ENRICHMENT_VECTOR_STORE_ID = os.getenv("ENRICHMENT_VECTOR_STORE_ID", "vs_69050fe6e43c8191be28bac47c3f565f")
+
+_enrichment_agent = EnrichmentAssistant(
+    assistant_id=ENRICHMENT_ASSISTANT_ID,
+    vector_store_id=ENRICHMENT_VECTOR_STORE_ID,
+)
+
+def _node_enrich(state: GraphState) -> GraphState:
+    """Asistente secundario que enriquece la respuesta base."""
+    base_answer = state.get("answer", "")
+    question = state.get("question", "")
+
+    with span_ctx(None, "enrich_node", {"assistant_id": ENRICHMENT_ASSISTANT_ID}, as_type="chain"):
+        try:
+            enriched = _enrichment_agent.enrich_response(
+                user_message=question,
+                draft_response=base_answer,
+            )
+        except Exception as e:
+            enriched = f"(⚠️ Falló el enriquecimiento: {e})\n\n{base_answer}"
+
+        return {"answer": enriched}
+
 # ---------- Graph builder ----------
 @dataclass
 class _Compiled:
@@ -101,19 +128,29 @@ def build_graph():
         return _COMPILED.app
 
     g = StateGraph(GraphState)
+
+    # nodos existentes
     g.add_node("retrieve", _node_retrieve)
     g.add_node("router", _node_router)
     g.add_node("answer_node", _node_answer)
     g.add_node("no_context", _node_no_context)
 
+    # nuevo nodo de enriquecimiento
+    g.add_node("enrich_node", _node_enrich)
+
+    # puntos de entrada y flujo
     g.set_entry_point("retrieve")
     g.add_edge("retrieve", "router")
+
     g.add_conditional_edges(
         "router",
         lambda s: s.get("route", "no_context"),
         {"answer_node": "answer_node", "no_context": "no_context"},
     )
-    g.add_edge("answer_node", END)
+
+    # ✅ nueva etapa de enriquecimiento
+    g.add_edge("answer_node", "enrich_node")
+    g.add_edge("enrich_node", END)
     g.add_edge("no_context", END)
 
     app = g.compile()
