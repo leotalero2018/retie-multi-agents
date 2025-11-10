@@ -1,24 +1,22 @@
 # app/bot/run_polling.py
-# Run with: python -m app.bot.run_polling
 from __future__ import annotations
-
 import asyncio
 import logging
 import os
 import glob
 from pathlib import Path
-
 from dotenv import load_dotenv
+
 load_dotenv()
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
-
 from app.config import settings
 from app.bootstrap_sync import sync_chroma_from_minio
 from app.bot.router import router
 
 logging.basicConfig(level=logging.INFO, force=True)
+
 dp = Dispatcher()
 dp.include_router(router)
 
@@ -41,64 +39,55 @@ def _clear_if_placeholder(path: str) -> None:
 
 
 async def main() -> None:
-    # 1) Sync from MinIO → returns the *runtime* directory we should use
-    runtime_dir = None
+    # 1️⃣ Sync from MinIO → local runtime dir
     try:
-        runtime_dir = sync_chroma_from_minio()
+        runtime_dir = sync_chroma_from_minio() or settings.CHROMA_DB_DIR
     except Exception as e:
-        logging.warning("[SYNC] MinIO sync raised: %s. Continuing with local paths.", e)
-
-    if not runtime_dir:
+        logging.warning("[SYNC] MinIO sync failed: %s. Using local directory.", e)
         runtime_dir = settings.CHROMA_DB_DIR
 
     os.environ["CHROMA_DB_DIR"] = runtime_dir
     os.environ["CHROMA_PERSIST_DIR"] = runtime_dir
-    settings.CHROMA_DB_DIR = runtime_dir  # pydantic settings in-memory value
+    settings.CHROMA_DB_DIR = runtime_dir
 
-    # >>> Rebind Chroma client to the *new* path <<<
     from app.retriever import chroma_client as cc
     cc.set_persist_dir(runtime_dir)
-
     os.makedirs(runtime_dir, exist_ok=True)
     _clear_if_placeholder(runtime_dir)
 
-    logging.info("[BOOT] Using COLLECTION_NAME=%s  CHROMA_DIR=%s",
+    logging.info("[BOOT] Using COLLECTION_NAME=%s | CHROMA_DIR=%s",
                  settings.COLLECTION_NAME, settings.CHROMA_DB_DIR)
 
-    # 2) Quick listing
+    # 2️⃣ Quick check
     try:
         files = glob.glob(os.path.join(settings.CHROMA_DB_DIR, "*"))
-        logging.info("[LS] %s -> %s", settings.CHROMA_DB_DIR, files[:30])
+        logging.info("[LS] Found %d files under %s", len(files), settings.CHROMA_DB_DIR)
     except Exception as e:
         logging.error("[LS] ERROR listing files: %s", e)
 
-    # 3) Deep check: enumerate collections & counts
+    # 3️⃣ Optional: list Chroma collections
     try:
         import chromadb
         cli = chromadb.PersistentClient(path=settings.CHROMA_DB_DIR)
         cols = cli.list_collections()
-        if not cols:
-            logging.error("[CHK2] No collections found in DB at %s", settings.CHROMA_DB_DIR)
-        else:
-            logging.info("[CHK2] Collections present in DB:")
-            for c in cols:
-                try:
-                    cnt = cli.get_collection(c.name).count()
-                except Exception as e:
-                    cnt = f"error: {e}"
-                logging.info("   - name=%s  count=%s", c.name, cnt)
+        for c in cols:
+            try:
+                cnt = cli.get_collection(c.name).count()
+            except Exception as e:
+                cnt = f"error: {e}"
+            logging.info("   - %s: %s items", c.name, cnt)
     except Exception as e:
-        logging.error("[CHK2] ERROR listing collections: %s", e)
+        logging.warning("[CHK2] Skipped Chroma check: %s", e)
 
-    # 4) Start Telegram bot
-    token = os.environ.get("TELEGRAM_BOT_TOKEN") or os.environ.get("TELEGRAM_TOKEN")
+    # 4️⃣ Start Telegram bot
+    token = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("TELEGRAM_TOKEN")
     if not token:
-        logging.error("❌ Missing TELEGRAM_BOT_TOKEN (or TELEGRAM_TOKEN). Bot cannot start.")
+        logging.error("❌ Missing TELEGRAM_BOT_TOKEN (or TELEGRAM_TOKEN). Cannot start bot.")
         while True:
             await asyncio.sleep(60)
 
     bot = Bot(token=token, default=DefaultBotProperties(parse_mode="HTML"))
-    logging.info("🤖 Iniciando bot RETIE..")
+    logging.info("🤖 Starting RETIE bot polling loop...")
     await dp.start_polling(bot)
 
 
