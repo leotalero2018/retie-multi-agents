@@ -78,3 +78,11 @@ settings.CHROMA_DB_DIR = persist_abs
 # Normalize Telegram token (prefer new name)
 if not settings.TELEGRAM_BOT_TOKEN and settings.TELEGRAM_TOKEN:
     settings.TELEGRAM_BOT_TOKEN = settings.TELEGRAM_TOKEN
+
+# --- Configuración del asistente de enriquecimiento ---
+ENRICHMENT_ASSISTANT_ID = os.getenv(
+    "ENRICHMENT_ASSISTANT_ID", "asst_qthy1ZfTpr2ps0mruX30zVlc"
+)
+ENRICHMENT_VECTOR_STORE_ID = os.getenv(
+    "ENRICHMENT_VECTOR_STORE_ID", "vs_69050fe6e43c8191be28bac47c3f565f"
+)
