@@ -90,6 +90,7 @@ def _node_no_context(state: GraphState) -> GraphState:
 
 
 from app.agent.enrichment_assistant import EnrichmentAssistant
+import os
 
 ENRICHMENT_ASSISTANT_ID = os.getenv("ENRICHMENT_ASSISTANT_ID", "asst_qthy1ZfTpr2ps0mruX30zVlc")
 ENRICHMENT_VECTOR_STORE_ID = os.getenv("ENRICHMENT_VECTOR_STORE_ID", "vs_69050fe6e43c8191be28bac47c3f565f")
