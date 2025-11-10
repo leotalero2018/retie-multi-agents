@@ -16,10 +16,10 @@ from aiogram.filters import CommandStart, Command
 
 # Run the LangGraph pipeline (instrumented for Langfuse)
 from app.agent.graph import run_graph
-from app.agent.registry import AGENTS as _AGENTS  # optional registry (may be empty)
+from app.agent.registry import AGENTS as _AGENTS
 from app.agent.enrichment_assistant import EnrichmentAssistant
-from app.bot.utils import _to_thread_ctx, _is_admin, _clean_for_user, _safe_agent_key
 from app.config import ENRICHMENT_ASSISTANT_ID, ENRICHMENT_VECTOR_STORE_ID
+
 
 # Initialize enrichment assistant once
 enrichment_agent = EnrichmentAssistant(
