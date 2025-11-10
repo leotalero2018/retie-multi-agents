@@ -17,6 +17,15 @@ from aiogram.filters import CommandStart, Command
 # Run the LangGraph pipeline (instrumented for Langfuse)
 from app.agent.graph import run_graph
 from app.agent.registry import AGENTS as _AGENTS  # optional registry (may be empty)
+from app.agent.enrichment_assistant import EnrichmentAssistant
+from app.bot.utils import _to_thread_ctx, _is_admin, _clean_for_user, _safe_agent_key
+from app.config import ENRICHMENT_ASSISTANT_ID, ENRICHMENT_VECTOR_STORE_ID
+
+# Initialize enrichment assistant once
+enrichment_agent = EnrichmentAssistant(
+    assistant_id=ENRICHMENT_ASSISTANT_ID,
+    vector_store_id=ENRICHMENT_VECTOR_STORE_ID,
+)
 
 # --- create router FIRST (before any @router.message decorators) ---
 router = Router(name="telegram_router")
@@ -397,8 +406,10 @@ async def on_text(message: Message):
     agent_key = CHAT_AGENT.get(message.chat.id, DEFAULT_AGENT)
     LAST_QUERY[message.chat.id] = q
 
+    # Typing indicator
     await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
 
+    # Step 1️⃣: Run the primary agent graph (main reasoning)
     raw_resp = await _to_thread_ctx(
         run_graph,
         q,
@@ -408,6 +419,23 @@ async def on_text(message: Message):
         metadata={"via": "text"},
     )
 
+    # Step 2️⃣: Clean up raw response for the user (admin or not)
     is_admin = _is_admin(message.from_user.id if message.from_user else None)
-    resp = _clean_for_user(raw_resp, is_admin)
-    await message.answer(resp)
+    draft_resp = _clean_for_user(raw_resp, is_admin)
+
+    # Step 3️⃣: Send typing indicator again for enrichment
+    await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
+
+    # Step 4️⃣: Enrich the response using the OpenAI Assistant
+    try:
+        enriched_resp = enrichment_agent.enrich_response(
+            user_message=q,
+            draft_response=draft_resp,
+        )
+    except Exception as e:
+        # Fallback to draft if enrichment fails
+        print(f"[⚠️ Enrichment Error] {e}")
+        enriched_resp = draft_resp
+
+    # Step 5️⃣: Send final enriched message
+    await message.answer(enriched_resp)
