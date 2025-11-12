@@ -91,30 +91,74 @@ def _node_no_context(state: GraphState) -> GraphState:
 
 from app.agent.enrichment_assistant import EnrichmentAssistant
 import os
+from app.observability.obs import span_ctx, log_generation  # ✅ keep logs visible in Langfuse
 
-ENRICHMENT_ASSISTANT_ID = os.getenv("ENRICHMENT_ASSISTANT_ID", "asst_qthy1ZfTpr2ps0mruX30zVlc")
-ENRICHMENT_VECTOR_STORE_ID = os.getenv("ENRICHMENT_VECTOR_STORE_ID", "vs_69050fe6e43c8191be28bac47c3f565f")
+# ===============================
+#  Enrichment Assistant Settings
+# ===============================
+ENRICHMENT_ASSISTANT_ID = os.getenv(
+    "ENRICHMENT_ASSISTANT_ID", "asst_qthy1ZfTpr2ps0mruX30zVlc"
+)
+ENRICHMENT_VECTOR_STORE_ID = os.getenv(
+    "ENRICHMENT_VECTOR_STORE_ID", "vs_69050fe6e43c8191be28bac47c3f565f"
+)
 
 _enrichment_agent = EnrichmentAssistant(
     assistant_id=ENRICHMENT_ASSISTANT_ID,
     vector_store_id=ENRICHMENT_VECTOR_STORE_ID,
 )
 
+# ===============================
+#  Enrichment Node
+# ===============================
 def _node_enrich(state: GraphState) -> GraphState:
-    """Asistente secundario que enriquece la respuesta base."""
+    """Asistente secundario que enriquece la respuesta base sin bloquear el flujo."""
     base_answer = state.get("answer", "")
     question = state.get("question", "")
 
-    with span_ctx(None, "enrich_node", {"assistant_id": ENRICHMENT_ASSISTANT_ID}, as_type="chain"):
+    with span_ctx(
+        None,
+        "enrich_node",
+        {"assistant_id": ENRICHMENT_ASSISTANT_ID},
+        as_type="chain",
+    ):
         try:
+            # Intento de enriquecimiento con el asistente secundario
             enriched = _enrichment_agent.enrich_response(
                 user_message=question,
                 draft_response=base_answer,
             )
+
+            # Si el enriquecimiento no produce texto, usa la respuesta base
+            if not enriched or len(enriched.strip()) < 20:
+                raise ValueError("Sin resultados de enriquecimiento o vector vacío")
+
+            status = "ok"
+
         except Exception as e:
-            enriched = f"(⚠️ Falló el enriquecimiento: {e})\n\n{base_answer}"
+            # Si falla (por vector vacío o error en la API), se conserva la respuesta original
+            enriched = f"{base_answer}\n\n(ℹ️ Enriquecimiento omitido: {e})"
+            status = "fallback"
+
+        # 🔍 Registro en Langfuse: permite ver la salida y el estado del enriquecimiento
+        try:
+            log_generation(
+                None,
+                name="enrich_node",
+                input_text=question,
+                output_text=enriched,
+                model="assistant_enrichment",
+                metadata={
+                    "assistant_id": ENRICHMENT_ASSISTANT_ID,
+                    "vector_store_id": ENRICHMENT_VECTOR_STORE_ID,
+                    "status": status,
+                },
+            )
+        except Exception:
+            pass
 
         return {"answer": enriched}
+
 
 # ---------- Graph builder ----------
 @dataclass
