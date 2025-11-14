@@ -416,8 +416,14 @@ async def on_text(message: Message):
         user_id=str(message.from_user.id) if message.from_user else "anon",
         session=f"telegram-chat-{message.chat.id}",
         agent_key=_safe_agent_key(agent_key),
-        metadata={"via": "text"},
+        metadata={"via": "text", "channel": "telegram"},
     )
+
+    # result may now be JSON (from stylist_node)
+    if isinstance(result, dict) and "formatted_response" in result:
+        final_resp = result["formatted_response"]
+    else:
+        final_resp = str(result)
 
     # Step 2️⃣: Clean response for the user
     is_admin = _is_admin(message.from_user.id if message.from_user else None)

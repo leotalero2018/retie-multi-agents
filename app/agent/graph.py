@@ -20,7 +20,9 @@ class GraphState(TypedDict, total=False):
     agent_key: Optional[str]
     hits: List[Dict[str, Any]]
     route: str
-    answer: str
+    answer: Any   # may now hold dict for styled payload
+    metadata: Optional[Dict[str, Any]]  # new, for passing channel info
+
 
 def make_state(question: str, *, user_id: str = "anon", session: str = "default", agent_key: Optional[str] = None) -> GraphState:
     return {
@@ -160,6 +162,75 @@ def _node_enrich(state: GraphState) -> GraphState:
         return {"answer": enriched}
 
 
+# ===============================
+#  Stylist Node (Output Formatter)
+# ===============================
+def _node_stylist(state: GraphState) -> GraphState:
+    """
+    Post-processing node that prepares the enriched response for downstream delivery.
+
+    It can adapt tone or format depending on the output channel (Telegram, WhatsApp, Web, etc.).
+    The output is a JSON-ready structure, making it easy to add or swap channels later.
+    """
+    enriched_answer = state.get("answer", "")
+    question = state.get("question", "")
+    metadata = state.get("metadata", {}) or {}
+    channel = metadata.get("channel", "telegram")  # default channel
+
+    with span_ctx(
+        None,
+        "stylist_node",
+        {"channel": channel},
+        as_type="chain",
+    ):
+        try:
+            # Simple rules: add emojis, Markdown, or remove unsupported tags depending on channel
+            if channel == "telegram":
+                styled_text = enriched_answer  # Telegram already supports Markdown/HTML
+            elif channel == "whatsapp":
+                styled_text = enriched_answer.replace("*", "").replace("_", "")
+            elif channel == "web":
+                styled_text = f"<p>{enriched_answer}</p>"
+            else:
+                styled_text = enriched_answer
+
+            # Unified JSON payload (future-proof)
+            styled_payload = {
+                "channel": channel,
+                "user_message": question,
+                "formatted_response": styled_text,
+                "timestamp": __import__("datetime").datetime.utcnow().isoformat(),
+            }
+
+            status = "ok"
+
+        except Exception as e:
+            styled_payload = {
+                "channel": channel,
+                "user_message": question,
+                "formatted_response": enriched_answer,
+                "error": str(e),
+                "timestamp": __import__("datetime").datetime.utcnow().isoformat(),
+            }
+            status = "fallback"
+
+        # Log to Langfuse for visibility
+        try:
+            log_generation(
+                None,
+                name="stylist_node",
+                input_text=question,
+                output_text=str(styled_payload),
+                model="stylist_formatter",
+                metadata={"channel": channel, "status": status},
+            )
+        except Exception:
+            pass
+
+        # return both final text and structured JSON for downstream consumers
+        return {"answer": styled_payload}
+
+
 # ---------- Graph builder ----------
 @dataclass
 class _Compiled:
@@ -173,17 +244,13 @@ def build_graph():
         return _COMPILED.app
 
     g = StateGraph(GraphState)
-
-    # nodos existentes
     g.add_node("retrieve", _node_retrieve)
     g.add_node("router", _node_router)
     g.add_node("answer_node", _node_answer)
+    g.add_node("enrich_node", _node_enrich)
+    g.add_node("stylist_node", _node_stylist)
     g.add_node("no_context", _node_no_context)
 
-    # nuevo nodo de enriquecimiento
-    g.add_node("enrich_node", _node_enrich)
-
-    # puntos de entrada y flujo
     g.set_entry_point("retrieve")
     g.add_edge("retrieve", "router")
 
@@ -193,14 +260,16 @@ def build_graph():
         {"answer_node": "answer_node", "no_context": "no_context"},
     )
 
-    # ✅ nueva etapa de enriquecimiento
+    # New sequence: answer → enrich → stylist → end
     g.add_edge("answer_node", "enrich_node")
-    g.add_edge("enrich_node", END)
+    g.add_edge("enrich_node", "stylist_node")
+    g.add_edge("stylist_node", END)
     g.add_edge("no_context", END)
 
     app = g.compile()
     _COMPILED = _Compiled(app=app)
     return app
+
 
 # ---------- Runner ----------
 from langfuse.langchain import CallbackHandler
