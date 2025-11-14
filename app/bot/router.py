@@ -406,42 +406,34 @@ async def on_text(message: Message):
     agent_key = CHAT_AGENT.get(message.chat.id, DEFAULT_AGENT)
     LAST_QUERY[message.chat.id] = q
 
-    # Step 0️⃣: Immediate feedback
     await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
 
-    # Step 1️⃣: Run the primary LangGraph agent (background-safe)
-    raw_resp = await _to_thread_ctx(
-        run_graph,
-        q,
-        user_id=str(message.from_user.id) if message.from_user else "anon",
-        session=f"telegram-chat-{message.chat.id}",
-        agent_key=_safe_agent_key(agent_key),
-        metadata={"via": "text", "channel": "telegram"},
-    )
+    # Step 1️⃣: Run the LangGraph pipeline safely
+    result = None
+    try:
+        result = await _to_thread_ctx(
+            run_graph,
+            q,
+            user_id=str(message.from_user.id) if message.from_user else "anon",
+            session=f"telegram-chat-{message.chat.id}",
+            agent_key=_safe_agent_key(agent_key),
+            metadata={"via": "text", "channel": "telegram"},
+        )
+    except Exception as e:
+        # Graceful fallback if graph execution fails
+        print(f"[⚠️ run_graph error] {e}")
+        result = {"formatted_response": f"⚠️ Ocurrió un error interno: {e}"}
 
-    # result may now be JSON (from stylist_node)
+    # Step 2️⃣: Handle JSON or plain text output
     if isinstance(result, dict) and "formatted_response" in result:
         final_resp = result["formatted_response"]
     else:
-        final_resp = str(result)
+        final_resp = str(result or "No se obtuvo respuesta del agente.")
 
-    # Step 2️⃣: Clean response for the user
+    # Step 3️⃣: Clean output for user role
     is_admin = _is_admin(message.from_user.id if message.from_user else None)
-    draft_resp = _clean_for_user(raw_resp, is_admin)
+    cleaned_resp = _clean_for_user(final_resp, is_admin)
 
-    # Step 3️⃣: Notify user again (typing while enriching)
-    await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
+    # Step 4️⃣: Send reply
+    await message.answer(cleaned_resp)
 
-    # Step 4️⃣: Run enrichment assistant asynchronously
-    try:
-        enriched_resp = await asyncio.to_thread(
-            enrichment_agent.enrich_response,
-            user_message=q,
-            draft_response=draft_resp,
-        )
-    except Exception as e:
-        print(f"[⚠️ Enrichment Error] {e}")
-        enriched_resp = draft_resp  # fallback gracefully
-
-    # Step 5️⃣: Deliver final enriched message
-    await message.answer(enriched_resp)
