@@ -41,7 +41,7 @@ def chat(messages: List[Dict[str, str]], *, model: str | None = None, max_tokens
     Minimal role-based chat helper.
     messages = [{"role":"system","content":"..."},{"role":"user","content":"..."}]
     """
-    mdl = model or getattr(settings, "CHAT_MODEL", "gpt-4o-mini")
+    mdl = model or getattr(settings, "CHAT_MODEL", "gpt-4.1")
     maxt = max_tokens or getattr(settings, "MAX_TOKENS", 512)
     resp = _client().chat.completions.create(
         model=mdl,
