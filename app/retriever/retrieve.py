@@ -23,9 +23,9 @@ def _env_top_k() -> int:
 
 def _env_distance_thr() -> float:
     try:
-        return float(os.getenv("RAG_DISTANCE_THRESHOLD", "0.45"))
+        return float(os.getenv("RAG_DISTANCE_THRESHOLD", "0.75"))
     except Exception:
-        return 0.45
+        return 0.75
 
 
 def _bm25_fallback(query: str, documents: List[str], metas: List[Dict], top_k: int) -> List[Dict]:
