@@ -11,6 +11,7 @@ from app.retriever.retrieve import search
 from app.agent.prompt import make_prompt
 from app.agent.retie_agent import _dedupe_hits, _resolve_collection, _resolve_model
 from app.observability.obs import trace_ctx, span_ctx, log_generation
+from app.services.history import get_history, add_message
 
 # ---------- State ----------
 class GraphState(TypedDict, total=False):
@@ -22,14 +23,16 @@ class GraphState(TypedDict, total=False):
     route: str
     answer: Any   # may now hold dict for styled payload
     metadata: Optional[Dict[str, Any]]  # new, for passing channel info
+    history: List[Dict[str, str]]
 
 
-def make_state(question: str, *, user_id: str = "anon", session: str = "default", agent_key: Optional[str] = None) -> GraphState:
+def make_state(question: str, *, user_id: str = "anon", session: str = "default", agent_key: Optional[str] = None, history: Optional[List[Dict[str, str]]] = None) -> GraphState:
     return {
         "question": (question or "").strip(),
         "user_id": user_id or "anon",
         "session": session or "default",
         "agent_key": agent_key,
+        "history": history or [],
     }
 
 _client = OpenAI(api_key=getattr(settings, "OPENAI_API_KEY", None))
@@ -63,13 +66,19 @@ def _node_answer(state: GraphState) -> GraphState:
     model = _resolve_model(agent_key, explicit=None)
     sys = "Eres un asistente útil."
     prompt = make_prompt(hits, q, is_admin=False)
+    messages = [{"role": "system", "content": sys}]
+    # Add history
+    for msg in state.get("history", []):
+        messages.append(msg)
+    # Add project context/query
+    messages.append({"role": "user", "content": prompt})
 
     with span_ctx(None, "answer_node", {"model": model, "hits": len(hits)}, as_type="chain"):
         resp = _client.chat.completions.create(
             model=model,
             temperature=0.0,
             max_tokens=getattr(settings, "MAX_TOKENS", 600),
-            messages=[{"role": "system", "content": sys}, {"role": "user", "content": prompt}],
+            messages=messages,
         )
         answer = (resp.choices[0].message.content or "").strip()
 
@@ -291,12 +300,19 @@ def run_graph(
     # Handler oficial de Langfuse para LangChain/LangGraph
     langfuse_handler = CallbackHandler()
 
+    # Load history
+    history = get_history(session, limit=getattr(settings, "HISTORY_LIMIT", 10))
+
+    # Save user message to history
+    add_message(session, user_id, "user", question)
+
     # Estado inicial
     state_in = make_state(
         question,
         user_id=user_id,
         session=session,
         agent_key=agent_key,
+        history=history,
     )
 
     # Acumuladores
@@ -333,8 +349,15 @@ def run_graph(
                 if "answer" in node_update:
                     final_answer = node_update["answer"]
 
-    # Fallback en caso de que no haya __end__ pero sí respuesta del nodo
-    if final_answer is None and last_answer_node and "answer" in last_answer_node:
-        final_answer = last_answer_node["answer"]
+    final_txt = final_answer or "No tengo evidencia en los documentos."
+    
+    # Save assistant response to history
+    if final_txt:
+        # If it's a dict (styled), extract the text
+        txt_to_save = final_txt
+        if isinstance(final_txt, dict) and "formatted_response" in final_txt:
+            txt_to_save = final_txt["formatted_response"]
+        
+        add_message(session, user_id, "assistant", str(txt_to_save))
 
-    return final_answer or "No tengo evidencia en los documentos."
+    return final_txt

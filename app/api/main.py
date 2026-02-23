@@ -28,6 +28,7 @@ async def health():
 def query_docs(
     q: str = Query(..., description="User question"),
     agent_key: str | None = Query(default=None, description="Route to a specific collection (e.g., plumber|pymupdf)"),
+    session_id: str = Query(default="api_query", description="Session ID for chat history"),
     admin: bool = Query(default=False, description="(ignorado; el grafo responde modo usuario)"),
 ):
     """
@@ -37,11 +38,11 @@ def query_docs(
     answer = run_graph(
         q,
         user_id="api",
-        session="api_query",
+        session=session_id,
         agent_key=agent_key,
         metadata={"via": "http"},
     )
-    return {"question": q, "answer": answer, "agent_key": agent_key, "admin": admin}
+    return {"question": q, "answer": answer, "session_id": session_id, "agent_key": agent_key, "admin": admin}
 
 app.include_router(router)
 
