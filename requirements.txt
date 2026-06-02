@@ -14,7 +14,7 @@ tiktoken==0.7.0
 # LLM orchestration
 langgraph==0.2.62
 langchain==0.3.25
-langchain-core==0.3.52
+langchain-core==0.3.58
 
 # Vector DB
 chromadb==1.1.0
