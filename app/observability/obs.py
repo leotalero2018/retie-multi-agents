@@ -49,22 +49,27 @@ def trace_ctx(
         yield None
         return
 
+    # Setup before yield — exceptions here are safe to catch.
     try:
-        with lf.start_as_current_span(name=name) as span:
-            try:
-                if user_id:
-                    lf.update_current_trace(user_id=user_id)
-                if trace_input:
-                    lf.update_current_span(input=trace_input)
-                if metadata:
-                    # add as attributes so they don't overwrite Input/Output fields
-                    for k, v in metadata.items():
-                        span.set_attribute(f"meta.{k}", v)
-            except Exception:
-                pass
-            yield span
+        ctx_mgr = lf.start_as_current_span(name=name)
     except Exception:
         yield None
+        return
+
+    with ctx_mgr as span:
+        try:
+            if user_id:
+                lf.update_current_trace(user_id=user_id)
+            if trace_input:
+                lf.update_current_span(input=trace_input)
+            if metadata:
+                for k, v in metadata.items():
+                    span.set_attribute(f"meta.{k}", v)
+        except Exception:
+            pass
+        # yield is outside any try/except so exceptions thrown by the caller
+        # propagate normally and don't trigger "generator didn't stop after throw()"
+        yield span
 
 
 @contextmanager
@@ -85,25 +90,28 @@ def span_ctx(
         yield None
         return
 
+    # Setup before yield — exceptions here are safe to catch.
     try:
-        # Newer SDKs accept as_type on start_as_current_span. Fallback if not supported.
         try:
             ctx_mgr = lf.start_as_current_span(name=name, as_type=as_type)  # type: ignore[arg-type]
         except TypeError:
             ctx_mgr = lf.start_as_current_span(name=name)
-
-        with ctx_mgr as span:
-            try:
-                if span_input:
-                    lf.update_current_span(input=span_input)
-                if metadata:
-                    for k, v in metadata.items():
-                        span.set_attribute(f"meta.{k}", v)
-            except Exception:
-                pass
-            yield span
     except Exception:
         yield None
+        return
+
+    with ctx_mgr as span:
+        try:
+            if span_input:
+                lf.update_current_span(input=span_input)
+            if metadata:
+                for k, v in metadata.items():
+                    span.set_attribute(f"meta.{k}", v)
+        except Exception:
+            pass
+        # yield is outside any try/except so exceptions thrown by the caller
+        # propagate normally and don't trigger "generator didn't stop after throw()"
+        yield span
 
 
 def log_generation(

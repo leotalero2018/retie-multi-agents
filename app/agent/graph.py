@@ -291,22 +291,13 @@ def run_graph(
     *,
     metadata: Optional[Dict[str, Any]] = None,
 ) -> str:
-    """
-    Ejecuta el grafo con streaming + Langfuse callback y devuelve el texto final.
-    Mantiene el stream para el diagrama y agrega correctamente el estado final.
-    """
     app = build_graph()
 
-    # Handler oficial de Langfuse para LangChain/LangGraph
     langfuse_handler = CallbackHandler()
 
-    # Load history
     history = get_history(session, limit=getattr(settings, "HISTORY_LIMIT", 10))
-
-    # Save user message to history
     add_message(session, user_id, "user", question)
 
-    # Estado inicial
     state_in = make_state(
         question,
         user_id=user_id,
@@ -315,13 +306,9 @@ def run_graph(
         history=history,
     )
 
-    # Acumuladores
-    final_answer: Optional[str] = None
-    final_route: Optional[str] = None
-    last_answer_node: Optional[Dict[str, Any]] = None
-
-    # Ejecuta *streaming* con callbacks → habilita el diagrama
-    for step in app.stream(
+    # invoke() devuelve el estado final directamente; evita el bug
+    # "generator didn't stop after throw()" que ocurría con stream() + break
+    result: Dict[str, Any] = app.invoke(
         state_in,
         config={
             "callbacks": [langfuse_handler],
@@ -329,35 +316,14 @@ def run_graph(
             "tags": ["retie-agent", "graph", f"user:{user_id}", f"session:{session}"],
             "metadata": {**(metadata or {}), "agent_key": agent_key},
         },
-    ):
-      # step es un dict con un único par {nombre_nodo: update} o {"__end__": state}
-        node_name, node_update = next(iter(step.items()))
+    )
 
-        if node_name == "__end__":
-            # Estado completo y aplanado
-            if isinstance(node_update, dict):
-                final_answer = node_update.get("answer", final_answer)
-                final_route = node_update.get("route", final_route)
-            break
-
-        # Guarda datos útiles de cualquier nodo
-        if isinstance(node_update, dict):
-            if "route" in node_update:
-                final_route = node_update["route"]
-            if node_name == "answer_node":
-                last_answer_node = node_update
-                if "answer" in node_update:
-                    final_answer = node_update["answer"]
-
+    final_answer = result.get("answer") if isinstance(result, dict) else None
     final_txt = final_answer or "No tengo evidencia en los documentos."
-    
-    # Save assistant response to history
-    if final_txt:
-        # If it's a dict (styled), extract the text
-        txt_to_save = final_txt
-        if isinstance(final_txt, dict) and "formatted_response" in final_txt:
-            txt_to_save = final_txt["formatted_response"]
-        
-        add_message(session, user_id, "assistant", str(txt_to_save))
+
+    txt_to_save = final_txt
+    if isinstance(final_txt, dict) and "formatted_response" in final_txt:
+        txt_to_save = final_txt["formatted_response"]
+    add_message(session, user_id, "assistant", str(txt_to_save))
 
     return final_txt

@@ -141,13 +141,13 @@ def sync_chroma_from_minio() -> str:
     _dump_env()
 
     persist_dir = os.getenv("CHROMA_PERSIST_DIR") or os.getenv("CHROMA_DB_DIR") or "./data/chroma_db"
-    runtime_dir = os.getenv("MINIO_RUNTIME_DIR", "/tmp/chroma_db")
+    # Default runtime_dir to persist_dir so we never delete what we just downloaded
+    runtime_dir = os.getenv("MINIO_RUNTIME_DIR") or persist_dir
     bucket = os.getenv("MINIO_BUCKET_NAME")
     prefix = _normalize_prefix(os.getenv("MINIO_PREFIX"), default="chroma_db/")
     force = os.getenv("MINIO_FORCE_SYNC", "false").lower() in ("1", "true", "yes")
 
     _ensure_dir(persist_dir)
-    _ensure_dir(runtime_dir)
 
     # If persist already complete and not forced, keep it
     sqlite_ok, shards_ok, shard_names = _markers(persist_dir)
@@ -166,15 +166,27 @@ def sync_chroma_from_minio() -> str:
             except Exception as e:
                 log.error("[SYNC] Falló la descarga: %s", e)
 
-    # Always copy to runtime_dir (ensures fully writable location)
-    try:
-        if Path(runtime_dir).exists():
-            shutil.rmtree(runtime_dir)
-        shutil.copytree(persist_dir, runtime_dir)
-        _fix_permissions(runtime_dir)
-        s_ok, sh_ok, sh_names = _markers(runtime_dir)
-        log.info("[SYNC] Runtime copy ok → %s  (sqlite=%s, shards=%s, %s)", runtime_dir, s_ok, sh_ok, sh_names)
-    except Exception as e:
-        log.error("[SYNC] Runtime copy failed: %s", e)
+    # Copy to runtime_dir only when it is a different path from persist_dir.
+    # If they are the same, copying would delete the just-downloaded files (rmtree)
+    # before trying to copy them, leaving an empty directory.
+    same_dir = Path(persist_dir).resolve() == Path(runtime_dir).resolve()
+    if same_dir:
+        _fix_permissions(persist_dir)
+        s_ok, sh_ok, sh_names = _markers(persist_dir)
+        log.info("[SYNC] persist_dir == runtime_dir (%s); no copy needed. sqlite=%s, shards=%s, %s",
+                 persist_dir, s_ok, sh_ok, sh_names)
+    else:
+        _ensure_dir(runtime_dir)
+        try:
+            if Path(runtime_dir).exists():
+                shutil.rmtree(runtime_dir)
+            shutil.copytree(persist_dir, runtime_dir)
+            _fix_permissions(runtime_dir)
+            s_ok, sh_ok, sh_names = _markers(runtime_dir)
+            log.info("[SYNC] Runtime copy ok → %s  (sqlite=%s, shards=%s, %s)",
+                     runtime_dir, s_ok, sh_ok, sh_names)
+        except Exception as e:
+            log.error("[SYNC] Runtime copy failed: %s", e)
+            runtime_dir = persist_dir  # fall back to where the data actually is
 
     return runtime_dir
