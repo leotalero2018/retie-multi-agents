@@ -5,6 +5,9 @@
 from __future__ import annotations
 
 import os
+from dotenv import load_dotenv
+load_dotenv()
+
 from fastapi import FastAPI, Request, Query, APIRouter, HTTPException
 from fastapi.responses import Response, HTMLResponse
 
@@ -29,20 +32,20 @@ def query_docs(
     q: str = Query(..., description="User question"),
     agent_key: str | None = Query(default=None, description="Route to a specific collection (e.g., plumber|pymupdf)"),
     session_id: str = Query(default="api_query", description="Session ID for chat history"),
-    admin: bool = Query(default=False, description="(ignorado; el grafo responde modo usuario)"),
 ):
     """
     Answer a question using the LangGraph pipeline (instrumented for Langfuse).
     If `agent_key` is provided, it switches the collection.
     """
-    answer = run_graph(
+    raw = run_graph(
         q,
         user_id="api",
         session=session_id,
         agent_key=agent_key,
-        metadata={"via": "http"},
+        metadata={"via": "http", "channel": "web"},
     )
-    return {"question": q, "answer": answer, "session_id": session_id, "agent_key": agent_key, "admin": admin}
+    answer = raw.get("formatted_response", raw) if isinstance(raw, dict) else raw
+    return {"question": q, "answer": answer, "session_id": session_id, "agent_key": agent_key}
 
 app.include_router(router)
 

@@ -7,7 +7,7 @@ from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Query
 from typing import Optional
 
 from app.ingestion.pipeline import index_folder
-from app.services.storage_s3 import download_folder, upload_folder
+from app.services.storage_minio import download_folder, upload_folder
 
 router = APIRouter(prefix="/ingest", tags=["ingest"])
 

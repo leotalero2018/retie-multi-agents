@@ -10,7 +10,7 @@ from app.config import settings
 from app.retriever.retrieve import search
 from app.agent.prompt import make_prompt
 from app.agent.retie_agent import _dedupe_hits, _resolve_collection, _resolve_model
-from app.observability.obs import trace_ctx, span_ctx, log_generation
+from app.observability.obs import span_ctx, log_generation
 from app.services.history import get_history, add_message
 
 # ---------- State ----------
@@ -46,7 +46,10 @@ def _node_retrieve(state: GraphState) -> GraphState:
 
     # Make this a "retriever" observation so Langfuse can draw the graph.
     with span_ctx(None, "retrieve", {"collection": coll, "top_k": top_k}, as_type="retriever", span_input={"q": q}):
-        hits = _dedupe_hits(search(q, top_k=top_k, collection_name=coll))
+        try:
+            hits = _dedupe_hits(search(q, top_k=top_k, collection_name=coll))
+        except Exception:
+            hits = []
         return {"hits": hits}
 
 def _node_router(state: GraphState) -> GraphState:
@@ -95,7 +98,7 @@ def _node_answer(state: GraphState) -> GraphState:
 
         return {"answer": answer}
 
-def _node_no_context(state: GraphState) -> GraphState:
+def _node_no_context(_state: GraphState) -> GraphState:
     with span_ctx(None, "answer_node", {"route": "no_context"}, as_type="chain"):
         return {"answer": "No tengo evidencia en los documentos."}
 
@@ -290,7 +293,7 @@ def run_graph(
     agent_key: Optional[str] = None,
     *,
     metadata: Optional[Dict[str, Any]] = None,
-) -> str:
+) -> Any:
     app = build_graph()
 
     langfuse_handler = CallbackHandler()
