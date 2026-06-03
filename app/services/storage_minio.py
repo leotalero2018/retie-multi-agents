@@ -37,3 +37,14 @@ def download_prefix(bucket: str, prefix: str, dest_dir: str) -> None:
         path = base / rel
         path.parent.mkdir(parents=True, exist_ok=True)
         cli.fget_object(bucket, key, str(path))
+
+def download_folder(bucket: str, prefix: str, local_dir: str) -> None:
+    download_prefix(bucket=bucket, prefix=prefix, dest_dir=local_dir)
+
+def upload_folder(local_dir: str, bucket: str, prefix: str) -> None:
+    cli = _client()
+    base = Path(local_dir)
+    for path in base.rglob("*"):
+        if path.is_file():
+            key = prefix.rstrip("/") + "/" + path.relative_to(base).as_posix()
+            cli.fput_object(bucket, key, str(path))
