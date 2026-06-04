@@ -15,12 +15,7 @@
 </div>
 
 ---
-
-## ¿Qué es este proyecto?
-
-**RETIE Multi-Agents** es un sistema de inteligencia artificial que permite a electricistas, ingenieros y profesionales del sector eléctrico colombiano **consultar el RETIE y la NTC 2050 de forma conversacional** a través de Telegram, una API REST o una CLI.
-
-El sistema indexa los documentos PDF normativos en una base de datos vectorial (ChromaDB), y cuando el usuario hace una pregunta, recupera los fragmentos más relevantes para generar una respuesta precisa con el modelo GPT-4o-mini. Incluye un agente de enriquecimiento secundario (OpenAI Assistants) y soporte para voz, imágenes y OCR.
+![Diagrama general](images/diagrama.png)
 
 ---
 
@@ -452,10 +447,10 @@ uvicorn retie_agent.api.main:app --host 0.0.0.0 --port $PORT
 ## Flujo de datos
 
 ### Indexación (pipeline_indexacion)
-
+![Pipeline de indexación](images/pipeline_parser.png)
 
 ### Consulta (retie_agent)
-
+![Flujo de consulta](images/flujo_consulta.png)
 
 ---
 
