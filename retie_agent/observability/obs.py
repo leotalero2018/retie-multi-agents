@@ -1,6 +1,3 @@
-# app/observability/obs.py
-# Langfuse v3 helpers (+ support for custom observation types like "retriever", "chain", "agent")
-
 from __future__ import annotations
 from contextlib import contextmanager
 from typing import Optional, Any, Dict
@@ -21,7 +18,6 @@ def _enabled() -> bool:
 
 
 def _get_client():
-    """Return the global v3 client (or None if disabled/unavailable)."""
     if not _enabled():
         return None
     global _langfuse
@@ -59,81 +55,68 @@ def trace_ctx(
     metadata: Optional[Dict[str, Any]] = None,
     trace_input: Optional[Dict[str, Any]] = None,
 ):
-    """
-    Root span; set overall Input on the root (question, agent, etc.).
-    """
+    """Root observation — groups all child spans under one trace."""
     lf = _get_client()
     if lf is None:
         yield None
         return
 
-    # Setup before yield — exceptions here are safe to catch.
+    meta = {**(metadata or {})}
+    if user_id:
+        meta["user_id"] = user_id
+
     try:
-        ctx_mgr = lf.start_as_current_span(name=name)
+        ctx_mgr = lf.start_as_current_observation(
+            name=name,
+            as_type="span",
+            input=trace_input,
+            metadata=meta if meta else None,
+        )
     except Exception:
         yield None
         return
 
     with ctx_mgr as span:
         try:
-            if user_id:
-                lf.update_current_trace(user_id=user_id)
             if trace_input:
-                lf.update_current_span(input=trace_input)
-            if metadata:
-                for k, v in metadata.items():
-                    span.set_attribute(f"meta.{k}", v)
+                lf.set_current_trace_io(input=trace_input)
         except Exception:
             pass
-        # yield is outside any try/except so exceptions thrown by the caller
-        # propagate normally and don't trigger "generator didn't stop after throw()"
         yield span
 
 
 @contextmanager
 def span_ctx(
-    trace,                      # kept for API parity
+    trace,
     name: str,
     metadata: Optional[Dict[str, Any]] = None,
     *,
-    as_type: Optional[str] = None,     # <-- important for Agent Graph
+    as_type: Optional[str] = None,
     span_input: Optional[Dict[str, Any]] = None,
 ):
-    """
-    Child observation. If `as_type` is provided (e.g., "retriever", "chain", "agent"),
-    Langfuse will classify this observation accordingly, enabling the Agent Graph view.
-    """
+    """Child observation. as_type controls the Langfuse graph icon."""
     lf = _get_client()
     if lf is None:
         yield None
         return
 
-    # Setup before yield — exceptions here are safe to catch.
     try:
-        try:
-            ctx_mgr = lf.start_as_current_span(name=name, as_type=as_type)  # type: ignore[arg-type]
-        except TypeError:
-            ctx_mgr = lf.start_as_current_span(name=name)
+        ctx_mgr = lf.start_as_current_observation(
+            name=name,
+            as_type=as_type or "span",
+            input=span_input,
+            metadata=metadata if metadata else None,
+        )
     except Exception:
         yield None
         return
 
     with ctx_mgr as span:
-        try:
-            if span_input:
-                lf.update_current_span(input=span_input)
-            if metadata:
-                for k, v in metadata.items():
-                    span.set_attribute(f"meta.{k}", v)
-        except Exception:
-            pass
-        # yield is outside any try/except so exceptions thrown by the caller
-        # propagate normally and don't trigger "generator didn't stop after throw()"
         yield span
 
 
 def log_generation(
-    trace,  # unused (API parity)
+    trace,
     name: str,
     input_text: str,
     output_text: str,
@@ -146,16 +129,17 @@ def log_generation(
     if lf is None:
         return
     try:
-        with lf.start_as_current_generation(
+        with lf.start_as_current_observation(
             name=name,
+            as_type="generation",
             model=model or "",
             input=input_text if isinstance(input_text, (str, bytes)) else str(input_text),
+            metadata=metadata if metadata else None,
         ) as gen:
             try:
                 gen.update(
                     output=output_text,
                     usage_details=usage or {},
-                    metadata=metadata or {},
                 )
             except Exception:
                 pass
