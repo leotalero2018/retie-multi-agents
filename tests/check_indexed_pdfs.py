@@ -7,7 +7,7 @@ from collections import defaultdict
 root = Path(__file__).parent.parent.resolve()
 sys.path.append(str(root))
 
-from app.retriever.chroma_client import get_collection
+from retie_agent.retriever.chroma_client import get_collection
 
 collections = ["retie_plumber", "retie_pymupdf"]
 

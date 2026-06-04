@@ -2,11 +2,11 @@
 import tempfile
 from pathlib import Path
 
-from app.ingestion.minio_handler import MinIOHandler
-from app.ingestion.extractors import extract_pages
-from app.ingestion.chunker import make_chunks
-from app.ingestion.embedder import embed_texts
-from app.retriever.chroma_client import get_collection
+from pipeline_indexacion.ingestion.minio_handler import MinIOHandler
+from pipeline_indexacion.ingestion.extractors import extract_pages
+from pipeline_indexacion.ingestion.chunker import make_chunks
+from retie_agent.llm.embedder import embed_texts
+from retie_agent.retriever.chroma_client import get_collection
 
 def test_pipeline_minio():
     # 1. Inicializamos el cliente MinIO

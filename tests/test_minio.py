@@ -1,6 +1,6 @@
 # test_minio.py
 from dotenv import load_dotenv
-from app.ingestion.minio_handler import MinIOHandler
+from pipeline_indexacion.ingestion.minio_handler import MinIOHandler
 
 from dotenv import load_dotenv
 import os

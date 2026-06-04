@@ -1,4 +1,4 @@
-from app.utils.text import split_by_tokens
+from retie_agent.utils.text import split_by_tokens
 
 
 def test_split_by_tokens_basic():
