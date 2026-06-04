@@ -35,7 +35,7 @@ boto3==1.35.36
 pymongo==4.15.0
 
 # Observability
-langfuse>=4.7.1
+langfuse>=2.0.0,<3.0.0
 
 # Images & OCR
 pytesseract==0.3.13
