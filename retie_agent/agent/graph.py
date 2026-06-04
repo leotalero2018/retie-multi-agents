@@ -10,7 +10,7 @@ from retie_agent.config import settings
 from retie_agent.retriever.retrieve import search
 from retie_agent.agent.prompt import make_prompt
 from retie_agent.agent.retie_agent import _dedupe_hits, _resolve_collection, _resolve_model
-from retie_agent.observability.obs import span_ctx, log_generation
+from retie_agent.observability.obs import trace_ctx, span_ctx, log_generation
 from retie_agent.services.history import get_history, add_message
 
 # ---------- State ----------
@@ -334,17 +334,21 @@ def run_graph(
         history=history,
     )
 
-    # invoke() devuelve el estado final directamente; evita el bug
-    # "generator didn't stop after throw()" que ocurría con stream() + break
-    result: Dict[str, Any] = app.invoke(
-        state_in,
-        config={
-            "callbacks": callbacks,
-            "run_name": "LangGraph",
-            "tags": ["retie-agent", "graph", f"user:{user_id}", f"session:{session}"],
-            "metadata": {**(metadata or {}), "agent_key": agent_key or "default"},
-        },
-    )
+    with trace_ctx(
+        name="retie-query",
+        user_id=user_id,
+        metadata={"agent_key": agent_key or "default", **(metadata or {})},
+        trace_input={"question": question, "session": session},
+    ):
+        result: Dict[str, Any] = app.invoke(
+            state_in,
+            config={
+                "callbacks": callbacks,
+                "run_name": "LangGraph",
+                "tags": ["retie-agent", "graph", f"user:{user_id}", f"session:{session}"],
+                "metadata": {**(metadata or {}), "agent_key": agent_key or "default"},
+            },
+        )
 
     final_answer = result.get("answer") if isinstance(result, dict) else None
     final_txt = final_answer or "No tengo evidencia en los documentos."

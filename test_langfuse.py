@@ -13,7 +13,7 @@ if __name__ == "__main__":
 
     response = client.chat.completions.create(
         model="gpt-4o-mini",
-        messages=[{"role": "user", "content": "Hola, respóndeme en una sola frase"}],
+        messages=[{"role": "user", "content": "Que es una Acometida?"}],
         name="test-trace",
         metadata={"component": "test_graph"},
         tags=["test", "langfuse"],
