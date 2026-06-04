@@ -342,7 +342,11 @@ async def on_voice(message: Message):
     )
 
     is_admin = _is_admin(message.from_user.id if message.from_user else None)
-    resp = _clean_for_user(raw_resp, is_admin)
+    if isinstance(raw_resp, dict) and "formatted_response" in raw_resp:
+        final_resp = raw_resp["formatted_response"]
+    else:
+        final_resp = str(raw_resp or "No se obtuvo respuesta del agente.")
+    resp = _clean_for_user(final_resp, is_admin)
     await message.answer(resp)
 
 
@@ -387,7 +391,11 @@ async def on_photo(message: Message):
     )
 
     is_admin = _is_admin(message.from_user.id if message.from_user else None)
-    resp = _clean_for_user(raw_resp, is_admin)
+    if isinstance(raw_resp, dict) and "formatted_response" in raw_resp:
+        final_resp = raw_resp["formatted_response"]
+    else:
+        final_resp = str(raw_resp or "No se obtuvo respuesta del agente.")
+    resp = _clean_for_user(final_resp, is_admin)
     await message.answer(resp)
 
 
