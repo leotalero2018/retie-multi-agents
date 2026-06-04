@@ -4,6 +4,7 @@
 from __future__ import annotations
 from contextlib import contextmanager
 from typing import Optional, Any, Dict
+import os
 
 from retie_agent.config import settings
 
@@ -27,8 +28,25 @@ def _get_client():
     if _langfuse is not None:
         return _langfuse
     try:
-        from langfuse import get_client  # v3 API
-        _langfuse = get_client()
+        from langfuse import Langfuse
+
+        pk = getattr(settings, "LANGFUSE_PUBLIC_KEY", None) or os.getenv("LANGFUSE_PUBLIC_KEY")
+        sk = getattr(settings, "LANGFUSE_SECRET_KEY", None) or os.getenv("LANGFUSE_SECRET_KEY")
+        host = (
+            getattr(settings, "LANGFUSE_HOST", None)
+            or os.getenv("LANGFUSE_HOST")
+            or os.getenv("LANGFUSE_BASE_URL")
+        )
+
+        kwargs: dict = {}
+        if pk:
+            kwargs["public_key"] = pk
+        if sk:
+            kwargs["secret_key"] = sk
+        if host:
+            kwargs["host"] = host
+
+        _langfuse = Langfuse(**kwargs)
         return _langfuse
     except Exception:
         return None

@@ -284,7 +284,31 @@ def build_graph():
 
 
 # ---------- Runner ----------
-from langfuse.langchain import CallbackHandler
+def _make_langfuse_handler():
+    """Crea CallbackHandler solo si Langfuse está habilitado, con credenciales explícitas."""
+    enabled = str(getattr(settings, "LANGFUSE_ENABLED", "false")).lower() in ("1", "true", "yes")
+    if not enabled:
+        return None
+    try:
+        from langfuse.langchain import CallbackHandler
+        kwargs: dict = {}
+        pk = getattr(settings, "LANGFUSE_PUBLIC_KEY", None) or os.getenv("LANGFUSE_PUBLIC_KEY")
+        sk = getattr(settings, "LANGFUSE_SECRET_KEY", None) or os.getenv("LANGFUSE_SECRET_KEY")
+        host = (
+            getattr(settings, "LANGFUSE_HOST", None)
+            or os.getenv("LANGFUSE_HOST")
+            or os.getenv("LANGFUSE_BASE_URL")
+        )
+        if pk:
+            kwargs["public_key"] = pk
+        if sk:
+            kwargs["secret_key"] = sk
+        if host:
+            kwargs["host"] = host
+        return CallbackHandler(**kwargs)
+    except Exception:
+        return None
+
 
 def run_graph(
     question: str,
@@ -296,7 +320,8 @@ def run_graph(
 ) -> Any:
     app = build_graph()
 
-    langfuse_handler = CallbackHandler()
+    langfuse_handler = _make_langfuse_handler()
+    callbacks = [langfuse_handler] if langfuse_handler else []
 
     history = get_history(session, limit=getattr(settings, "HISTORY_LIMIT", 10))
     add_message(session, user_id, "user", question)
@@ -314,10 +339,10 @@ def run_graph(
     result: Dict[str, Any] = app.invoke(
         state_in,
         config={
-            "callbacks": [langfuse_handler],
+            "callbacks": callbacks,
             "run_name": "LangGraph",
             "tags": ["retie-agent", "graph", f"user:{user_id}", f"session:{session}"],
-            "metadata": {**(metadata or {}), "agent_key": agent_key},
+            "metadata": {**(metadata or {}), "agent_key": agent_key or "default"},
         },
     )
 
