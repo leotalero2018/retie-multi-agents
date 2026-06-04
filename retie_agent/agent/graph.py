@@ -44,19 +44,27 @@ def _node_retrieve(state: GraphState) -> GraphState:
     coll = _resolve_collection(agent_key, explicit=None)
     top_k = getattr(settings, "TOP_K", 4)
 
-    # Make this a "retriever" observation so Langfuse can draw the graph.
-    with span_ctx(None, "retrieve", {"collection": coll, "top_k": top_k}, as_type="retriever", span_input={"q": q}):
+    with span_ctx(None, "retrieve", {"collection": coll, "top_k": top_k}, as_type="retriever", span_input={"question": q}) as span:
         try:
             hits = _dedupe_hits(search(q, top_k=top_k, collection_name=coll))
         except Exception:
             hits = []
+        if span is not None:
+            try:
+                span.update(output={"hits_count": len(hits), "sources": [h.get("meta", {}).get("source", "") for h in hits[:3]]})
+            except Exception:
+                pass
         return {"hits": hits}
 
 def _node_router(state: GraphState) -> GraphState:
     hits = state.get("hits") or []
     route = "answer_node" if len(hits) > 0 else "no_context"
-    # Mark as a generic "chain" step
-    with span_ctx(None, "router", {"hits": len(hits), "route": route}, as_type="chain"):
+    with span_ctx(None, "router", as_type="chain", span_input={"hits_count": len(hits)}) as span:
+        if span is not None:
+            try:
+                span.update(output={"route": route})
+            except Exception:
+                pass
         return {"route": route}
 
 def _node_answer(state: GraphState) -> GraphState:
@@ -70,13 +78,11 @@ def _node_answer(state: GraphState) -> GraphState:
     sys = "Eres un asistente útil."
     prompt = make_prompt(hits, q, is_admin=False)
     messages = [{"role": "system", "content": sys}]
-    # Add history
     for msg in state.get("history", []):
         messages.append(msg)
-    # Add project context/query
     messages.append({"role": "user", "content": prompt})
 
-    with span_ctx(None, "answer_node", {"model": model, "hits": len(hits)}, as_type="chain"):
+    with span_ctx(None, "answer_node", {"model": model, "hits": len(hits)}, as_type="chain", span_input={"question": q}):
         resp = _client.chat.completions.create(
             model=model,
             temperature=0.0,
@@ -99,7 +105,7 @@ def _node_answer(state: GraphState) -> GraphState:
         return {"answer": answer}
 
 def _node_no_context(_state: GraphState) -> GraphState:
-    with span_ctx(None, "answer_node", {"route": "no_context"}, as_type="chain"):
+    with span_ctx(None, "no_context", as_type="chain"):
         return {"answer": "No tengo evidencia en los documentos."}
 
 
@@ -334,12 +340,20 @@ def run_graph(
         history=history,
     )
 
+    trace_input = {
+        "question": question,
+        "user_id": user_id,
+        "session": session,
+        "agent_key": agent_key,
+        "history": history,
+    }
+
     with trace_ctx(
         name="retie-query",
         user_id=user_id,
         metadata={"agent_key": agent_key or "default", **(metadata or {})},
-        trace_input={"question": question, "session": session},
-    ):
+        trace_input=trace_input,
+    ) as trace_span:
         result: Dict[str, Any] = app.invoke(
             state_in,
             config={
@@ -350,8 +364,15 @@ def run_graph(
             },
         )
 
-    final_answer = result.get("answer") if isinstance(result, dict) else None
-    final_txt = final_answer or "No tengo evidencia en los documentos."
+        final_answer = result.get("answer") if isinstance(result, dict) else None
+        final_txt = final_answer or "No tengo evidencia en los documentos."
+        output_txt = final_txt.get("formatted_response", str(final_txt)) if isinstance(final_txt, dict) else str(final_txt)
+
+        if trace_span is not None:
+            try:
+                trace_span.set_trace_io(output=output_txt)
+            except Exception:
+                pass
 
     txt_to_save = final_txt
     if isinstance(final_txt, dict) and "formatted_response" in final_txt:
