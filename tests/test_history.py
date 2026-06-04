@@ -4,7 +4,7 @@ import sys
 # Add project root to path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-from app.agent.graph import run_graph
+from retie_agent.agent.graph import run_graph
 import uuid
 
 def test_conversation_history():

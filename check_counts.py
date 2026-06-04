@@ -1,4 +1,4 @@
-from app.retriever.retrieve import search
+from retie_agent.retriever.retrieve import search
 hits = search("¿Qué es un accidente?", top_k=8, collection_name="retie_docs", distance_threshold=1.0)
 print("HITS:", len(hits))
 for i,h in enumerate(hits,1):

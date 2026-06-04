@@ -3,8 +3,8 @@ import os
 import argparse
 from pathlib import Path
 
-from app.ingestion.pipeline import index_folder
-from app.ingestion.indexer import index_file
+from pipeline_indexacion.ingestion.pipeline import index_folder
+from pipeline_indexacion.ingestion.indexer import index_file
 
 def main():
     p = argparse.ArgumentParser(description="Indexa PDFs en Chroma con parser seleccionable.")
@@ -35,7 +35,7 @@ def main():
     if args.upload:
         # Importar solo cuando se usa --upload
         try:
-            from app.services.storage_s3 import upload_folder
+            from retie_agent.services.storage_s3 import upload_folder
         except ModuleNotFoundError:
             raise SystemExit(
                 "Falta app/services/storage_s3.py. Crea ese archivo o ejecuta sin --upload."

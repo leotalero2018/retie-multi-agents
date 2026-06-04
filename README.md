@@ -1,127 +1,541 @@
+<div align="center">
 
-# python-telegram-bot-RETIE
-Este proyecto implementa un sistema de **agentes inteligentes** (multiagente) que responden preguntas técnicas sobre el RETIE (Reglamento Técnico de Instalaciones Eléctricas).
+# RETIE Multi-Agents
 
-# retie-agent
+**Sistema RAG multiagente para consultas técnicas sobre el Reglamento Técnico de Instalaciones Eléctricas (RETIE)**
 
-Bot de Telegram con RAG (Chroma + OpenAI) para responder preguntas sobre documentos RETIE.
+[![Python](https://img.shields.io/badge/Python-3.11+-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://www.python.org/)
+[![FastAPI](https://img.shields.io/badge/FastAPI-0.112-009688?style=for-the-badge&logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
+[![LangGraph](https://img.shields.io/badge/LangGraph-0.2.62-FF6B35?style=for-the-badge)](https://langchain-ai.github.io/langgraph/)
+[![ChromaDB](https://img.shields.io/badge/ChromaDB-1.1.0-FF4081?style=for-the-badge)](https://www.trychroma.com/)
+[![OpenAI](https://img.shields.io/badge/OpenAI-GPT--4o--mini-412991?style=for-the-badge&logo=openai&logoColor=white)](https://openai.com/)
+[![Telegram](https://img.shields.io/badge/Telegram-Bot-26A5E4?style=for-the-badge&logo=telegram&logoColor=white)](https://core.telegram.org/bots)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=for-the-badge)](LICENSE)
 
-![RETIE Flow](retie-agent\images\diagrama.png)
+</div>
 
+---
 
+## ¿Qué es este proyecto?
 
+**RETIE Multi-Agents** es un sistema de inteligencia artificial que permite a electricistas, ingenieros y profesionales del sector eléctrico colombiano **consultar el RETIE y la NTC 2050 de forma conversacional** a través de Telegram, una API REST o una CLI.
 
+El sistema indexa los documentos PDF normativos en una base de datos vectorial (ChromaDB), y cuando el usuario hace una pregunta, recupera los fragmentos más relevantes para generar una respuesta precisa con el modelo GPT-4o-mini. Incluye un agente de enriquecimiento secundario (OpenAI Assistants) y soporte para voz, imágenes y OCR.
 
-## 1 Preparar entorno
+---
+
+## Arquitectura general
+
+```
+Usuario
+  │
+  ├── Telegram Bot (voz, texto, imagen)
+  │       └── retie_agent/bot/
+  │
+  ├── API REST (HTTP)
+  │       └── retie_agent/api/
+  │
+  └── CLI (script local)
+          └── index_docs.py
+                │
+          ┌─────▼────────────────────────────────────────┐
+          │               LangGraph Pipeline              │
+          │   retrieve → router → answer → enrich → style │
+          │          retie_agent/agent/graph.py           │
+          └─────────────────┬────────────────────────────┘
+                            │
+             ┌──────────────┴──────────────┐
+             ▼                             ▼
+    retie_agent/retriever/        retie_agent/services/
+     Chroma (dense + BM25)        MongoDB · MinIO · Whisper
+                                  Vision · Langfuse
+             ▲
+             │  (índice vectorial pre-construido)
+             │
+    pipeline_indexacion/
+     PDF → parsers → chunker → embedder → ChromaDB
+```
+
+---
+
+## Estructura del monorepo
+
+```
+retie-multi-agents/
+│
+├── retie_agent/                    ← Agente inteligente RETIE
+│   ├── config.py                   # Configuración centralizada (Pydantic Settings)
+│   ├── agent/
+│   │   ├── graph.py                # Grafo LangGraph (pipeline principal de respuesta)
+│   │   ├── retie_agent.py          # Agente base con dedupe y resolución de colecciones
+│   │   ├── enrichment_assistant.py # Enriquecimiento con OpenAI Assistants API
+│   │   ├── registry.py             # Registro de agentes disponibles (plumber, pymupdf)
+│   │   ├── orchestrator.py         # Wrapper de compatibilidad
+│   │   └── prompt.py               # Templates de prompts (usuario vs admin)
+│   ├── api/
+│   │   ├── main.py                 # FastAPI: /health, /query, /files, /gallery
+│   │   ├── ingest.py               # Endpoints /ingest/rebuild y /ingest/sync
+│   │   └── debug.py                # Endpoint /debug/bucket (S3)
+│   ├── bot/
+│   │   ├── run_polling.py          # Entry point del bot Telegram (aiogram)
+│   │   └── router.py               # Handlers: texto, voz, imágenes, comandos admin
+│   ├── llm/
+│   │   ├── provider.py             # OpenAI client + respuesta extractiva fallback
+│   │   └── embedder.py             # Generación de embeddings (text-embedding-3-small)
+│   ├── retriever/
+│   │   ├── retrieve.py             # Dense retrieval + BM25 fallback
+│   │   └── chroma_client.py        # Cliente persistente ChromaDB (singleton)
+│   ├── services/
+│   │   ├── history.py              # Historial de chat en MongoDB
+│   │   ├── mongo_store.py          # Almacenamiento de imágenes (GridFS)
+│   │   ├── storage_minio.py        # Cliente MinIO/S3
+│   │   ├── vision.py               # OCR (Tesseract) + GPT-4o Vision
+│   │   └── whisper.py              # Transcripción de audio (Whisper / GPT-4o)
+│   ├── observability/
+│   │   └── obs.py                  # Trazabilidad con Langfuse v3
+│   ├── db/
+│   │   └── chroma.py               # Adaptador minimalista de ChromaDB
+│   └── utils/
+│       ├── text.py                 # Tokenización, limpieza y splitting de texto
+│       └── storage.py              # Helpers S3-compatibles (boto3)
+│
+├── pipeline_indexacion/            ← Pipeline de indexación de documentos
+│   ├── ingestion/
+│   │   ├── pipeline.py             # index_folder(): indexa una carpeta completa de PDFs
+│   │   ├── indexer.py              # index_file(): indexa un PDF individual
+│   │   ├── chunker.py              # Splitting por tokens con overlap (tiktoken)
+│   │   └── parsers/
+│   │       ├── base.py             # BaseParser (interfaz)
+│   │       ├── factory.py          # Selección dinámica de parser
+│   │       ├── pdfplumber_parser.py# Parser preciso para tablas y layouts complejos
+│   │       └── pymupdf_parser.py   # Parser rápido para texto plano
+│   ├── bootstrap_sync.py           # Descarga automática del índice Chroma desde MinIO
+│   └── bootstrap_preflight.py      # Self-test del RAG al arrancar
+│
+├── tests/                          ← Suite de pruebas
+│   ├── test_chuncker.py
+│   ├── test_history.py
+│   ├── check_indexed_pdfs.py
+│   ├── test_pipeline_minio.py
+│   ├── test_minio.py
+│   └── test_search_minio.py
+│
+├── docs/                           ← Documentos PDF normativos (no versionados)
+├── data/                           ← Base de datos ChromaDB persistente (no versionado)
+├── images/                         ← Imágenes del README
+│
+├── index_docs.py                   # CLI para indexar PDFs desde terminal
+├── check_counts.py                 # Verifica el número de chunks indexados
+├── test_langfuse.py                # Test de conexión con Langfuse
+│
+├── Dockerfile                      # Imagen Docker multi-etapa
+├── docker-compose.yml              # Servicios: bot + MinIO
+├── Procfile                        # Para Railway: `python -m retie_agent.bot.run_polling`
+├── requirements.txt                # Dependencias Python
+└── .env                            # Variables de entorno (no se versiona)
+```
+
+---
+
+## Stack tecnológico
+
+| Categoría | Tecnología | Versión |
+|-----------|-----------|---------|
+| **Framework web** | FastAPI + Uvicorn | 0.112 / 0.30 |
+| **Bot Telegram** | aiogram | 3.7.0 |
+| **Orquestación de agentes** | LangGraph + LangChain | 0.2.62 / 0.3.25 |
+| **Base de datos vectorial** | ChromaDB (HNSW cosine) | 1.1.0 |
+| **LLM** | OpenAI GPT-4o-mini | — |
+| **Embeddings** | text-embedding-3-small (1536 dim) | — |
+| **Parsers PDF** | pdfplumber + PyMuPDF | 0.11.7 / 1.24.9 |
+| **Tokenización** | tiktoken (cl100k_base) | 0.7.0 |
+| **Recuperación léxica** | rank-bm25 (fallback) | 0.2.2 |
+| **Transcripción de voz** | Whisper / GPT-4o-transcribe | — |
+| **Vision / OCR** | GPT-4o + Tesseract | — |
+| **Historial de chat** | MongoDB + PyMongo | 4.15.0 |
+| **Almacenamiento vectores** | MinIO (S3-compatible) | 7.2.15 |
+| **Observabilidad** | Langfuse v3 | 4.7.1+ |
+| **Contenedores** | Docker + docker-compose | — |
+
+---
+
+## Prerrequisitos
+
+Antes de comenzar, asegúrate de tener instalado:
+
+- **Python 3.11+** — [descargar](https://www.python.org/downloads/)
+- **Git** — [descargar](https://git-scm.com/)
+- **Docker + Docker Compose** (opcional, para ejecutar con contenedores)
+- **Tesseract OCR** (opcional, para procesar imágenes)
+  - Ubuntu: `sudo apt install tesseract-ocr tesseract-ocr-spa`
+  - Windows: [instalador](https://github.com/UB-Mannheim/tesseract/wiki)
+- **ffmpeg** (opcional, para normalizar audio)
+  - Ubuntu: `sudo apt install ffmpeg`
+  - Windows: [descargar](https://ffmpeg.org/download.html)
+
+Cuentas necesarias:
+- **OpenAI** con API Key activa ([platform.openai.com](https://platform.openai.com))
+- **Telegram Bot Token** (créalo con [@BotFather](https://t.me/BotFather))
+- **MongoDB** — [MongoDB Atlas](https://www.mongodb.com/atlas) (gratuito) o instancia local
+- **Langfuse** (opcional, para observabilidad) — [cloud.langfuse.com](https://cloud.langfuse.com)
+
+---
+
+## Inicio rápido
+
+### 1. Clonar el repositorio
 
 ```bash
-
-CLONACION DEL REPOSITORIO
-
 git clone https://github.com/leotalero2018/retie-multi-agents.git
 cd retie-multi-agents
+```
 
-CREACION DEL ENTORNO VIRTUAL
+### 2. Crear y activar el entorno virtual
 
-PARA LINUX/MAC
+**Linux / macOS:**
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+```
 
-python3 -m venv venv
-source venv/bin/activate
-
-PARA WINDOWS
-
-python -m venv venv
+**Windows (PowerShell):**
+```powershell
+python -m venv .venv
 Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
-.\venv\Scripts\activate
+.\.venv\Scripts\Activate.ps1
+```
 
-INSTALACION DE DEPENDENCIAS (LIBRERIAS)
+### 3. Instalar dependencias
 
+```bash
 pip install -r requirements.txt
+```
 
-EJECUCION DEL ENTORNO
+### 4. Configurar variables de entorno
 
-PARA LINUX/MAC
+Copia el archivo de ejemplo y edítalo con tus credenciales:
 
+```bash
+cp .env.example .env   # Linux/macOS
+copy .env.example .env  # Windows
+```
+
+Abre `.env` y configura las variables (ver sección [Variables de entorno](#variables-de-entorno)).
+
+### 5. Configurar el PYTHONPATH
+
+El proyecto usa dos paquetes raíz (`retie_agent` y `pipeline_indexacion`), por lo que debes apuntar el PYTHONPATH a la raíz del repositorio.
+
+**Linux / macOS:**
+```bash
 export PYTHONPATH=$(pwd)
+```
 
-PARA WINDOWS
-
+**Windows (PowerShell):**
+```powershell
 $env:PYTHONPATH = "$(Get-Location)"
+```
 
-PRUEBA LOCAL (LA RESPUESTA ES MUY BASICA POR EL MOMENTO)
+> **Tip:** Agrega esta línea a tu `.bashrc`, `.zshrc` o al perfil de PowerShell para no repetirla cada sesión.
 
-python -c "from app.agent.orchestrator import answer_question; print(answer_question('¿Qué exige el RETIE sobre puesta a tierra en subestaciones?'))"
+---
 
-PRUEBA CON TELEGRAM
+## Variables de entorno
 
-Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
-$env:PYTHONPATH = "$(Get-Location)"
-python -m app.bot.run_polling
+Crea un archivo `.env` en la raíz con las siguientes variables:
 
-Estructura del proyectore
+```env
+# ── OpenAI ─────────────────────────────────────────────────────────────
+OPENAI_API_KEY=sk-proj-...          # API key principal
+CHROMA_OPENAI_API_KEY=sk-proj-...   # (opcional) key exclusiva para embeddings
 
-retie-agent/
-├─ app/
-│ ├─ agent/ # Orquestador RAG/LLM y herramientas
-│ │ ├─ init.py
-│ │ ├─ orchestrator.py
-│ │ ├─ prompt.py
-│ │ ├─ tools.py
-│ │ └─ graph.py
-│ │
-│ ├─ api/ # API con FastAPI (para integración / webhooks)
-│ │ ├─ init.py
-│ │ └─ main.py
-│ │
-│ ├─ bot/ # Bot de Telegram (aiogram)
-│ │ ├─ init.py
-│ │ └─ run_polling.py
-│ │
-│ ├─ ingestion/ # Extracción de texto, chunking, embeddings, indexado
-│ │ ├─ init.py
-│ │ ├─ chunker.py
-│ │ ├─ embedder.py
-│ │ ├─ extractors.py
-│ │ └─ indexer.py
-│ │
-│ ├─ llm/ # Capa de conexión con modelos LLM
-│ │ ├─ init.py
-│ │ └─ provider.py
-│ │
-│ ├─ observability/ # Monitoreo y observabilidad
-│ │ └─ obs.py
-│ │
-│ ├─ retriever/ # Conexión y búsquedas en Chroma
-│ │ ├─ init.py
-│ │ ├─ chroma_client.py
-│ │ └─ retrieve.py
-│ │
-│ ├─ utils/ # Utilidades comunes
-│ │ ├─ init.py
-│ │ ├─ text.py
-│ │ └─ config.py
-│ │
-│ └─ init.py
-│
-├─ data/ # Documentos fuente y DB persistente de Chroma
-│ ├─ chroma_db/ # Persistencia de embeddings
-│ ├─ 73f9a4a0...db/ # Carpeta autogenerada por Chroma
-│ └─ chroma.sqlite3 # Base de datos local
-│
-├─ docs/ # Documentos normativos RETIE/NTC
-│ ├─ 2_Libro_1__Disposiciones_Generales.pdf
-│ ├─ NTC_2050_V2_Codigo_Electrico_Colombiano.pdf
-│ ├─ NTC_2050-Fe-de-erratas.pdf
-│ └─ Resolución_40117_de_2024_RETIE.pdf
-│
-├─ tests/ # Pruebas unitarias
-│ ├─ init.py
-│ └─ test_chunker.py
-│
-├─ .env.example # Ejemplo de variables de entorno
-├─ .gitignore
-├─ requirements.txt # Dependencias del proyecto
-├─ Dockerfile # Imagen de contenedor
-├─ docker-compose.yml # Orquestación con contenedores
-├─ index_docs.py # Script CLI para indexar documentos
-└─ README.md
+# ── LLM / Embeddings ───────────────────────────────────────────────────
+CHAT_MODEL=gpt-4o-mini              # Modelo de chat
+EMBEDDING_MODEL=text-embedding-3-small
+MAX_TOKENS=600
+
+# ── Telegram ───────────────────────────────────────────────────────────
+TELEGRAM_BOT_TOKEN=1234567890:AAE...
+
+# ── RAG / ChromaDB ─────────────────────────────────────────────────────
+COLLECTION_NAME=retie_docs
+CHROMA_PERSIST_DIR=./data/chroma_db
+CHUNK_TOKENS=800                    # Tokens por chunk
+CHUNK_OVERLAP=150                   # Overlap entre chunks
+TOP_K=8                             # Documentos recuperados por query
+RAG_DISTANCE_THRESHOLD=0.45         # Umbral de similitud coseno
+
+# ── MongoDB ────────────────────────────────────────────────────────────
+MONGO_URI=mongodb+srv://user:pass@cluster.mongodb.net/
+MONGO_DB=retie
+MONGO_BUCKET=images
+
+# ── MinIO / S3 ─────────────────────────────────────────────────────────
+MINIO_ROOT_USER=minioadmin
+MINIO_ROOT_PASSWORD=minioadmin
+MINIO_BUCKET_NAME=embeddings-store
+MINIO_PRIVATE_ENDPOINT=localhost:9000
+MINIO_PUBLIC_ENDPOINT=localhost:9000
+
+# ── Langfuse (observabilidad, opcional) ────────────────────────────────
+LANGFUSE_ENABLED=false
+LANGFUSE_PUBLIC_KEY=pk-lf-...
+LANGFUSE_SECRET_KEY=sk-lf-...
+LANGFUSE_HOST=https://us.cloud.langfuse.com
+
+# ── Admin Bot ──────────────────────────────────────────────────────────
+ADMIN_PASSWORD=tu_contraseña_segura
+ADMIN_USER_IDS=123456789            # IDs Telegram separados por coma
+
+# ── Asistente de enriquecimiento ───────────────────────────────────────
+ENRICHMENT_ASSISTANT_ID=asst_...
+ENRICHMENT_VECTOR_STORE_ID=vs_...
+
+# ── Vision / OCR ───────────────────────────────────────────────────────
+VISION_MODEL=gpt-4o
+OCR_LANG=spa+eng
+```
+
+---
+
+## Ejecución de cada componente
+
+### Indexar documentos (pipeline_indexacion)
+
+Coloca los PDFs normativos en la carpeta `docs/` y ejecuta:
+
+```bash
+# Indexar toda la carpeta (parser por defecto: PyMuPDF)
+python index_docs.py --source ./docs --out ./data/chroma_db --engine pymupdf
+
+# Indexar con pdfplumber (mejor para tablas)
+python index_docs.py --source ./docs --out ./data/chroma_db --engine pdfplumber
+
+# Indexar un único PDF
+python index_docs.py --file ./docs/Resolución_40117_de_2024_RETIE.pdf --engine pymupdf
+
+# Indexar y subir la DB a MinIO/S3
+python index_docs.py --source ./docs --out ./data/chroma_db --upload --s3-prefix chroma_db/
+```
+
+Parámetros disponibles:
+
+| Parámetro | Descripción | Por defecto |
+|-----------|-------------|-------------|
+| `--source` | Carpeta con PDFs a indexar | `./docs` |
+| `--out` | Directorio de persistencia de ChromaDB | `./data/chroma_db` |
+| `--engine` | Parser PDF: `pymupdf` o `pdfplumber` | `pymupdf` |
+| `--file` | Indexar un PDF específico | — |
+| `--upload` | Subir la DB a S3/MinIO tras indexar | `false` |
+| `--s3-prefix` | Prefijo en el bucket S3 | `chroma_db/` |
+
+---
+
+### Bot de Telegram (retie_agent)
+
+```bash
+# Activar entorno virtual y PYTHONPATH primero
+python -m retie_agent.bot.run_polling
+```
+
+Al arrancar, el bot:
+1. Sincroniza automáticamente la base ChromaDB desde MinIO (si está configurado)
+2. Verifica las colecciones disponibles
+3. Inicia el polling de Telegram
+
+**Comandos disponibles en el bot:**
+
+| Comando | Descripción |
+|---------|-------------|
+| `/start` | Inicia la conversación |
+| `/agent plumber` | Cambia al agente pdfplumber (colección `retie_docs`) |
+| `/agent pymupdf` | Cambia al agente PyMuPDF (colección `retie_pymupdf`) |
+| `/who` | Muestra el agente activo |
+| `/admin <contraseña>` | Acceso administrador (activa citas y fuentes) |
+| `/docs [k]` | Muestra los k documentos más relevantes (solo admin) |
+| `/logout` | Cierra la sesión de administrador |
+
+Además acepta: mensajes de texto, notas de voz, fotos e imágenes de documentos.
+
+---
+
+### API REST (retie_agent)
+
+```bash
+# Iniciar el servidor FastAPI
+uvicorn retie_agent.api.main:app --host 0.0.0.0 --port 8000 --reload
+```
+
+Accede a la documentación interactiva en: **http://localhost:8000/docs**
+
+**Endpoints principales:**
+
+| Método | Endpoint | Descripción |
+|--------|----------|-------------|
+| `GET` | `/health` | Estado del servicio |
+| `GET` | `/query?q=...&agent_key=plumber&session_id=...` | Consulta al agente |
+| `POST` | `/ingest/rebuild?secret=...&engine=pymupdf` | Reindexar PDFs locales |
+| `POST` | `/ingest/sync?secret=...&prefix=chroma_db/` | Sincronizar DB desde S3 |
+| `GET` | `/files` | Listar imágenes guardadas (GridFS) |
+| `GET` | `/files/{id}` | Descargar imagen por ID |
+| `GET` | `/gallery` | Galería HTML de imágenes |
+| `GET` | `/debug/bucket?prefix=chroma_db/` | Listar objetos en S3 |
+| `POST` | `/telegram/webhook` | Webhook de Telegram (producción) |
+
+**Ejemplo de consulta:**
+
+```bash
+curl "http://localhost:8000/query?q=¿Qué%20exige%20el%20RETIE%20sobre%20puesta%20a%20tierra?&agent_key=plumber"
+```
+
+```json
+{
+  "question": "¿Qué exige el RETIE sobre puesta a tierra?",
+  "answer": "El RETIE establece que...",
+  "session_id": "api_query",
+  "agent_key": "plumber"
+}
+```
+
+---
+
+## Despliegue con Docker
+
+### Desarrollo local (bot + MinIO)
+
+```bash
+docker-compose up --build
+```
+
+Esto levanta:
+- **bot**: Contenedor con el bot de Telegram (`retie_agent.bot.run_polling`)
+- **minio**: Servidor MinIO en `localhost:9000` (consola en `localhost:9001`)
+
+Accede a la consola de MinIO: **http://localhost:9001** (usuario: `minioadmin` / contraseña: `minioadmin`)
+
+### Solo el bot
+
+```bash
+docker build -t retie-agent .
+docker run --env-file .env -v $(pwd)/data:/app/data retie-agent python -m retie_agent.bot.run_polling
+```
+
+### Solo la API
+
+```bash
+docker run --env-file .env -p 8000:8000 -v $(pwd)/data:/app/data retie-agent \
+  uvicorn retie_agent.api.main:app --host 0.0.0.0 --port 8000
+```
+
+---
+
+## Despliegue en Railway
+
+Este proyecto está preparado para Railway con el `Procfile` incluido:
+
+```
+worker: python -m retie_agent.bot.run_polling
+```
+
+Variables de entorno a configurar en Railway:
+- Todas las de la sección [Variables de entorno](#variables-de-entorno)
+- `PYTHONPATH=/app`
+- `CHROMA_PERSIST_DIR=/data/chroma_db`
+
+Para el servicio de API, el comando de inicio es:
+```
+uvicorn retie_agent.api.main:app --host 0.0.0.0 --port $PORT
+```
+
+---
+
+## Flujo de datos
+
+### Indexación (pipeline_indexacion)
+
+
+### Consulta (retie_agent)
+
+
+---
+
+## Tests
+
+```bash
+# Verificar chunks indexados
+python tests/check_indexed_pdfs.py
+
+# Probar chunking de texto
+python -m pytest tests/test_chuncker.py -v
+
+# Probar historial de chat
+python -m pytest tests/test_history.py -v
+
+# Verificar conteos en Chroma
+python check_counts.py
+
+# Test de Langfuse
+python test_langfuse.py
+```
+
+---
+
+## Agentes disponibles
+
+El sistema tiene dos agentes configurados en `retie_agent/agent/registry.py`, cada uno apuntando a una colección ChromaDB diferente (indexada con parser distinto):
+
+| Agente | Comando Bot | Colección ChromaDB | Parser PDF | Ideal para |
+|--------|-------------|-------------------|------------|-----------|
+| `plumber` | `/agent plumber` | `retie_docs` | pdfplumber | Documentos con tablas y layouts complejos |
+| `pymupdf` | `/agent pymupdf` | `retie_pymupdf` | PyMuPDF | Texto fluido, respuesta más rápida |
+
+Para indexar ambas colecciones:
+
+```bash
+# Colección plumber
+python index_docs.py --source ./docs --out ./data/chroma_db --engine pdfplumber
+# (configura COLLECTION_NAME=retie_docs en .env)
+
+# Colección pymupdf
+COLLECTION_NAME=retie_pymupdf python index_docs.py --source ./docs --out ./data/chroma_db --engine pymupdf
+```
+
+---
+
+## Observabilidad con Langfuse
+
+El proyecto integra Langfuse v3 para trazabilidad completa del pipeline. Actívalo configurando:
+
+```env
+LANGFUSE_ENABLED=true
+LANGFUSE_PUBLIC_KEY=pk-lf-...
+LANGFUSE_SECRET_KEY=sk-lf-...
+LANGFUSE_HOST=https://us.cloud.langfuse.com
+```
+
+Cada consulta genera una traza con los nodos: `retrieve → router → answer_node → enrich_node → stylist_node`.
+
+---
+
+## Contribuir
+
+1. Haz fork del repositorio
+2. Crea una rama: `git checkout -b feature/mi-mejora`
+3. Realiza tus cambios y haz commit: `git commit -m "feat: descripción del cambio"`
+4. Abre un Pull Request hacia la rama `dev`
+
+---
+
+## Licencia
+
+Este proyecto está bajo la licencia MIT. Consulta el archivo [LICENSE](LICENSE) para más detalles.
+
+---
+
+<div align="center">
+
+Desarrollado para facilitar el acceso al conocimiento técnico del RETIE colombiano.
+
+**[Reportar un bug](https://github.com/leotalero2018/retie-multi-agents/issues)** · **[Solicitar una función](https://github.com/leotalero2018/retie-multi-agents/issues)**
+
+</div>
