@@ -82,6 +82,34 @@ def _get_client():
             len(pk), _fp(pk), len(sk), _fp(sk), otlp_host,
         )
 
+        # ── Diagnóstico de red/entorno (one-shot) ──────────────────────────
+        # Credenciales idénticas local vs Railway pero 401 solo en Railway →
+        # el problema está en la capa de red/SDK, no en las keys.
+        _diag_env_keys = [
+            "LANGFUSE_BASE_URL", "LANGFUSE_HOST",
+            "OTEL_EXPORTER_OTLP_ENDPOINT", "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT",
+            "OTEL_EXPORTER_OTLP_HEADERS",
+            "HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy", "NO_PROXY",
+        ]
+        _diag_found = {k: os.environ.get(k) for k in _diag_env_keys if os.environ.get(k)}
+        log.info("[Langfuse][diag] env vars de red/override presentes: %s", _diag_found or "(ninguna)")
+
+        # Request HTTP crudo, saltándose el SDK, para aislar red vs config del SDK.
+        try:
+            import httpx, base64 as _b64
+            _auth = "Basic " + _b64.b64encode(f"{pk}:{sk}".encode()).decode("ascii")
+            _url = f"{otlp_host}/api/public/projects"
+            _r = httpx.get(_url, headers={"Authorization": _auth}, timeout=10)
+            log.info(
+                "[Langfuse][diag] RAW GET %s -> status=%s server=%r cf-ray=%r body=%.180s",
+                _url, _r.status_code,
+                _r.headers.get("server"), _r.headers.get("cf-ray"),
+                _r.text,
+            )
+        except Exception as _de:
+            log.warning("[Langfuse][diag] RAW request falló: %r", _de)
+        # ────────────────────────────────────────────────────────────────────
+
         kwargs: dict = {"public_key": pk, "secret_key": sk}
         if host:
             kwargs["host"] = host
