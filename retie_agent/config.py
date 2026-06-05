@@ -79,6 +79,28 @@ settings.CHROMA_DB_DIR = persist_abs
 if not settings.TELEGRAM_BOT_TOKEN and settings.TELEGRAM_TOKEN:
     settings.TELEGRAM_BOT_TOKEN = settings.TELEGRAM_TOKEN
 
+# --- Langfuse: reconciliar región (host vs base_url) ---
+# El SDK de Langfuse da PRECEDENCIA a la env var LANGFUSE_BASE_URL por encima
+# del kwarg `host`. Si LANGFUSE_BASE_URL apunta a una región distinta de
+# LANGFUSE_HOST (p.ej. EU vs US), el SDK envía las trazas a la región
+# equivocada y el servidor responde 401 ("Invalid credentials / correct host").
+# Forzamos que ambas env vars coincidan con LANGFUSE_HOST para que TODA
+# instancia de Langfuse del proceso (cliente propio + CallbackHandler) use la
+# misma región, sin depender de la config externa (Railway).
+if settings.LANGFUSE_HOST:
+    _lf_host = settings.LANGFUSE_HOST.strip().strip('"').strip("'").strip()
+    _lf_stale = os.environ.get("LANGFUSE_BASE_URL")
+    if _lf_stale and _lf_stale.strip().rstrip("/") != _lf_host.rstrip("/"):
+        import logging
+        logging.getLogger(__name__).warning(
+            "[Langfuse] LANGFUSE_BASE_URL=%r contradecía LANGFUSE_HOST=%r — "
+            "normalizado a LANGFUSE_HOST para evitar 401 por región incorrecta.",
+            _lf_stale, _lf_host,
+        )
+    os.environ["LANGFUSE_HOST"] = _lf_host
+    os.environ["LANGFUSE_BASE_URL"] = _lf_host
+    settings.LANGFUSE_HOST = _lf_host
+
 # --- Configuración del asistente de enriquecimiento ---
 ENRICHMENT_ASSISTANT_ID = os.getenv(
     "ENRICHMENT_ASSISTANT_ID", "asst_qthy1ZfTpr2ps0mruX30zVlc"
