@@ -66,9 +66,14 @@ def _get_client():
 
         try:
             ok = _langfuse.auth_check()
-            log.info("[Langfuse] auth_check REST API = %s", ok)
+            log.info("[Langfuse] auth_check OK — trazas activas")
         except Exception as e:
-            log.warning("[Langfuse] auth_check falló: %s", e)
+            log.warning(
+                "[Langfuse] auth_check falló — Langfuse deshabilitado para evitar errores 401. "
+                "Verifica LANGFUSE_PUBLIC_KEY, LANGFUSE_SECRET_KEY y LANGFUSE_HOST. Error: %s", e
+            )
+            _langfuse.shutdown()
+            _langfuse = None
 
         return _langfuse
     except Exception as exc:
