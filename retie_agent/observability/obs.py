@@ -48,10 +48,14 @@ def _get_client():
             )
             return None
 
+        import base64
+        otlp_host = host or "https://cloud.langfuse.com"
+        otlp_endpoint = f"{otlp_host}/api/public/otel/v1/traces"
+        auth_preview = base64.b64encode(f"{pk[:8]}...:{sk[:8]}...".encode()).decode()
+
         log.info(
-            "[Langfuse] Inicializando cliente — pk=%s... host=%s",
-            pk[:8],
-            host or "(default)",
+            "[Langfuse] Inicializando cliente — pk=%s... sk=%s... host=%s endpoint=%s auth_preview=Basic %s",
+            pk[:8], sk[:8], otlp_host, otlp_endpoint, auth_preview,
         )
 
         kwargs: dict = {"public_key": pk, "secret_key": sk}
@@ -59,6 +63,13 @@ def _get_client():
             kwargs["host"] = host
 
         _langfuse = Langfuse(**kwargs)
+
+        try:
+            ok = _langfuse.auth_check()
+            log.info("[Langfuse] auth_check REST API = %s", ok)
+        except Exception as e:
+            log.warning("[Langfuse] auth_check falló: %s", e)
+
         return _langfuse
     except Exception as exc:
         log.warning("[Langfuse] Error al inicializar cliente: %s", exc)
