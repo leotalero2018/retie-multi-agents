@@ -180,24 +180,32 @@ def span_ctx(
 def log_generation(
     trace,
     name: str,
-    input_text: str,
+    input_text: Any,
     output_text: str,
     model: str = "",
     usage: Optional[Dict[str, Any]] = None,
     metadata: Optional[Dict[str, Any]] = None,
+    model_parameters: Optional[Dict[str, Any]] = None,
 ) -> None:
-    """Record one LLM call as a Generation under the current span."""
+    """Record one LLM call as a Generation under the current span.
+
+    input_text puede ser str o una lista de mensajes (role/content); Langfuse
+    renderiza mejor la lista de mensajes que un string plano.
+    """
     lf = _get_client()
     if lf is None:
         return
     try:
-        with lf.start_as_current_observation(
-            name=name,
-            as_type="generation",
-            model=model or "",
-            input=input_text if isinstance(input_text, (str, bytes)) else str(input_text),
-            metadata=metadata if metadata else None,
-        ) as gen:
+        gen_kwargs: dict = {
+            "name": name,
+            "as_type": "generation",
+            "model": model or "",
+            "input": input_text,
+            "metadata": metadata if metadata else None,
+        }
+        if model_parameters:
+            gen_kwargs["model_parameters"] = model_parameters
+        with lf.start_as_current_observation(**gen_kwargs) as gen:
             try:
                 gen.update(
                     output=output_text,

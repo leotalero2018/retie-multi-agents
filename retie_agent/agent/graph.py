@@ -37,21 +37,77 @@ def make_state(question: str, *, user_id: str = "anon", session: str = "default"
 
 _client = OpenAI(api_key=getattr(settings, "OPENAI_API_KEY", None))
 
+# ---------- Trace helpers ----------
+def _format_chunks_for_trace(hits: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Convierte los hits del retriever en documentos estructurados y legibles
+    para la vista de Langfuse: rank, score, fuente, página, chunk_id y contenido."""
+    docs: List[Dict[str, Any]] = []
+    for i, h in enumerate(hits, start=1):
+        meta = h.get("meta", {}) or {}
+        score = h.get("score")
+        docs.append({
+            "rank": i,
+            "score": round(score, 4) if isinstance(score, (int, float)) else score,
+            "score_type": h.get("score_type", "cosine_distance"),
+            "retrieval_method": h.get("retrieval_method", "dense"),
+            "source": meta.get("source", "desconocido"),
+            "page": meta.get("page", meta.get("page_number")),
+            "chunk_id": meta.get("chunk_id"),
+            "content": h.get("text", ""),
+        })
+    return docs
+
+
+def _retrieval_stats(hits: List[Dict[str, Any]], coll: str, top_k: int, thr: float) -> Dict[str, Any]:
+    scores = [h.get("score") for h in hits if isinstance(h.get("score"), (int, float))]
+    method = hits[0].get("retrieval_method", "dense") if hits else "none"
+    sources = []
+    for h in hits:
+        s = (h.get("meta", {}) or {}).get("source")
+        if s and s not in sources:
+            sources.append(s)
+    stats: Dict[str, Any] = {
+        "collection": coll,
+        "top_k": top_k,
+        "distance_threshold": thr,
+        "retrieval_method": method,
+        "hits_count": len(hits),
+        "unique_sources": sources,
+    }
+    if scores:
+        stats["score_best"] = round(min(scores), 4) if method == "dense" else round(max(scores), 4)
+        stats["score_worst"] = round(max(scores), 4) if method == "dense" else round(min(scores), 4)
+    return stats
+
+
 # ---------- Nodes ----------
 def _node_retrieve(state: GraphState) -> GraphState:
     q = state["question"]
     agent_key = state.get("agent_key")
     coll = _resolve_collection(agent_key, explicit=None)
     top_k = getattr(settings, "TOP_K", 4)
+    thr = getattr(settings, "RAG_DISTANCE_THRESHOLD", 0.45)
 
-    with span_ctx(None, "retrieve", {"collection": coll, "top_k": top_k}, as_type="retriever", span_input={"question": q}) as span:
+    span_input = {
+        "question": q,
+        "collection": coll,
+        "top_k": top_k,
+        "distance_threshold": thr,
+    }
+    with span_ctx(None, "retrieve", as_type="retriever", span_input=span_input) as span:
         try:
             hits = _dedupe_hits(search(q, top_k=top_k, collection_name=coll))
         except Exception:
             hits = []
+
         if span is not None:
             try:
-                span.update(output={"hits_count": len(hits), "sources": [h.get("meta", {}).get("source", "") for h in hits[:3]]})
+                stats = _retrieval_stats(hits, coll, top_k, thr)
+                # output = documentos recuperados (Langfuse los renderiza como lista)
+                span.update(
+                    output={"documents": _format_chunks_for_trace(hits)},
+                    metadata=stats,
+                )
             except Exception:
                 pass
         return {"hits": hits}
@@ -82,11 +138,19 @@ def _node_answer(state: GraphState) -> GraphState:
         messages.append(msg)
     messages.append({"role": "user", "content": prompt})
 
-    with span_ctx(None, "answer_node", {"model": model, "hits": len(hits)}, as_type="chain", span_input={"question": q}):
+    temperature = 0.0
+    max_tokens = getattr(settings, "MAX_TOKENS", 600)
+
+    with span_ctx(
+        None, "answer_node",
+        {"model": model, "context_chunks": len(hits), "agent_key": agent_key or "default"},
+        as_type="chain",
+        span_input={"question": q},
+    ) as span:
         resp = _client.chat.completions.create(
             model=model,
-            temperature=0.0,
-            max_tokens=getattr(settings, "MAX_TOKENS", 600),
+            temperature=temperature,
+            max_tokens=max_tokens,
             messages=messages,
         )
         answer = (resp.choices[0].message.content or "").strip()
@@ -94,13 +158,32 @@ def _node_answer(state: GraphState) -> GraphState:
         try:
             usage = getattr(resp, "usage", None)
             usage_dict = {
-                "prompt_tokens": getattr(usage, "prompt_tokens", None),
-                "completion_tokens": getattr(usage, "completion_tokens", None),
-                "total_tokens": getattr(usage, "total_tokens", None),
+                "input": getattr(usage, "prompt_tokens", None),
+                "output": getattr(usage, "completion_tokens", None),
+                "total": getattr(usage, "total_tokens", None),
             }
-            log_generation(None, name="openai.chat", input_text=prompt, output_text=answer, model=model, usage=usage_dict, metadata={"agent_key": agent_key})
+            log_generation(
+                None,
+                name="openai.chat",
+                input_text=messages,  # lista de mensajes → Langfuse la renderiza como chat
+                output_text=answer,
+                model=model,
+                usage=usage_dict,
+                metadata={
+                    "agent_key": agent_key or "default",
+                    "context_chunks": len(hits),
+                    "sources": [(h.get("meta", {}) or {}).get("source") for h in hits],
+                },
+                model_parameters={"temperature": temperature, "max_tokens": max_tokens},
+            )
         except Exception:
             pass
+
+        if span is not None:
+            try:
+                span.update(output={"answer": answer})
+            except Exception:
+                pass
 
         return {"answer": answer}
 

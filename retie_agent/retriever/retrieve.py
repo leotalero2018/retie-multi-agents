@@ -35,7 +35,16 @@ def _bm25_fallback(query: str, documents: List[str], metas: List[Dict], top_k: i
     bm25 = BM25Okapi(tokens_docs)
     scores = bm25.get_scores(query.split())
     idxs = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:top_k]
-    return [{"text": documents[i], "meta": metas[i], "score": float(scores[i])} for i in idxs]
+    return [
+        {
+            "text": documents[i],
+            "meta": metas[i],
+            "score": float(scores[i]),
+            "retrieval_method": "bm25",
+            "score_type": "bm25_relevance",  # mayor = mejor
+        }
+        for i in idxs
+    ]
 
 
 def search(
@@ -73,7 +82,13 @@ def search(
         dense_hits: List[Dict] = []
         for d, m, dist in zip(docs, metas, dists):
             if dist <= thr:
-                dense_hits.append({"text": d, "meta": m, "score": float(dist)})
+                dense_hits.append({
+                    "text": d,
+                    "meta": m,
+                    "score": float(dist),
+                    "retrieval_method": "dense",
+                    "score_type": "cosine_distance",  # menor = mejor
+                })
 
         if dense_hits:
             return dense_hits
