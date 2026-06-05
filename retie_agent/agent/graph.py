@@ -1,5 +1,6 @@
 # app/agent/graph.py
 from __future__ import annotations
+import re
 from typing import TypedDict, Optional, List, Dict, Any
 from dataclasses import dataclass
 
@@ -78,6 +79,77 @@ def _retrieval_stats(hits: List[Dict[str, Any]], coll: str, top_k: int, thr: flo
         stats["score_best"] = round(min(scores), 4) if method == "dense" else round(max(scores), 4)
         stats["score_worst"] = round(max(scores), 4) if method == "dense" else round(min(scores), 4)
     return stats
+
+
+# ---------- Citas / Fuentes para el usuario ----------
+# Marcadores estructurales del RETIE para extraer la sección de forma best-effort
+# (la metadata indexada solo tiene source/page/chunk_id; la sección se infiere del texto).
+_SECTION_PATTERNS = [
+    r"ART[IÍ]CULO\s+\d+[°ºo]?",
+    r"SECCI[OÓ]N\s+\d+(?:\.\d+)*",
+    r"CAP[IÍ]TULO\s+[IVXLCDM0-9]+",
+    r"T[IÍ]TULO\s+[IVXLCDM0-9]+",
+    r"TABLA\s+\d+(?:[.\-]\d+)*",
+    r"ANEXO\s+[A-Z0-9]+",
+]
+_SECTION_RE = [re.compile(p, re.IGNORECASE) for p in _SECTION_PATTERNS]
+
+
+def _extract_section(text: str) -> Optional[str]:
+    """Intenta inferir la sección/artículo del RETIE a partir del texto del chunk.
+    Retorna None si no encuentra un marcador estructural reconocible."""
+    if not text:
+        return None
+    for rx in _SECTION_RE:
+        m = rx.search(text)
+        if m:
+            return " ".join(m.group(0).split())
+    return None
+
+
+def _clean_source_name(name: Any) -> str:
+    s = str(name or "Documento")
+    if s.lower().endswith(".pdf"):
+        s = s[:-4]
+    return s.strip()
+
+
+def _build_user_sources(hits: List[Dict[str, Any]], limit: int = 5):
+    """Construye las citas para el usuario a partir de los hits reales del retriever.
+    Deduplica por (fuente, página), infiere la sección y devuelve:
+      - sources: lista estructurada [{source, page, section}]
+      - sources_text: bloque de texto listo para mostrar al usuario.
+    """
+    seen = set()
+    items: List[Dict[str, Any]] = []
+    for h in hits:
+        meta = h.get("meta", {}) or {}
+        source = _clean_source_name(meta.get("source"))
+        page = meta.get("page", meta.get("page_number"))
+        key = (source, page)
+        if key in seen:
+            continue
+        seen.add(key)
+        items.append({
+            "source": source,
+            "page": page,
+            "section": _extract_section(h.get("text", "")),
+        })
+        if len(items) >= limit:
+            break
+
+    if not items:
+        return [], ""
+
+    lines = ["📚 Fuentes consultadas:"]
+    for i, it in enumerate(items, start=1):
+        parts = [it["source"]]
+        if it["page"] is not None:
+            parts.append(f"pág. {it['page']}")
+        if it["section"]:
+            parts.append(it["section"])
+        lines.append(f"{i}. " + " · ".join(parts))
+    return items, "\n".join(lines)
 
 
 # ---------- Nodes ----------
@@ -275,8 +347,12 @@ def _node_stylist(state: GraphState) -> GraphState:
     """
     enriched_answer = state.get("answer", "")
     question = state.get("question", "")
+    hits = state.get("hits", []) or []
     metadata = state.get("metadata", {}) or {}
     channel = metadata.get("channel", "telegram")  # default channel
+
+    # Citas a partir de los documentos realmente recuperados (no del LLM).
+    sources, sources_text = _build_user_sources(hits)
 
     with span_ctx(
         None,
@@ -300,6 +376,8 @@ def _node_stylist(state: GraphState) -> GraphState:
                 "channel": channel,
                 "user_message": question,
                 "formatted_response": styled_text,
+                "sources": sources,
+                "sources_text": sources_text,
                 "timestamp": __import__("datetime").datetime.utcnow().isoformat(),
             }
 
@@ -310,6 +388,8 @@ def _node_stylist(state: GraphState) -> GraphState:
                 "channel": channel,
                 "user_message": question,
                 "formatted_response": enriched_answer,
+                "sources": sources,
+                "sources_text": sources_text,
                 "error": str(e),
                 "timestamp": __import__("datetime").datetime.utcnow().isoformat(),
             }

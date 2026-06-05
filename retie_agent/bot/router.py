@@ -105,6 +105,27 @@ def _clean_for_user(raw: str, is_admin: bool) -> str:
     return cleaned
 
 
+def _finalize_for_user(result, is_admin: bool) -> str:
+    """Prepara la respuesta final para el usuario:
+    1. Extrae el texto de la respuesta (payload del stylist o texto plano).
+    2. Lo limpia según el rol (quita citas crudas del LLM para no-admins).
+    3. Anexa las 'Fuentes consultadas' (página y sección) construidas a partir
+       de los documentos realmente recuperados — se añaden DESPUÉS de limpiar
+       para garantizar que siempre se muestren y den trazabilidad al usuario.
+    """
+    if isinstance(result, dict):
+        text = result.get("formatted_response") or "No se obtuvo respuesta del agente."
+        sources_text = result.get("sources_text", "")
+    else:
+        text = str(result or "No se obtuvo respuesta del agente.")
+        sources_text = ""
+
+    cleaned = _clean_for_user(text, is_admin)
+    if sources_text:
+        cleaned = f"{cleaned}\n\n{sources_text}"
+    return cleaned
+
+
 # --- voice transcription ---
 from retie_agent.services.whisper import transcribe_audio
 
@@ -342,11 +363,7 @@ async def on_voice(message: Message):
     )
 
     is_admin = _is_admin(message.from_user.id if message.from_user else None)
-    if isinstance(raw_resp, dict) and "formatted_response" in raw_resp:
-        final_resp = raw_resp["formatted_response"]
-    else:
-        final_resp = str(raw_resp or "No se obtuvo respuesta del agente.")
-    resp = _clean_for_user(final_resp, is_admin)
+    resp = _finalize_for_user(raw_resp, is_admin)
     await message.answer(resp)
 
 
@@ -391,11 +408,7 @@ async def on_photo(message: Message):
     )
 
     is_admin = _is_admin(message.from_user.id if message.from_user else None)
-    if isinstance(raw_resp, dict) and "formatted_response" in raw_resp:
-        final_resp = raw_resp["formatted_response"]
-    else:
-        final_resp = str(raw_resp or "No se obtuvo respuesta del agente.")
-    resp = _clean_for_user(final_resp, is_admin)
+    resp = _finalize_for_user(raw_resp, is_admin)
     await message.answer(resp)
 
 
@@ -432,16 +445,10 @@ async def on_text(message: Message):
         print(f"[⚠️ run_graph error] {e}")
         result = {"formatted_response": f"⚠️ Ocurrió un error interno: {e}"}
 
-    # Step 2️⃣: Handle JSON or plain text output
-    if isinstance(result, dict) and "formatted_response" in result:
-        final_resp = result["formatted_response"]
-    else:
-        final_resp = str(result or "No se obtuvo respuesta del agente.")
-
-    # Step 3️⃣: Clean output for user role
+    # Step 2️⃣: Limpia según rol y anexa las fuentes consultadas (página/sección)
     is_admin = _is_admin(message.from_user.id if message.from_user else None)
-    cleaned_resp = _clean_for_user(final_resp, is_admin)
+    cleaned_resp = _finalize_for_user(result, is_admin)
 
-    # Step 4️⃣: Send reply
+    # Step 3️⃣: Send reply
     await message.answer(cleaned_resp)
 

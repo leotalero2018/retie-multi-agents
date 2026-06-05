@@ -45,7 +45,14 @@ def query_docs(
         metadata={"via": "http", "channel": "web"},
     )
     answer = raw.get("formatted_response", raw) if isinstance(raw, dict) else raw
-    return {"question": q, "answer": answer, "session_id": session_id, "agent_key": agent_key}
+    sources = raw.get("sources", []) if isinstance(raw, dict) else []
+    return {
+        "question": q,
+        "answer": answer,
+        "sources": sources,
+        "session_id": session_id,
+        "agent_key": agent_key,
+    }
 
 app.include_router(router)
 
