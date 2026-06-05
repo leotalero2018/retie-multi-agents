@@ -1,9 +1,12 @@
 from __future__ import annotations
 from contextlib import contextmanager
 from typing import Optional, Any, Dict
+import logging
 import os
 
 from retie_agent.config import settings
+
+log = logging.getLogger(__name__)
 
 _langfuse = None
 _enabled_cache: Optional[bool] = None
@@ -34,17 +37,31 @@ def _get_client():
             or os.getenv("LANGFUSE_BASE_URL")
         )
 
-        kwargs: dict = {}
-        if pk:
-            kwargs["public_key"] = pk
-        if sk:
-            kwargs["secret_key"] = sk
+        if not pk or not sk:
+            log.warning(
+                "[Langfuse] LANGFUSE_ENABLED=true pero faltan credenciales — "
+                "public_key=%s secret_key=%s host=%s. "
+                "Configura las variables en Railway (o .env local).",
+                "OK" if pk else "MISSING",
+                "OK" if sk else "MISSING",
+                host or "MISSING",
+            )
+            return None
+
+        log.info(
+            "[Langfuse] Inicializando cliente — pk=%s... host=%s",
+            pk[:8],
+            host or "(default)",
+        )
+
+        kwargs: dict = {"public_key": pk, "secret_key": sk}
         if host:
             kwargs["host"] = host
 
         _langfuse = Langfuse(**kwargs)
         return _langfuse
-    except Exception:
+    except Exception as exc:
+        log.warning("[Langfuse] Error al inicializar cliente: %s", exc)
         return None
 
 
