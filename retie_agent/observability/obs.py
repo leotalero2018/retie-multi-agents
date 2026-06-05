@@ -70,9 +70,16 @@ def _get_client():
             return None
 
         otlp_host = host or "https://cloud.langfuse.com"
+
+        # Fingerprint seguro (no expone el secreto): permite comparar local vs Railway.
+        # Si los hashes difieren entre entornos, las keys NO son idénticas.
+        import hashlib
+        def _fp(v):
+            return hashlib.sha256(v.encode()).hexdigest()[:12] if v else "EMPTY"
         log.info(
-            "[Langfuse] Inicializando cliente — pk=%s... sk=%s... host=%s",
-            pk[:8], sk[:8], otlp_host,
+            "[Langfuse] Fingerprint credenciales — "
+            "pk(len=%d, sha=%s) sk(len=%d, sha=%s) host=%r",
+            len(pk), _fp(pk), len(sk), _fp(sk), otlp_host,
         )
 
         kwargs: dict = {"public_key": pk, "secret_key": sk}
