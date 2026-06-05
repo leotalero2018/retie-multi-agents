@@ -23,19 +23,39 @@ def _enabled() -> bool:
 def _get_client():
     if not _enabled():
         return None
-    global _langfuse
+    global _langfuse, _enabled_cache
     if _langfuse is not None:
         return _langfuse
     try:
         from langfuse import Langfuse
 
-        pk = getattr(settings, "LANGFUSE_PUBLIC_KEY", None) or os.getenv("LANGFUSE_PUBLIC_KEY")
-        sk = getattr(settings, "LANGFUSE_SECRET_KEY", None) or os.getenv("LANGFUSE_SECRET_KEY")
-        host = (
+        pk_raw = getattr(settings, "LANGFUSE_PUBLIC_KEY", None) or os.getenv("LANGFUSE_PUBLIC_KEY")
+        sk_raw = getattr(settings, "LANGFUSE_SECRET_KEY", None) or os.getenv("LANGFUSE_SECRET_KEY")
+        host_raw = (
             getattr(settings, "LANGFUSE_HOST", None)
             or os.getenv("LANGFUSE_HOST")
             or os.getenv("LANGFUSE_BASE_URL")
         )
+
+        # Railway/os.environ no quita comillas ni saltos de línea como sí hace .env.
+        # Un '\n' o comilla al final del secret corrompe el header Basic auth → 401.
+        def _clean(v):
+            if v is None:
+                return None
+            return v.strip().strip('"').strip("'").strip()
+
+        pk = _clean(pk_raw)
+        sk = _clean(sk_raw)
+        host = _clean(host_raw)
+
+        # Diagnóstico: revela caracteres ocultos (saltos de línea, comillas, espacios)
+        for label, raw, cleaned in (("pk", pk_raw, pk), ("sk", sk_raw, sk), ("host", host_raw, host)):
+            if raw is not None and len(raw) != len(cleaned or ""):
+                log.warning(
+                    "[Langfuse] %s tenía caracteres extra: len %d -> %d. "
+                    "raw_repr_tail=%r (corregido automáticamente)",
+                    label, len(raw), len(cleaned or ""), raw[-4:],
+                )
 
         if not pk or not sk:
             log.warning(
@@ -46,16 +66,13 @@ def _get_client():
                 "OK" if sk else "MISSING",
                 host or "MISSING",
             )
+            _enabled_cache = False
             return None
 
-        import base64
         otlp_host = host or "https://cloud.langfuse.com"
-        otlp_endpoint = f"{otlp_host}/api/public/otel/v1/traces"
-        auth_preview = base64.b64encode(f"{pk[:8]}...:{sk[:8]}...".encode()).decode()
-
         log.info(
-            "[Langfuse] Inicializando cliente — pk=%s... sk=%s... host=%s endpoint=%s auth_preview=Basic %s",
-            pk[:8], sk[:8], otlp_host, otlp_endpoint, auth_preview,
+            "[Langfuse] Inicializando cliente — pk=%s... sk=%s... host=%s",
+            pk[:8], sk[:8], otlp_host,
         )
 
         kwargs: dict = {"public_key": pk, "secret_key": sk}
@@ -65,19 +82,27 @@ def _get_client():
         _langfuse = Langfuse(**kwargs)
 
         try:
-            ok = _langfuse.auth_check()
+            _langfuse.auth_check()
             log.info("[Langfuse] auth_check OK — trazas activas")
         except Exception as e:
             log.warning(
-                "[Langfuse] auth_check falló — Langfuse deshabilitado para evitar errores 401. "
-                "Verifica LANGFUSE_PUBLIC_KEY, LANGFUSE_SECRET_KEY y LANGFUSE_HOST. Error: %s", e
+                "[Langfuse] auth_check falló — Langfuse deshabilitado permanentemente. "
+                "Verifica LANGFUSE_PUBLIC_KEY, LANGFUSE_SECRET_KEY y LANGFUSE_HOST en Railway. "
+                "Mensaje del servidor: %s",
+                getattr(e, "body", str(e)),
             )
-            _langfuse.shutdown()
+            try:
+                _langfuse.shutdown()
+            except Exception:
+                pass
             _langfuse = None
+            _enabled_cache = False  # evita bucle de re-inicialización y nuevos spans OTEL
+            return None
 
         return _langfuse
     except Exception as exc:
         log.warning("[Langfuse] Error al inicializar cliente: %s", exc)
+        _enabled_cache = False
         return None
 
 
