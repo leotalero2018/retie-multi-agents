@@ -385,10 +385,13 @@ def _node_hybrid_retrieve(state: GraphState) -> GraphState:
             except Exception:
                 hits = []
 
-            # Confidence check: skip NLM wait if Chroma is highly confident
+            # Confidence check: skip NLM wait if Chroma is highly confident.
+            # EXCEPTION: never skip NLM for table queries — table data requires
+            # NotebookLM's full-PDF access; Chroma chunks rarely contain full tables.
+            wants_table = state.get("wants_table", False)
             scores = [h["score"] for h in hits if isinstance(h.get("score"), (int, float))]
             best_score = min(scores) if scores else 1.0
-            high_confidence = bool(hits and best_score < conf_thr)
+            high_confidence = bool(hits and best_score < conf_thr and not wants_table)
 
             if cached:
                 nlm_answer, _ = cached
@@ -414,7 +417,16 @@ def _node_hybrid_retrieve(state: GraphState) -> GraphState:
                         nlm_status = "error"
                         logger.warning("NotebookLM parallel query failed: %s", exc)
 
-        route = "answer_node" if (hits or nlm_answer) else "no_context"
+        # Routing:
+        # - Table query + NLM answer → skip answer_node synthesis (preserves tabular format)
+        # - Any other query with content → answer_node (LLM synthesis of both sources)
+        # - Nothing found → no_context
+        if wants_table and nlm_answer:
+            route = "table_node"
+        elif hits or nlm_answer:
+            route = "answer_node"
+        else:
+            route = "no_context"
 
         if span is not None:
             try:
@@ -422,6 +434,7 @@ def _node_hybrid_retrieve(state: GraphState) -> GraphState:
                     "hits_count": len(hits),
                     "best_chroma_score": round(best_score, 4) if scores else None,
                     "high_confidence": high_confidence,
+                    "wants_table": wants_table,
                     "nlm_answer_len": len(nlm_answer),
                     "nlm_status": nlm_status,
                     "route": route,
@@ -429,7 +442,11 @@ def _node_hybrid_retrieve(state: GraphState) -> GraphState:
             except Exception:
                 pass
 
-        return {"hits": hits, "nlm_answer": nlm_answer, "route": route}
+        out: GraphState = {"hits": hits, "nlm_answer": nlm_answer, "route": route}
+        # For table_node, answer must be pre-loaded with the NLM response
+        if route == "table_node":
+            out["answer"] = nlm_answer
+        return out
 
 
 # Mensajes para el usuario cuando NotebookLM no entrega una respuesta útil.
@@ -895,11 +912,14 @@ def build_graph():
         {"answer_node": "answer_node", "no_context": "no_context"},
     )
 
-    # Hybrid path: hybrid_retrieve → answer_node or no_context
+    # Hybrid path:
+    #   table query + NLM answer → table_node (skips answer_node to preserve tabular format)
+    #   any content found        → answer_node (LLM synthesis of Chroma + NLM)
+    #   nothing found            → no_context
     g.add_conditional_edges(
         "hybrid_retrieve",
         lambda s: s.get("route", "no_context"),
-        {"answer_node": "answer_node", "no_context": "no_context"},
+        {"answer_node": "answer_node", "no_context": "no_context", "table_node": "table_node"},
     )
 
     # Shared answer path: answer_node → (table | enrich) → stylist → end
