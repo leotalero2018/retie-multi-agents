@@ -1,4 +1,4 @@
-from typing import List, Dict
+from typing import List, Dict, Optional
 
 # Two templates:
 # - USER: no citations requested
@@ -59,3 +59,43 @@ def make_prompt(context_blocks: List[Dict], question: str, *, is_admin: bool = F
     ctx = build_context(context_blocks, include_meta=is_admin)
     tmpl = PROMPT_TEMPLATE_ADMIN if is_admin else PROMPT_TEMPLATE_USER
     return tmpl.format(context=ctx, question=question)
+
+
+PROMPT_TEMPLATE_HYBRID = (
+    "Eres un asistente experto en el Reglamento Técnico de Instalaciones Eléctricas (RETIE). "
+    "Dispones de dos fuentes complementarias: fragmentos del documento oficial y un análisis "
+    "previo de NotebookLM. Sintetiza ambas fuentes para dar una respuesta precisa y en español. "
+    "No inventes información ni contradigas lo que dicen las fuentes. "
+    "Si hay contradicción entre fuentes, menciona ambas versiones.\n\n"
+    "FRAGMENTOS DEL DOCUMENTO RETIE:\n{context}\n\n"
+    "ANÁLISIS COMPLEMENTARIO (NotebookLM):\n{nlm_answer}\n\n"
+    "Pregunta: {question}\n"
+    "Responde en español, de manera breve, precisa y sin inventar información."
+)
+
+
+def make_hybrid_prompt(
+    context_blocks: List[Dict],
+    nlm_answer: str,
+    question: str,
+    *,
+    is_admin: bool = False,
+) -> str:
+    """Prompt that merges Chroma chunks with a NotebookLM pre-synthesized answer."""
+    has_chroma = bool(context_blocks)
+    has_nlm = bool(nlm_answer and nlm_answer.strip())
+
+    if has_chroma and has_nlm:
+        ctx = build_context(context_blocks, include_meta=is_admin)
+        return PROMPT_TEMPLATE_HYBRID.format(
+            context=ctx, nlm_answer=nlm_answer.strip(), question=question
+        )
+    if has_chroma:
+        return make_prompt(context_blocks, question, is_admin=is_admin)
+    # NLM answer only
+    return (
+        "Eres un experto en RETIE. Responde con base en el siguiente análisis:\n\n"
+        f"{nlm_answer.strip()}\n\n"
+        f"Pregunta: {question}\n"
+        "Responde en español, de manera breve y precisa."
+    )

@@ -69,13 +69,6 @@ def _get_client():
             _enabled_cache = False
             return None
 
-        otlp_host = host or "https://cloud.langfuse.com"
-
-        log.info(
-            "[Langfuse] Inicializando cliente — pk=%s... host=%s",
-            pk[:8], otlp_host,
-        )
-
         kwargs: dict = {"public_key": pk, "secret_key": sk}
         if host:
             # base_url tiene la máxima precedencia en el SDK; lo pasamos explícito

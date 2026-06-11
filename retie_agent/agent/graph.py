@@ -1,18 +1,24 @@
 # app/agent/graph.py
 from __future__ import annotations
+import logging
 import re
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from typing import TypedDict, Optional, List, Dict, Any
 from dataclasses import dataclass
+
+logger = logging.getLogger(__name__)
 
 from langgraph.graph import StateGraph, END
 from openai import OpenAI
 
 from retie_agent.config import settings
 from retie_agent.retriever.retrieve import search
-from retie_agent.agent.prompt import make_prompt
+from retie_agent.agent.prompt import make_prompt, make_hybrid_prompt
 from retie_agent.agent.retie_agent import _dedupe_hits, _resolve_collection, _resolve_model
 from retie_agent.observability.obs import trace_ctx, span_ctx, log_generation
 from retie_agent.services.history import get_history, add_message
+from retie_agent.agent.notebooklm_client import NotebookLMClient, NotebookLMError, NotebookLMCache
+from retie_agent.agent.table_render import render_telegram_table, render_table_image
 
 # ---------- State ----------
 class GraphState(TypedDict, total=False):
@@ -25,6 +31,17 @@ class GraphState(TypedDict, total=False):
     answer: Any   # may now hold dict for styled payload
     metadata: Optional[Dict[str, Any]]  # new, for passing channel info
     history: List[Dict[str, str]]
+    wants_table: bool       # user asked for a "tabla" → route through table_node
+    table_image: Any        # PNG bytes when the table is rendered as an image
+    nlm_answer: Optional[str]  # NotebookLM answer from parallel hybrid retrieve
+
+
+# Detección de intención de tabla por palabra clave (determinística).
+_TABLE_RE = re.compile(r"\btablas?\b", re.IGNORECASE)
+
+
+def _wants_table(text: str) -> bool:
+    return bool(_TABLE_RE.search(text or ""))
 
 
 def make_state(question: str, *, user_id: str = "anon", session: str = "default", agent_key: Optional[str] = None, history: Optional[List[Dict[str, str]]] = None) -> GraphState:
@@ -184,10 +201,31 @@ def _node_retrieve(state: GraphState) -> GraphState:
                 pass
         return {"hits": hits}
 
+def _node_route_entry(state: GraphState) -> GraphState:
+    """Entry point: routes to hybrid (Chroma+NLM parallel) or Chroma-only based on feature flag."""
+    nlm_enabled = str(getattr(settings, "NOTEBOOKLM_ENABLED", "false")).lower() in ("1", "true", "yes")
+    # hybrid_retrieve runs Chroma + NLM in parallel with caching; falls back to Chroma-only
+    route = "hybrid_retrieve" if nlm_enabled else "retrieve"
+    wants_table = _wants_table(state.get("question", ""))
+    with span_ctx(
+        None, "route_entry", as_type="chain",
+        span_input={"nlm_enabled": nlm_enabled, "wants_table": wants_table},
+    ) as span:
+        if span is not None:
+            try:
+                span.update(output={"route": route, "wants_table": wants_table})
+            except Exception:
+                pass
+    return {"route": route, "wants_table": wants_table}
+
+
 def _node_router(state: GraphState) -> GraphState:
     hits = state.get("hits") or []
-    route = "answer_node" if len(hits) > 0 else "no_context"
-    with span_ctx(None, "router", as_type="chain", span_input={"hits_count": len(hits)}) as span:
+    route = "answer_node" if hits else "no_context"
+    with span_ctx(
+        None, "router", as_type="chain",
+        span_input={"hits_count": len(hits)},
+    ) as span:
         if span is not None:
             try:
                 span.update(output={"route": route})
@@ -199,12 +237,15 @@ def _node_answer(state: GraphState) -> GraphState:
     q = state["question"]
     agent_key = state.get("agent_key")
     hits = state.get("hits") or []
-    if not hits:
+    nlm_answer = (state.get("nlm_answer") or "").strip()
+
+    if not hits and not nlm_answer:
         return {"answer": "No tengo evidencia en los documentos."}
 
     model = _resolve_model(agent_key, explicit=None)
     sys = "Eres un asistente útil."
-    prompt = make_prompt(hits, q, is_admin=False)
+    # Use hybrid prompt when both sources are available
+    prompt = make_hybrid_prompt(hits, nlm_answer, q, is_admin=False)
     messages = [{"role": "system", "content": sys}]
     for msg in state.get("history", []):
         messages.append(msg)
@@ -262,6 +303,404 @@ def _node_answer(state: GraphState) -> GraphState:
 def _node_no_context(_state: GraphState) -> GraphState:
     with span_ctx(None, "no_context", as_type="chain"):
         return {"answer": "No tengo evidencia en los documentos."}
+
+
+# ===============================
+#  NotebookLM MCP Node (legacy solo-NLM path, kept for reference)
+# ===============================
+_notebooklm_client: Optional[NotebookLMClient] = None
+
+
+def _get_notebooklm_client() -> NotebookLMClient:
+    global _notebooklm_client
+    if _notebooklm_client is None:
+        _notebooklm_client = NotebookLMClient(
+            base_url=getattr(settings, "NOTEBOOKLM_URL", "http://localhost:3000"),
+            notebook_id=getattr(settings, "NOTEBOOKLM_NOTEBOOK_ID", None),
+            timeout=float(getattr(settings, "NOTEBOOKLM_TIMEOUT", 120.0)),
+            page_timeout_ms=int(getattr(settings, "NOTEBOOKLM_PAGE_TIMEOUT_MS", 15000)),
+        )
+    return _notebooklm_client
+
+
+# ===============================
+#  Hybrid RAG Node (Chroma + NLM in parallel with cache)
+# ===============================
+_nlm_cache: Optional[NotebookLMCache] = None
+
+
+def _get_nlm_cache() -> NotebookLMCache:
+    global _nlm_cache
+    if _nlm_cache is None:
+        ttl = int(getattr(settings, "NOTEBOOKLM_CACHE_TTL", 3600))
+        _nlm_cache = NotebookLMCache(ttl=ttl)
+    return _nlm_cache
+
+
+def _node_hybrid_retrieve(state: GraphState) -> GraphState:
+    """Hybrid RAG: runs Chroma and NotebookLM in parallel, merges both results.
+
+    Fast-path exits:
+    - Cache hit on NLM → answer available immediately, no browser wait.
+    - Chroma high-confidence (best score < CHROMA_HIGH_CONFIDENCE_THR) → NLM skipped.
+
+    Otherwise waits up to NOTEBOOKLM_PARALLEL_TIMEOUT seconds for NLM, then
+    falls back to Chroma-only. Always routes to answer_node (merged LLM call)
+    or no_context when both sources are empty.
+    """
+    q = state["question"]
+    agent_key = state.get("agent_key")
+    coll = _resolve_collection(agent_key, explicit=None)
+    top_k = getattr(settings, "TOP_K", 4)
+    nb_id = getattr(settings, "NOTEBOOKLM_NOTEBOOK_ID", None)
+    conf_thr = float(getattr(settings, "CHROMA_HIGH_CONFIDENCE_THR", 0.25))
+    parallel_timeout = float(getattr(settings, "NOTEBOOKLM_PARALLEL_TIMEOUT", 45.0))
+
+    nlm_eligible = len(q.strip()) >= _NLM_MIN_QUERY_LEN
+    cache = _get_nlm_cache()
+    cached = cache.get(q, nb_id) if nlm_eligible else None
+
+    with span_ctx(
+        None, "hybrid_retrieve", as_type="retriever",
+        span_input={"question": q, "nlm_cache_hit": cached is not None},
+    ) as span:
+        hits: List[Dict[str, Any]] = []
+        nlm_answer = ""
+        nlm_status = "disabled"
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            chroma_fut = pool.submit(
+                lambda: _dedupe_hits(search(q, top_k=top_k, collection_name=coll))
+            )
+
+            nlm_fut = None
+            if nlm_eligible and not cached:
+                client = _get_notebooklm_client()
+                nlm_fut = pool.submit(client.ask_question, q, "footnotes", nb_id)
+                nlm_status = "submitted"
+
+            # Chroma is fast — retrieve results first
+            try:
+                hits = chroma_fut.result(timeout=15)
+            except Exception:
+                hits = []
+
+            # Confidence check: skip NLM wait if Chroma is highly confident
+            scores = [h["score"] for h in hits if isinstance(h.get("score"), (int, float))]
+            best_score = min(scores) if scores else 1.0
+            high_confidence = bool(hits and best_score < conf_thr)
+
+            if cached:
+                nlm_answer, _ = cached
+                nlm_status = "cache_hit"
+            elif nlm_fut is not None:
+                if high_confidence:
+                    nlm_fut.cancel()
+                    nlm_status = "skipped_high_conf"
+                else:
+                    try:
+                        raw_answer, _ = nlm_fut.result(timeout=parallel_timeout)
+                        nlm_answer = (raw_answer or "").strip()
+                        if nlm_answer:
+                            cache.set(q, nb_id, nlm_answer, [])
+                        nlm_status = "ok"
+                    except FutureTimeoutError:
+                        nlm_status = "timeout"
+                        logger.warning(
+                            "NotebookLM parallel timeout after %.0fs — using Chroma only",
+                            parallel_timeout,
+                        )
+                    except Exception as exc:
+                        nlm_status = "error"
+                        logger.warning("NotebookLM parallel query failed: %s", exc)
+
+        route = "answer_node" if (hits or nlm_answer) else "no_context"
+
+        if span is not None:
+            try:
+                span.update(output={
+                    "hits_count": len(hits),
+                    "best_chroma_score": round(best_score, 4) if scores else None,
+                    "high_confidence": high_confidence,
+                    "nlm_answer_len": len(nlm_answer),
+                    "nlm_status": nlm_status,
+                    "route": route,
+                })
+            except Exception:
+                pass
+
+        return {"hits": hits, "nlm_answer": nlm_answer, "route": route}
+
+
+# Mensajes para el usuario cuando NotebookLM no entrega una respuesta útil.
+_NLM_MSG_ERROR = (
+    "⚠️ En este momento no pude procesar tu consulta. "
+    "Por favor reformúlala con términos relacionados al RETIE "
+    "(p. ej. instalaciones eléctricas, puesta a tierra, protecciones, tableros)."
+)
+_NLM_MSG_EMPTY = (
+    "No encontré información sobre eso en el RETIE. "
+    "¿Podrías reformular tu pregunta con más detalle?"
+)
+_NLM_MIN_QUERY_LEN = 4  # consultas más cortas casi nunca dan resultado y gastan ~30s
+
+
+def _node_notebooklm(state: GraphState) -> GraphState:
+    """Fallback retrieval via NotebookLM MCP when Chroma has no relevant hits.
+
+    Distingue tres desenlaces para dar siempre un output claro al usuario:
+      - ok:    respuesta válida de NotebookLM → continúa al stylist
+      - error: fallo técnico (timeout del navegador, sesión, etc.) → mensaje para reformular
+      - empty: NotebookLM respondió pero sin contenido útil → mensaje "sin información"
+    """
+    q = (state.get("question") or "").strip()
+
+    # Rechazo rápido de consultas triviales para no gastar ~30s en el navegador.
+    if len(q) < _NLM_MIN_QUERY_LEN:
+        return {"answer": _NLM_MSG_EMPTY, "route": "deliver"}
+
+    with span_ctx(None, "notebooklm_node", as_type="retriever", span_input={"question": q}) as span:
+        status = "ok"
+        answer = ""
+        error_msg = ""
+        try:
+            client = _get_notebooklm_client()
+            answer, _sources = client.ask_question(q, source_format="footnotes")
+        except Exception as exc:
+            status = "error"
+            error_msg = str(exc)
+            logger.warning("NotebookLM query failed: %s", exc)
+
+        has_answer = bool(answer and len(answer.strip()) > 10)
+        if not has_answer and status == "ok":
+            status = "empty"
+
+        if span is not None:
+            try:
+                span.update(
+                    output={"answer_preview": answer[:200] if answer else error_msg[:200]},
+                    metadata={"status": status},
+                )
+            except Exception:
+                pass
+
+        if has_answer:
+            # Si el usuario pidió tabla, formatearla antes de entregar.
+            route = "table_node" if state.get("wants_table") else "stylist_node"
+            return {"answer": answer, "route": route}
+
+        # Fallo técnico → pedir reformular; respuesta vacía → "sin información".
+        # route="deliver" entrega el mensaje tal cual (no pasa por no_context,
+        # que lo sobreescribiría con "No tengo evidencia en los documentos").
+        user_msg = _NLM_MSG_ERROR if status == "error" else _NLM_MSG_EMPTY
+        return {"answer": user_msg, "route": "deliver"}
+
+
+# ===============================
+#  Table Node (formato tabular)
+# ===============================
+import json as _json
+
+# Tokens dedicados para el table_node. MAX_TOKENS general (p. ej. 400) trunca el
+# JSON de tablas grandes; este límite alto evita que se corte a la mitad.
+_TABLE_MAX_TOKENS = 4000
+
+_TABLE_PROMPT = (
+    "A partir de la INFORMACIÓN, extrae los datos en forma de tabla.\n"
+    "Responde ÚNICAMENTE con JSON válido, sin texto adicional ni markdown, con esta forma:\n"
+    '{{"title": "Título breve", "headers": ["Col1", "Col2"], "rows": [["a", "b"], ["c", "d"]]}}\n'
+    "Reglas:\n"
+    "- 'title' es un título corto y descriptivo en español (máx. 8 palabras).\n"
+    "- Usa encabezados cortos y claros en español.\n"
+    "- Extrae TODAS las filas de datos, sin resumir ni omitir ninguna.\n"
+    "- Conserva los valores tal como aparecen, incluidos rangos ('26-30', '61 y más')\n"
+    "  y fórmulas ('15 kW + 1 kW por cada estufa').\n"
+    "- Cada fila debe tener exactamente el mismo número de celdas que headers.\n"
+    "- NO incluyas notas, leyendas ni texto explicativo: solo encabezados y filas.\n"
+    "- Mantén el JSON compacto, sin saltos de línea innecesarios.\n"
+    "- Si la información NO es tabulable, responde {{\"headers\": [], \"rows\": []}}.\n\n"
+    "Pregunta del usuario: {question}\n\n"
+    "INFORMACIÓN:\n{answer}"
+)
+
+
+def _close_truncated_json(s: str) -> str:
+    """Best-effort repair of JSON truncated mid-output (e.g. by a token limit).
+
+    Balances open brackets/strings and drops a trailing comma so a cut-off
+    rows array can still be parsed (the last, incomplete row is discarded)."""
+    in_str = False
+    esc = False
+    stack: List[str] = []
+    for ch in s:
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch in "[{":
+            stack.append(ch)
+        elif ch == "]" and stack and stack[-1] == "[":
+            stack.pop()
+        elif ch == "}" and stack and stack[-1] == "{":
+            stack.pop()
+
+    repaired = s
+    if in_str:
+        repaired += '"'
+    # Drop a dangling comma / incomplete trailing token before closing.
+    repaired = repaired.rstrip()
+    while repaired and repaired[-1] in ",":
+        repaired = repaired[:-1].rstrip()
+    for opener in reversed(stack):
+        repaired += "]" if opener == "[" else "}"
+    return repaired
+
+
+def _parse_table_json(raw: str) -> Optional[Dict[str, Any]]:
+    """Extrae y valida el JSON {headers, rows} de la salida del LLM.
+
+    Tolera fences markdown, texto alrededor y truncamiento (token limit)."""
+    if not raw:
+        return None
+    text = raw.strip()
+    # Quitar fences ```json ... ``` si los hubiera
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.IGNORECASE).strip()
+
+    start = text.find("{")
+    if start == -1:
+        return None
+    candidate = text[start:]
+    end = candidate.rfind("}")
+    snippet = candidate[: end + 1] if end != -1 else candidate
+
+    data = None
+    for attempt in (snippet, _close_truncated_json(candidate)):
+        try:
+            data = _json.loads(attempt)
+            break
+        except _json.JSONDecodeError:
+            continue
+    if not isinstance(data, dict):
+        return None
+
+    headers = data.get("headers")
+    rows = data.get("rows")
+    if not isinstance(headers, list) or not isinstance(rows, list):
+        return None
+    if not headers or not rows:
+        return None
+
+    # Normalizar: solo filas que sean listas, recortadas/rellenadas a len(headers).
+    ncol = len(headers)
+    norm_rows: List[List[Any]] = []
+    for row in rows:
+        if not isinstance(row, list):
+            continue
+        if len(row) < ncol:
+            row = row + [""] * (ncol - len(row))
+        norm_rows.append(row[:ncol])
+    if not norm_rows:
+        return None
+
+    title = data.get("title")
+    return {
+        "title": title if isinstance(title, str) else None,
+        "headers": headers,
+        "rows": norm_rows,
+    }
+
+
+def _node_table(state: GraphState) -> GraphState:
+    """Convierte la respuesta del agente en una tabla y la entrega como imagen PNG.
+
+    Pide al LLM estructurar los datos como JSON {title, headers, rows} y renderiza
+    una imagen (sin el botón "COPIAR CÓDIGO" que Telegram añade a los <pre>).
+    Degradación elegante:
+      - Si Pillow/imagen falla → tabla de texto adaptativa (<pre>).
+      - Si la información no es tabulable o el LLM falla → prosa original.
+    """
+    base_answer = state.get("answer", "") or ""
+    question = state.get("question", "")
+    if not base_answer.strip():
+        return {"answer": base_answer, "route": "stylist_node"}
+
+    model = _resolve_model(state.get("agent_key"), explicit=None)
+    prompt = _TABLE_PROMPT.format(question=question, answer=base_answer)
+
+    with span_ctx(
+        None, "table_node",
+        {"model": model},
+        as_type="chain",
+        span_input={"question": question},
+    ) as span:
+        status = "ok"
+        final_text = base_answer
+        image: Optional[bytes] = None
+        try:
+            resp = _client.chat.completions.create(
+                model=model,
+                temperature=0.0,
+                max_tokens=_TABLE_MAX_TOKENS,
+                messages=[
+                    {"role": "system", "content": "Eres un formateador de datos a tablas. Solo devuelves JSON."},
+                    {"role": "user", "content": prompt},
+                ],
+            )
+            raw = (resp.choices[0].message.content or "").strip()
+            table = _parse_table_json(raw)
+            if not table:
+                # Diagnóstico: deja rastro del JSON que no se pudo parsear.
+                logger.warning("table_node: no se pudo parsear JSON (%d chars): %s",
+                               len(raw), raw[:300])
+            if table:
+                title = table.get("title")
+                try:
+                    image = render_table_image(table["headers"], table["rows"], title=title)
+                    # Caption breve para acompañar la imagen.
+                    final_text = f"📊 {title}" if title else "📊 Tabla solicitada"
+                except Exception as img_exc:
+                    # Sin Pillow / sin fuente → degradar a tabla de texto.
+                    status = "text_fallback"
+                    logger.warning("table image failed, using text table: %s", img_exc)
+                    final_text = render_telegram_table(table["headers"], table["rows"])
+            else:
+                status = "not_tabular"  # se conserva la prosa original
+        except Exception as exc:
+            status = "error"
+            logger.warning("table_node failed: %s", exc)
+
+        if span is not None:
+            try:
+                span.update(
+                    output={"preview": final_text[:200], "has_image": image is not None},
+                    metadata={"status": status},
+                )
+            except Exception:
+                pass
+
+        try:
+            log_generation(
+                None,
+                name="table_node",
+                input_text=base_answer,
+                output_text=final_text,
+                model=model,
+                metadata={"status": status, "has_image": image is not None},
+            )
+        except Exception:
+            pass
+
+    out: GraphState = {"answer": final_text, "route": "stylist_node"}
+    if image is not None:
+        out["table_image"] = image
+    return out
 
 
 from retie_agent.agent.enrichment_assistant import EnrichmentAssistant
@@ -350,6 +789,7 @@ def _node_stylist(state: GraphState) -> GraphState:
     hits = state.get("hits", []) or []
     metadata = state.get("metadata", {}) or {}
     channel = metadata.get("channel", "telegram")  # default channel
+    table_image = state.get("table_image")  # PNG bytes if the answer is a table
 
     # Citas a partir de los documentos realmente recuperados (no del LLM).
     sources, sources_text = _build_user_sources(hits)
@@ -378,6 +818,7 @@ def _node_stylist(state: GraphState) -> GraphState:
                 "formatted_response": styled_text,
                 "sources": sources,
                 "sources_text": sources_text,
+                "image": table_image,  # PNG bytes → router sends it as a photo
                 "timestamp": __import__("datetime").datetime.utcnow().isoformat(),
             }
 
@@ -390,20 +831,23 @@ def _node_stylist(state: GraphState) -> GraphState:
                 "formatted_response": enriched_answer,
                 "sources": sources,
                 "sources_text": sources_text,
+                "image": table_image,
                 "error": str(e),
                 "timestamp": __import__("datetime").datetime.utcnow().isoformat(),
             }
             status = "fallback"
 
-        # Log to Langfuse for visibility
+        # Log to Langfuse for visibility (sin los bytes crudos de la imagen)
         try:
+            loggable = {k: v for k, v in styled_payload.items() if k != "image"}
+            loggable["image"] = f"<{len(table_image)} bytes PNG>" if table_image else None
             log_generation(
                 None,
                 name="stylist_node",
                 input_text=question,
-                output_text=str(styled_payload),
+                output_text=str(loggable),
                 model="stylist_formatter",
-                metadata={"channel": channel, "status": status},
+                metadata={"channel": channel, "status": status, "has_image": table_image is not None},
             )
         except Exception:
             pass
@@ -425,25 +869,47 @@ def build_graph():
         return _COMPILED.app
 
     g = StateGraph(GraphState)
+    g.add_node("route_entry", _node_route_entry)
     g.add_node("retrieve", _node_retrieve)
     g.add_node("router", _node_router)
+    g.add_node("hybrid_retrieve", _node_hybrid_retrieve)
     g.add_node("answer_node", _node_answer)
     g.add_node("enrich_node", _node_enrich)
     g.add_node("stylist_node", _node_stylist)
     g.add_node("no_context", _node_no_context)
+    g.add_node("table_node", _node_table)
 
-    g.set_entry_point("retrieve")
+    # Entry: feature flag decides hybrid (Chroma+NLM) vs Chroma-only
+    g.set_entry_point("route_entry")
+    g.add_conditional_edges(
+        "route_entry",
+        lambda s: s.get("route", "retrieve"),
+        {"retrieve": "retrieve", "hybrid_retrieve": "hybrid_retrieve"},
+    )
+
+    # Chroma-only path: retrieve → router → answer → (table | enrich) → stylist → end
     g.add_edge("retrieve", "router")
-
     g.add_conditional_edges(
         "router",
         lambda s: s.get("route", "no_context"),
         {"answer_node": "answer_node", "no_context": "no_context"},
     )
 
-    # New sequence: answer → enrich → stylist → end
-    g.add_edge("answer_node", "enrich_node")
+    # Hybrid path: hybrid_retrieve → answer_node or no_context
+    g.add_conditional_edges(
+        "hybrid_retrieve",
+        lambda s: s.get("route", "no_context"),
+        {"answer_node": "answer_node", "no_context": "no_context"},
+    )
+
+    # Shared answer path: answer_node → (table | enrich) → stylist → end
+    g.add_conditional_edges(
+        "answer_node",
+        lambda s: "table_node" if s.get("wants_table") else "enrich_node",
+        {"table_node": "table_node", "enrich_node": "enrich_node"},
+    )
     g.add_edge("enrich_node", "stylist_node")
+    g.add_edge("table_node", "stylist_node")
     g.add_edge("stylist_node", END)
     g.add_edge("no_context", END)
 

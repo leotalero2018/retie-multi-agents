@@ -36,6 +36,23 @@ class Settings(BaseSettings):
     WHISPER_PROVIDER: str = "openai"
     WHISPER_MODEL: str = "gpt-4o-transcribe"       # or "whisper-1"
 
+    # --- NotebookLM MCP ---
+    NOTEBOOKLM_ENABLED: str = "false"          # "true" | "1" | "yes" to enable
+    NOTEBOOKLM_URL: str = "http://localhost:3000"
+    NOTEBOOKLM_NOTEBOOK_ID: Optional[str] = None  # share link or notebook ID
+    NOTEBOOKLM_TIMEOUT: float = 120.0
+    # Per-browser-operation timeout (ms). Lower than the server's 30s default so a
+    # stuck click (overlay intercepting the textarea) fails fast instead of hanging.
+    NOTEBOOKLM_PAGE_TIMEOUT_MS: int = 15000
+    # Hybrid RAG settings
+    NOTEBOOKLM_CACHE_TTL: int = 3600          # seconds to cache NLM responses in memory
+    NOTEBOOKLM_PARALLEL_TIMEOUT: float = 45.0  # max seconds to wait for NLM in parallel mode
+    CHROMA_HIGH_CONFIDENCE_THR: float = 0.25   # skip NLM when Chroma best score < this
+    # Session persistence (Playwright user-data-dir backed up in MinIO)
+    NOTEBOOKLM_SESSION_DIR: str = "/tmp/nlm-session"  # where Playwright stores the browser profile
+    NOTEBOOKLM_SESSION_BUCKET: str = ""               # MinIO bucket (defaults to S3_BUCKET_NAME)
+    NOTEBOOKLM_STARTUP_TIMEOUT: int = 60              # seconds to wait for MCP server to become ready
+
     # --- Observability (Langfuse) ---
     # Accept typical string booleans; obs.py interprets them safely.
     LANGFUSE_ENABLED: str = "false"

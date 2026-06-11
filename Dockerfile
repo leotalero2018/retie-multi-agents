@@ -2,9 +2,10 @@
 FROM python:3.11-slim
 
 # -------------------------------
-# System deps (only what you need)
+# System deps
 # -------------------------------
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
     ffmpeg \
     tesseract-ocr \
     tesseract-ocr-spa \
@@ -12,6 +13,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libglib2.0-0 \
     libgl1 \
   && rm -rf /var/lib/apt/lists/*
+
+# -------------------------------
+# Node.js 20 LTS (for notebooklm-mcp)
+# -------------------------------
+RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \
+    apt-get install -y --no-install-recommends nodejs && \
+    rm -rf /var/lib/apt/lists/*
+
+# Pre-install notebooklm-mcp globally so npx doesn't download it on every boot
+RUN npm install -g notebooklm-mcp@latest
+
+# Install Playwright's Chromium + all its system dependencies in one step
+RUN npx playwright install chromium --with-deps
 
 # -------------------------------
 # Workdir

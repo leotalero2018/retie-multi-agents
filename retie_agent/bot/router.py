@@ -11,7 +11,7 @@ from typing import Dict, Set, Optional, List
 
 from aiogram import Router, F
 from aiogram.enums import ChatAction
-from aiogram.types import Message
+from aiogram.types import Message, BufferedInputFile
 from aiogram.filters import CommandStart, Command
 
 # Run the LangGraph pipeline (instrumented for Langfuse)
@@ -95,14 +95,49 @@ def _strip_inline_citations(text: str) -> str:
     return _INLINE_BRACKET_CITE_RE.sub("", text)
 
 
+_PRE_BLOCK_RE = re.compile(r"<pre>.*?</pre>", re.DOTALL | re.IGNORECASE)
+
+
 def _clean_for_user(raw: str, is_admin: bool) -> str:
     if is_admin:
         return raw
-    cleaned = _strip_sources_sections(raw)
+
+    # Proteger bloques <pre> (tablas ASCII): su alineación depende de espacios
+    # múltiples, que el colapso de whitespace de abajo destruiría.
+    pre_blocks: List[str] = []
+
+    def _stash(m: "re.Match") -> str:
+        pre_blocks.append(m.group(0))
+        return f"\x00PRE{len(pre_blocks) - 1}\x00"
+
+    cleaned = _PRE_BLOCK_RE.sub(_stash, raw)
+    cleaned = _strip_sources_sections(cleaned)
     cleaned = _strip_inline_citations(cleaned)
     cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
     cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+
+    # Restaurar los bloques <pre> intactos
+    for i, block in enumerate(pre_blocks):
+        cleaned = cleaned.replace(f"\x00PRE{i}\x00", block)
     return cleaned
+
+
+# Telegram HTML mode only supports a small subset of tags.
+# Any other tag (e.g. <textarea>, <form>, <div>) causes TelegramBadRequest.
+_TELEGRAM_SAFE_TAGS = re.compile(
+    r"<(?!/?(?:b|strong|i|em|u|ins|s|strike|del|code|pre|a|tg-spoiler|tg-emoji)\b)[^>]+>",
+    re.IGNORECASE,
+)
+
+
+def _sanitize_html_for_telegram(text: str) -> str:
+    """Strip HTML tags that Telegram's HTML parser does not support.
+
+    Keeps <b>, <i>, <u>, <s>, <code>, <pre>, <a> and a few others.
+    Everything else (e.g. <textarea>, <form>, <div>) is removed so Telegram
+    doesn't reject the message with 'can't parse entities'.
+    """
+    return _TELEGRAM_SAFE_TAGS.sub("", text)
 
 
 def _finalize_for_user(result, is_admin: bool) -> str:
@@ -112,6 +147,7 @@ def _finalize_for_user(result, is_admin: bool) -> str:
     3. Anexa las 'Fuentes consultadas' (página y sección) construidas a partir
        de los documentos realmente recuperados — se añaden DESPUÉS de limpiar
        para garantizar que siempre se muestren y den trazabilidad al usuario.
+    4. Sanitiza tags HTML no soportados por Telegram (parse_mode=HTML).
     """
     if isinstance(result, dict):
         text = result.get("formatted_response") or "No se obtuvo respuesta del agente."
@@ -123,7 +159,24 @@ def _finalize_for_user(result, is_admin: bool) -> str:
     cleaned = _clean_for_user(text, is_admin)
     if sources_text:
         cleaned = f"{cleaned}\n\n{sources_text}"
-    return cleaned
+    return _sanitize_html_for_telegram(cleaned)
+
+
+_TELEGRAM_CAPTION_LIMIT = 1024
+
+
+async def _send_response(message: Message, result, is_admin: bool) -> None:
+    """Entrega la respuesta al usuario: como foto si el agente generó una imagen
+    de tabla, o como texto en cualquier otro caso."""
+    image = result.get("image") if isinstance(result, dict) else None
+    if image:
+        caption = _finalize_for_user(result, is_admin)
+        if len(caption) > _TELEGRAM_CAPTION_LIMIT:
+            caption = caption[: _TELEGRAM_CAPTION_LIMIT - 1] + "…"
+        photo = BufferedInputFile(image, filename="tabla.png")
+        await message.answer_photo(photo, caption=caption or None)
+    else:
+        await message.answer(_finalize_for_user(result, is_admin))
 
 
 # --- voice transcription ---
@@ -363,8 +416,7 @@ async def on_voice(message: Message):
     )
 
     is_admin = _is_admin(message.from_user.id if message.from_user else None)
-    resp = _finalize_for_user(raw_resp, is_admin)
-    await message.answer(resp)
+    await _send_response(message, raw_resp, is_admin)
 
 
 # ----------------------- IMAGES (photo + image document) -----------------------
@@ -408,8 +460,7 @@ async def on_photo(message: Message):
     )
 
     is_admin = _is_admin(message.from_user.id if message.from_user else None)
-    resp = _finalize_for_user(raw_resp, is_admin)
-    await message.answer(resp)
+    await _send_response(message, raw_resp, is_admin)
 
 
 @router.message(F.document)
@@ -445,10 +496,7 @@ async def on_text(message: Message):
         print(f"[⚠️ run_graph error] {e}")
         result = {"formatted_response": f"⚠️ Ocurrió un error interno: {e}"}
 
-    # Step 2️⃣: Limpia según rol y anexa las fuentes consultadas (página/sección)
+    # Step 2️⃣: Entrega según rol; foto si el agente generó una imagen de tabla.
     is_admin = _is_admin(message.from_user.id if message.from_user else None)
-    cleaned_resp = _finalize_for_user(result, is_admin)
-
-    # Step 3️⃣: Send reply
-    await message.answer(cleaned_resp)
+    await _send_response(message, result, is_admin)
 
