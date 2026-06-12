@@ -259,6 +259,14 @@ CHUNK_TOKENS=800                    # Tokens por chunk
 CHUNK_OVERLAP=150                   # Overlap entre chunks
 TOP_K=8                             # Documentos recuperados por query
 RAG_DISTANCE_THRESHOLD=0.45         # Umbral de similitud coseno
+BM25_FUSION_ENABLED=true            # Fusión léxica BM25 + dense vía RRF
+FETCH_K_MULTIPLIER=3                # Candidatos dense extra antes de fusionar
+QUERY_REWRITE_ENABLED=true          # Reescribe preguntas de seguimiento usando el historial
+HISTORY_LIMIT=10                    # Mensajes de historial por sesión
+
+# ── Enriquecimiento ────────────────────────────────────────────────────
+ENRICHMENT_ENABLED=true             # false = omite el assistant (~2x más rápido)
+ENRICHMENT_TIMEOUT=30               # Segundos máx. de espera del assistant
 
 # ── MongoDB ────────────────────────────────────────────────────────────
 MONGO_URI=mongodb+srv://user:pass@cluster.mongodb.net/
@@ -343,6 +351,8 @@ Al arrancar, el bot:
 | Comando | Descripción |
 |---------|-------------|
 | `/start` | Inicia la conversación |
+| `/help` | Lista de comandos y capacidades del bot |
+| `/clear` | Borra el historial de la conversación actual |
 | `/agent plumber` | Cambia al agente pdfplumber (colección `retie_docs`) |
 | `/agent pymupdf` | Cambia al agente PyMuPDF (colección `retie_pymupdf`) |
 | `/who` | Muestra el agente activo |
@@ -508,7 +518,7 @@ LANGFUSE_SECRET_KEY=sk-lf-...
 LANGFUSE_HOST=https://us.cloud.langfuse.com
 ```
 
-Cada consulta genera una traza con los nodos: `retrieve → router → answer_node → enrich_node → stylist_node`.
+Cada consulta genera una traza con los nodos: `route_entry → condense_node → retrieve/hybrid_retrieve → answer_node → enrich_node → stylist_node` (más `table_node` cuando se pide una tabla).
 
 ---
 

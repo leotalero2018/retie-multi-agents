@@ -96,3 +96,8 @@ docker-compose.override.yml
 # NotebookLM local session files
 nlm-session/
 retie_agent/agent/.nlm_session_cache.json
+
+pipeline_indexacion/chroma_local/
+chroma_local/
+*.bin
+*.pickle

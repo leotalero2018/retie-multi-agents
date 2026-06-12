@@ -9,6 +9,11 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic import Field
 
 
+def as_bool(value: object) -> bool:
+    """Interpreta flags tipo string ("true"/"1"/"yes") de forma consistente."""
+    return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+
 class Settings(BaseSettings):
     # --- Providers / keys ---
     OPENAI_API_KEY: Optional[str] = Field(default=None, description="OpenAI API key")
@@ -31,6 +36,21 @@ class Settings(BaseSettings):
     CHUNK_TOKENS: int = 800
     CHUNK_OVERLAP: int = 150
     RAG_DISTANCE_THRESHOLD: float = 0.45           # cosine distance filter
+    # Candidatos extra que pide el dense retrieval antes de filtrar/fusionar.
+    FETCH_K_MULTIPLIER: int = 3
+    # Fusión léxica BM25 + dense vía Reciprocal Rank Fusion.
+    BM25_FUSION_ENABLED: str = "true"
+    RRF_K: int = 60                                # constante k del RRF
+
+    # --- Conversación ---
+    HISTORY_LIMIT: int = 10
+    # Reescribe preguntas de seguimiento ("¿y eso aplica a...?") usando el
+    # historial para que el retrieval reciba una pregunta autocontenida.
+    QUERY_REWRITE_ENABLED: str = "true"
+
+    # --- Enriquecimiento (OpenAI Assistants) ---
+    ENRICHMENT_ENABLED: str = "true"               # "false" → respuesta ~2x más rápida
+    ENRICHMENT_TIMEOUT: float = 30.0               # segundos máx. para el assistant
 
     # --- Whisper ---
     WHISPER_PROVIDER: str = "openai"

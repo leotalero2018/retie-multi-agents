@@ -1,5 +1,45 @@
 from typing import List, Dict, Optional
 
+# System prompt compartido por los nodos de respuesta del grafo.
+SYSTEM_PROMPT_RETIE = (
+    "Eres un asistente experto en el Reglamento Técnico de Instalaciones "
+    "Eléctricas (RETIE) de Colombia. Respondes en español, con precisión "
+    "técnica y solo con base en la evidencia que se te entrega. Cuando la "
+    "evidencia incluye valores numéricos, tablas o requisitos normativos, los "
+    "reproduces fielmente sin redondear ni omitir."
+)
+
+# Reescritura de preguntas de seguimiento: convierte una pregunta que depende
+# del historial ("¿y eso aplica en baja tensión?") en una autocontenida para
+# que el retrieval (Chroma/NotebookLM) reciba todo el contexto necesario.
+CONDENSE_PROMPT = (
+    "Dada la conversación previa y la última pregunta del usuario, reescribe la "
+    "última pregunta como una pregunta AUTOCONTENIDA sobre el RETIE, en español, "
+    "que pueda entenderse sin leer la conversación.\n"
+    "Reglas:\n"
+    "- Si la pregunta ya es autocontenida, devuélvela EXACTAMENTE igual.\n"
+    "- No respondas la pregunta; solo reescríbela.\n"
+    "- Conserva términos técnicos, números de artículo, tablas y unidades.\n"
+    "- Devuelve únicamente la pregunta reescrita, sin comillas ni explicación.\n\n"
+    "CONVERSACIÓN PREVIA:\n{history}\n\n"
+    "ÚLTIMA PREGUNTA: {question}\n\n"
+    "Pregunta reescrita:"
+)
+
+
+def format_history_for_condense(history: List[Dict[str, str]], max_messages: int = 6) -> str:
+    """Formatea los últimos mensajes para el prompt de condensación."""
+    lines: List[str] = []
+    for msg in history[-max_messages:]:
+        role = "Usuario" if msg.get("role") == "user" else "Asistente"
+        content = (msg.get("content") or "").strip()
+        if len(content) > 500:
+            content = content[:500] + "…"
+        if content:
+            lines.append(f"{role}: {content}")
+    return "\n".join(lines) if lines else "(sin historial)"
+
+
 # Two templates:
 # - USER: no citations requested
 # - ADMIN: asks the model to cite [archivo, página]

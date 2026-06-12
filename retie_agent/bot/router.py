@@ -17,15 +17,7 @@ from aiogram.filters import CommandStart, Command
 # Run the LangGraph pipeline (instrumented for Langfuse)
 from retie_agent.agent.graph import run_graph
 from retie_agent.agent.registry import AGENTS as _AGENTS
-from retie_agent.agent.enrichment_assistant import EnrichmentAssistant
-from retie_agent.config import ENRICHMENT_ASSISTANT_ID, ENRICHMENT_VECTOR_STORE_ID
-
-
-# Initialize enrichment assistant once
-enrichment_agent = EnrichmentAssistant(
-    assistant_id=ENRICHMENT_ASSISTANT_ID,
-    vector_store_id=ENRICHMENT_VECTOR_STORE_ID,
-)
+from retie_agent.services.history import clear_history
 
 # --- create router FIRST (before any @router.message decorators) ---
 router = Router(name="telegram_router")
@@ -204,10 +196,40 @@ def _safe_agent_key(k: Optional[str]) -> Optional[str]:
 
 
 # ----------------------- commands & admin -----------------------
+_HELP_TEXT = (
+    "🤖 <b>Bot RETIE — comandos disponibles</b>\n\n"
+    "/start — Inicia la conversación\n"
+    "/help — Muestra esta ayuda\n"
+    "/clear — Borra el historial de esta conversación\n"
+    "/agent &lt;key&gt; — Cambia de agente (plumber, pymupdf)\n"
+    "/who — Muestra el agente activo\n"
+    "/admin &lt;contraseña&gt; — Acceso administrador\n"
+    "/docs [k] — Documentos más relevantes de la última consulta (admin)\n"
+    "/logout — Cierra la sesión de administrador\n\n"
+    "También puedes enviar <b>notas de voz</b> e <b>imágenes</b> de documentos.\n"
+    "💡 Pide una «tabla» para recibir los datos en formato tabular."
+)
+
+
 @router.message(CommandStart())
 async def on_start(message: Message):
     CHAT_AGENT[message.chat.id] = DEFAULT_AGENT
-    await message.answer("¡Hola! Soy tu bot RETIE, ¿en qué puedo ayudarte?")
+    await message.answer("¡Hola! Soy tu bot RETIE, ¿en qué puedo ayudarte?\nEscribe /help para ver lo que puedo hacer.")
+
+
+@router.message(Command("help"))
+async def on_help(message: Message):
+    await message.answer(_HELP_TEXT)
+
+
+@router.message(Command("clear"))
+async def on_clear(message: Message):
+    """Borra el historial de la conversación (el mismo session_id que usa run_graph)."""
+    deleted = await asyncio.to_thread(clear_history, f"telegram-chat-{message.chat.id}")
+    if deleted:
+        await message.answer(f"🧹 Historial borrado ({deleted} mensajes). Empezamos de cero.")
+    else:
+        await message.answer("No había historial que borrar en esta conversación.")
 
 
 @router.message(Command("agent"))

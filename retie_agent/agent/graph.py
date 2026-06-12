@@ -11,14 +11,26 @@ logger = logging.getLogger(__name__)
 from langgraph.graph import StateGraph, END
 from openai import OpenAI
 
-from retie_agent.config import settings
+from retie_agent.config import settings, as_bool
 from retie_agent.retriever.retrieve import search
-from retie_agent.agent.prompt import make_prompt, make_hybrid_prompt
+from retie_agent.agent.prompt import (
+    make_prompt,
+    make_hybrid_prompt,
+    SYSTEM_PROMPT_RETIE,
+    CONDENSE_PROMPT,
+    format_history_for_condense,
+)
 from retie_agent.agent.retie_agent import _dedupe_hits, _resolve_collection, _resolve_model
 from retie_agent.observability.obs import trace_ctx, span_ctx, log_generation
 from retie_agent.services.history import get_history, add_message
 from retie_agent.agent.notebooklm_client import NotebookLMClient, NotebookLMError, NotebookLMCache
 from retie_agent.agent.table_render import render_telegram_table, render_table_image
+
+# Executor compartido para trabajo paralelo (Chroma + NotebookLM, enrichment con
+# timeout). Es persistente a propósito: un `with ThreadPoolExecutor(...)` espera
+# en el __exit__ a los futures en ejecución, lo que anulaba el "skip" de
+# NotebookLM (la respuesta quedaba bloqueada hasta que el navegador terminara).
+_POOL = ThreadPoolExecutor(max_workers=8, thread_name_prefix="graph")
 
 # ---------- State ----------
 class GraphState(TypedDict, total=False):
@@ -34,6 +46,7 @@ class GraphState(TypedDict, total=False):
     wants_table: bool       # user asked for a "tabla" → route through table_node
     table_image: Any        # PNG bytes when the table is rendered as an image
     nlm_answer: Optional[str]  # NotebookLM answer from parallel hybrid retrieve
+    search_query: Optional[str]  # standalone query (condensed from history) used for retrieval
 
 
 # Detección de intención de tabla por palabra clave (determinística).
@@ -170,8 +183,55 @@ def _build_user_sources(hits: List[Dict[str, Any]], limit: int = 5):
 
 
 # ---------- Nodes ----------
-def _node_retrieve(state: GraphState) -> GraphState:
+def _node_condense(state: GraphState) -> GraphState:
+    """Reescribe preguntas de seguimiento como preguntas autocontenidas.
+
+    "¿Y eso aplica en baja tensión?" no recupera nada útil en Chroma/NotebookLM
+    sin el contexto previo. Con historial, una llamada corta al LLM produce la
+    consulta de búsqueda; la pregunta original se conserva para el prompt final.
+    Sin historial (o con el flag apagado) es un pass-through sin costo.
+    """
     q = state["question"]
+    history = state.get("history") or []
+    enabled = as_bool(getattr(settings, "QUERY_REWRITE_ENABLED", "true"))
+    if not enabled or not history:
+        return {"search_query": q}
+
+    with span_ctx(
+        None, "condense_node", as_type="chain",
+        span_input={"question": q, "history_messages": len(history)},
+    ) as span:
+        search_query = q
+        try:
+            prompt = CONDENSE_PROMPT.format(
+                history=format_history_for_condense(history), question=q
+            )
+            resp = _client.chat.completions.create(
+                model=_resolve_model(state.get("agent_key"), explicit=None),
+                temperature=0.0,
+                max_tokens=150,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            rewritten = (resp.choices[0].message.content or "").strip().strip('"')
+            # Sanidad: descarta reescrituras vacías o desproporcionadas.
+            if rewritten and len(rewritten) <= max(300, len(q) * 4):
+                search_query = rewritten
+        except Exception as exc:
+            logger.warning("condense_node failed, using original question: %s", exc)
+
+        if span is not None:
+            try:
+                span.update(output={
+                    "search_query": search_query,
+                    "rewritten": search_query != q,
+                })
+            except Exception:
+                pass
+        return {"search_query": search_query}
+
+
+def _node_retrieve(state: GraphState) -> GraphState:
+    q = state.get("search_query") or state["question"]
     agent_key = state.get("agent_key")
     coll = _resolve_collection(agent_key, explicit=None)
     top_k = getattr(settings, "TOP_K", 4)
@@ -243,7 +303,7 @@ def _node_answer(state: GraphState) -> GraphState:
         return {"answer": "No tengo evidencia en los documentos."}
 
     model = _resolve_model(agent_key, explicit=None)
-    sys = "Eres un asistente útil."
+    sys = SYSTEM_PROMPT_RETIE
     # Use hybrid prompt when both sources are available
     prompt = make_hybrid_prompt(hits, nlm_answer, q, is_admin=False)
     messages = [{"role": "system", "content": sys}]
@@ -351,7 +411,7 @@ def _node_hybrid_retrieve(state: GraphState) -> GraphState:
     falls back to Chroma-only. Always routes to answer_node (merged LLM call)
     or no_context when both sources are empty.
     """
-    q = state["question"]
+    q = state.get("search_query") or state["question"]
     agent_key = state.get("agent_key")
     coll = _resolve_collection(agent_key, explicit=None)
     top_k = getattr(settings, "TOP_K", 4)
@@ -371,54 +431,72 @@ def _node_hybrid_retrieve(state: GraphState) -> GraphState:
         nlm_answer = ""
         nlm_status = "disabled"
 
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            chroma_fut = pool.submit(
-                lambda: _dedupe_hits(search(q, top_k=top_k, collection_name=coll))
-            )
+        # Pool persistente: si se decide saltar/abandonar NotebookLM, el future
+        # queda corriendo en background sin bloquear esta respuesta.
+        chroma_fut = _POOL.submit(
+            lambda: _dedupe_hits(search(q, top_k=top_k, collection_name=coll))
+        )
 
-            nlm_fut = None
-            if nlm_eligible and not cached:
-                client = _get_notebooklm_client()
-                nlm_fut = pool.submit(client.ask_question, q, "footnotes", nb_id)
-                nlm_status = "submitted"
+        nlm_fut = None
+        if nlm_eligible and not cached:
+            client = _get_notebooklm_client()
+            nlm_fut = _POOL.submit(client.ask_question, q, "footnotes", nb_id)
+            nlm_status = "submitted"
 
-            # Chroma is fast — retrieve results first
-            try:
-                hits = chroma_fut.result(timeout=15)
-            except Exception:
-                hits = []
+        # Chroma is fast — retrieve results first
+        try:
+            hits = chroma_fut.result(timeout=15)
+        except Exception:
+            hits = []
 
-            # Confidence check: skip NLM wait if Chroma is highly confident.
-            # EXCEPTION: never skip NLM for table queries — table data requires
-            # NotebookLM's full-PDF access; Chroma chunks rarely contain full tables.
-            wants_table = state.get("wants_table", False)
-            scores = [h["score"] for h in hits if isinstance(h.get("score"), (int, float))]
-            best_score = min(scores) if scores else 1.0
-            high_confidence = bool(hits and best_score < conf_thr and not wants_table)
+        # Confidence check: skip NLM wait if Chroma is highly confident.
+        # EXCEPTION: never skip NLM for table queries — table data requires
+        # NotebookLM's full-PDF access; Chroma chunks rarely contain full tables.
+        wants_table = state.get("wants_table", False)
+        # Solo distancias coseno: los scores BM25 (mayor=mejor) no son comparables.
+        scores = [
+            h["score"] for h in hits
+            if isinstance(h.get("score"), (int, float))
+            and h.get("score_type", "cosine_distance") == "cosine_distance"
+        ]
+        best_score = min(scores) if scores else 1.0
+        high_confidence = bool(hits and best_score < conf_thr and not wants_table)
 
-            if cached:
-                nlm_answer, _ = cached
-                nlm_status = "cache_hit"
-            elif nlm_fut is not None:
-                if high_confidence:
-                    nlm_fut.cancel()
-                    nlm_status = "skipped_high_conf"
-                else:
-                    try:
-                        raw_answer, _ = nlm_fut.result(timeout=parallel_timeout)
-                        nlm_answer = (raw_answer or "").strip()
-                        if nlm_answer:
-                            cache.set(q, nb_id, nlm_answer, [])
-                        nlm_status = "ok"
-                    except FutureTimeoutError:
-                        nlm_status = "timeout"
-                        logger.warning(
-                            "NotebookLM parallel timeout after %.0fs — using Chroma only",
-                            parallel_timeout,
-                        )
-                    except Exception as exc:
-                        nlm_status = "error"
-                        logger.warning("NotebookLM parallel query failed: %s", exc)
+        if cached:
+            nlm_answer, _ = cached
+            nlm_status = "cache_hit"
+        elif nlm_fut is not None:
+            if high_confidence:
+                nlm_fut.cancel()  # si ya corre, sigue en background sin bloquear
+                nlm_status = "skipped_high_conf"
+            else:
+                try:
+                    raw_answer, _ = nlm_fut.result(timeout=parallel_timeout)
+                    nlm_answer = (raw_answer or "").strip()
+                    if nlm_answer:
+                        cache.set(q, nb_id, nlm_answer, [])
+                    nlm_status = "ok"
+                except FutureTimeoutError:
+                    nlm_status = "timeout"
+                    logger.warning(
+                        "NotebookLM parallel timeout after %.0fs — using Chroma only",
+                        parallel_timeout,
+                    )
+
+                    # El navegador sigue trabajando: cachear la respuesta tardía
+                    # para que una repetición de la pregunta sea cache-hit.
+                    def _cache_late(fut, _q=q, _nb=nb_id):
+                        try:
+                            raw, _ = fut.result()
+                            if raw and raw.strip():
+                                cache.set(_q, _nb, raw.strip(), [])
+                        except Exception:
+                            pass
+
+                    nlm_fut.add_done_callback(_cache_late)
+                except Exception as exc:
+                    nlm_status = "error"
+                    logger.warning("NotebookLM parallel query failed: %s", exc)
 
         # Routing:
         # - Table query + NLM answer → skip answer_node synthesis (preserves tabular format)
@@ -725,30 +803,41 @@ def _node_table(state: GraphState) -> GraphState:
 
 from retie_agent.agent.enrichment_assistant import EnrichmentAssistant
 import os
+from retie_agent.config import ENRICHMENT_ASSISTANT_ID, ENRICHMENT_VECTOR_STORE_ID
 from retie_agent.observability.obs import span_ctx, log_generation  # ✅ keep logs visible in Langfuse
-
-# ===============================
-#  Enrichment Assistant Settings
-# ===============================
-ENRICHMENT_ASSISTANT_ID = os.getenv(
-    "ENRICHMENT_ASSISTANT_ID", "asst_qthy1ZfTpr2ps0mruX30zVlc"
-)
-ENRICHMENT_VECTOR_STORE_ID = os.getenv(
-    "ENRICHMENT_VECTOR_STORE_ID", "vs_69050fe6e43c8191be28bac47c3f565f"
-)
-
-_enrichment_agent = EnrichmentAssistant(
-    assistant_id=ENRICHMENT_ASSISTANT_ID,
-    vector_store_id=ENRICHMENT_VECTOR_STORE_ID,
-)
 
 # ===============================
 #  Enrichment Node
 # ===============================
+# Lazy: instanciar EnrichmentAssistant en import rompía el arranque cuando no
+# había OPENAI_API_KEY en el entorno (p. ej. tests o tooling local).
+_enrichment_agent: Optional[EnrichmentAssistant] = None
+
+
+def _get_enrichment_agent() -> EnrichmentAssistant:
+    global _enrichment_agent
+    if _enrichment_agent is None:
+        _enrichment_agent = EnrichmentAssistant(
+            assistant_id=ENRICHMENT_ASSISTANT_ID,
+            vector_store_id=ENRICHMENT_VECTOR_STORE_ID,
+        )
+    return _enrichment_agent
+
+
 def _node_enrich(state: GraphState) -> GraphState:
-    """Asistente secundario que enriquece la respuesta base sin bloquear el flujo."""
+    """Asistente secundario que enriquece la respuesta base sin bloquear el flujo.
+
+    Con ENRICHMENT_ENABLED=false el nodo es un pass-through (respuesta ~2x más
+    rápida). Si el assistant falla o excede ENRICHMENT_TIMEOUT, se conserva la
+    respuesta base SIN exponer el error interno al usuario.
+    """
     base_answer = state.get("answer", "")
     question = state.get("question", "")
+
+    if not as_bool(getattr(settings, "ENRICHMENT_ENABLED", "true")):
+        return {"answer": base_answer}
+
+    timeout = float(getattr(settings, "ENRICHMENT_TIMEOUT", 30.0))
 
     with span_ctx(
         None,
@@ -757,11 +846,12 @@ def _node_enrich(state: GraphState) -> GraphState:
         as_type="chain",
     ):
         try:
-            # Intento de enriquecimiento con el asistente secundario
-            enriched = _enrichment_agent.enrich_response(
+            fut = _POOL.submit(
+                _get_enrichment_agent().enrich_response,
                 user_message=question,
                 draft_response=base_answer,
             )
+            enriched = fut.result(timeout=timeout)
 
             # Si el enriquecimiento no produce texto, usa la respuesta base
             if not enriched or len(enriched.strip()) < 20:
@@ -770,8 +860,10 @@ def _node_enrich(state: GraphState) -> GraphState:
             status = "ok"
 
         except Exception as e:
-            # Si falla (por vector vacío o error en la API), se conserva la respuesta original
-            enriched = f"{base_answer}\n\n(ℹ️ Enriquecimiento omitido: {e})"
+            # Falla técnica → conservar la respuesta original tal cual.
+            # (Antes se anexaba el error al texto y el usuario lo veía.)
+            logger.warning("enrich_node fallback (%s)", e)
+            enriched = base_answer
             status = "fallback"
 
         # 🔍 Registro en Langfuse: permite ver la salida y el estado del enriquecimiento
@@ -797,6 +889,13 @@ def _node_enrich(state: GraphState) -> GraphState:
 # ===============================
 #  Stylist Node (Output Formatter)
 # ===============================
+from datetime import datetime, timezone
+
+
+def _utcnow_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
 def _node_stylist(state: GraphState) -> GraphState:
     """
     Post-processing node that prepares the enriched response for downstream delivery.
@@ -839,7 +938,7 @@ def _node_stylist(state: GraphState) -> GraphState:
                 "sources": sources,
                 "sources_text": sources_text,
                 "image": table_image,  # PNG bytes → router sends it as a photo
-                "timestamp": __import__("datetime").datetime.utcnow().isoformat(),
+                "timestamp": _utcnow_iso(),
             }
 
             status = "ok"
@@ -853,7 +952,7 @@ def _node_stylist(state: GraphState) -> GraphState:
                 "sources_text": sources_text,
                 "image": table_image,
                 "error": str(e),
-                "timestamp": __import__("datetime").datetime.utcnow().isoformat(),
+                "timestamp": _utcnow_iso(),
             }
             status = "fallback"
 
@@ -890,6 +989,7 @@ def build_graph():
 
     g = StateGraph(GraphState)
     g.add_node("route_entry", _node_route_entry)
+    g.add_node("condense_node", _node_condense)
     g.add_node("retrieve", _node_retrieve)
     g.add_node("router", _node_router)
     g.add_node("hybrid_retrieve", _node_hybrid_retrieve)
@@ -899,10 +999,12 @@ def build_graph():
     g.add_node("no_context", _node_no_context)
     g.add_node("table_node", _node_table)
 
-    # Entry: feature flag decides hybrid (Chroma+NLM) vs Chroma-only
+    # Entry: feature flag decides hybrid (Chroma+NLM) vs Chroma-only.
+    # condense_node reescribe preguntas de seguimiento antes del retrieval.
     g.set_entry_point("route_entry")
+    g.add_edge("route_entry", "condense_node")
     g.add_conditional_edges(
-        "route_entry",
+        "condense_node",
         lambda s: s.get("route", "retrieve"),
         {"retrieve": "retrieve", "hybrid_retrieve": "hybrid_retrieve"},
     )
