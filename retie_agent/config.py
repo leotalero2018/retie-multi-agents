@@ -48,6 +48,9 @@ class Settings(BaseSettings):
     # colecciones disponibles en la DB.
     COLLECTION_NAMES: str = "normativas"
     TOP_K: int = 4
+    # Consultas de tabla: se recuperan MÁS chunks (las tablas largas quedan
+    # partidas en varios fragmentos contiguos y omitir uno = filas faltantes).
+    TOP_K_TABLES: int = 12
     CHUNK_TOKENS: int = 800
     CHUNK_OVERLAP: int = 150
     RAG_DISTANCE_THRESHOLD: float = 0.45           # cosine distance filter

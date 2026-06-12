@@ -268,7 +268,12 @@ def _node_retrieve(state: GraphState) -> GraphState:
     q = state.get("search_query") or state["question"]
     agent_key = state.get("agent_key")
     coll = _resolve_collection(agent_key, explicit=None)
-    top_k = getattr(settings, "TOP_K", 4)
+    # Tablas: más chunks — las tablas largas viven partidas en varios fragmentos.
+    top_k = (
+        getattr(settings, "TOP_K_TABLES", 12)
+        if state.get("wants_table")
+        else getattr(settings, "TOP_K", 4)
+    )
     thr = getattr(settings, "RAG_DISTANCE_THRESHOLD", 0.45)
 
     span_input = {
@@ -350,10 +355,10 @@ def _node_answer(state: GraphState) -> GraphState:
     messages.append({"role": "user", "content": prompt})
 
     temperature = 0.0
-    # Tables need more tokens to reproduce all rows; regular answers stay at default.
+    # Tables need more tokens to reproduce ALL rows; regular answers stay at default.
     wants_table = state.get("wants_table", False)
     default_max = getattr(settings, "MAX_TOKENS", 600)
-    max_tokens = 2000 if wants_table else default_max
+    max_tokens = 3000 if wants_table else default_max
 
     with span_ctx(
         None, "answer_node",
@@ -452,7 +457,12 @@ def _node_hybrid_retrieve(state: GraphState) -> GraphState:
     q = state.get("search_query") or state["question"]
     agent_key = state.get("agent_key")
     coll = _resolve_collection(agent_key, explicit=None)
-    top_k = getattr(settings, "TOP_K", 4)
+    # Tablas: más chunks — las tablas largas viven partidas en varios fragmentos.
+    top_k = (
+        getattr(settings, "TOP_K_TABLES", 12)
+        if state.get("wants_table")
+        else getattr(settings, "TOP_K", 4)
+    )
     nb_id = getattr(settings, "NOTEBOOKLM_NOTEBOOK_ID", None)
     conf_thr = float(getattr(settings, "CHROMA_HIGH_CONFIDENCE_THR", 0.25))
     decent_thr = float(getattr(settings, "CHROMA_DECENT_THR", 0.40))
