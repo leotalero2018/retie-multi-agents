@@ -108,6 +108,10 @@ class Settings(BaseSettings):
     NOTEBOOKLM_SESSION_DIR: str = "/tmp/nlm-session"  # where Playwright stores the browser profile
     NOTEBOOKLM_SESSION_BUCKET: str = ""               # MinIO bucket (defaults to S3_BUCKET_NAME)
     NOTEBOOKLM_STARTUP_TIMEOUT: int = 60              # seconds to wait for MCP server to become ready
+    # Keepalive: cada N minutos el bot "toca" la sesión de Google (refresca
+    # cookies) y sube el browser_state renovado a MinIO. Mantiene viva una
+    # sesión VÁLIDA indefinidamente sin uploads manuales. 0 = desactivado.
+    NOTEBOOKLM_KEEPALIVE_MINUTES: int = 240
 
     # --- Observability (Langfuse) ---
     # Accept typical string booleans; obs.py interprets them safely.

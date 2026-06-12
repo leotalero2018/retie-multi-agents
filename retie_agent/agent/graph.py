@@ -700,6 +700,8 @@ _TABLE_PROMPT = (
     "- 'title' es un título corto y descriptivo en español (máx. 8 palabras).\n"
     "- Usa encabezados cortos y claros en español.\n"
     "- Extrae TODAS las filas de datos, sin resumir ni omitir ninguna.\n"
+    "- Los fragmentos pueden venir desordenados o repetidos (solapamiento de\n"
+    "  chunks): únelos, DEDUPLICA filas idénticas y ordénalas como en el documento.\n"
     "- Conserva los valores tal como aparecen, incluidos rangos ('26-30', '61 y más')\n"
     "  y fórmulas ('15 kW + 1 kW por cada estufa').\n"
     "- Cada fila debe tener exactamente el mismo número de celdas que headers.\n"
@@ -804,22 +806,46 @@ def _parse_table_json(raw: str) -> Optional[Dict[str, Any]]:
     }
 
 
+_TABLE_PARTIAL_NOTE = (
+    "⚠️ No pude reconstruir la tabla completa en este intento "
+    "(la fuente NotebookLM no estuvo disponible). "
+    "Esta es la información encontrada en la base local:\n\n"
+)
+
+# Tope de caracteres de fragmentos crudos que se anexan a la extracción de tabla
+# (~12k chars ≈ 3k tokens; suficiente para TOP_K_TABLES chunks de 800 chars).
+_TABLE_RAW_CONTEXT_CHARS = 12000
+
+
 def _node_table(state: GraphState) -> GraphState:
     """Convierte la respuesta del agente en una tabla y la entrega como imagen PNG.
 
     Pide al LLM estructurar los datos como JSON {title, headers, rows} y renderiza
     una imagen (sin el botón "COPIAR CÓDIGO" que Telegram añade a los <pre>).
+    La extracción usa la respuesta sintetizada Y los fragmentos crudos del
+    retriever: la síntesis comprime/omite filas, los chunks originales no.
     Degradación elegante:
       - Si Pillow/imagen falla → tabla de texto adaptativa (<pre>).
-      - Si la información no es tabulable o el LLM falla → prosa original.
+      - Si la información no es tabulable o el LLM falla → prosa original
+        (con nota de tabla parcial cuando NotebookLM no estuvo disponible).
     """
     base_answer = state.get("answer", "") or ""
     question = state.get("question", "")
     if not base_answer.strip():
         return {"answer": base_answer, "route": "stylist_node"}
 
+    # Fragmentos crudos: la fuente más fiel para no omitir filas. La respuesta
+    # del answer_node ya pasó por un LLM con límite de tokens y puede haber
+    # resumido; los chunks de Chroma traen el texto literal del PDF.
+    raw_chunks = "\n\n".join(
+        h.get("text", "") for h in (state.get("hits") or []) if h.get("text")
+    )[:_TABLE_RAW_CONTEXT_CHARS]
+    info = base_answer
+    if raw_chunks:
+        info = f"{base_answer}\n\nFRAGMENTOS LITERALES DEL DOCUMENTO:\n{raw_chunks}"
+
     model = _resolve_model(state.get("agent_key"), explicit=None)
-    prompt = _TABLE_PROMPT.format(question=question, answer=base_answer)
+    prompt = _TABLE_PROMPT.format(question=question, answer=info)
 
     with span_ctx(
         None, "table_node",
@@ -859,9 +885,15 @@ def _node_table(state: GraphState) -> GraphState:
                     final_text = render_telegram_table(table["headers"], table["rows"])
             else:
                 status = "not_tabular"  # se conserva la prosa original
+                # Honestidad con el usuario: si NLM no aportó (fuente clave para
+                # tablas) y no se pudo tabular, avisar que el resultado es parcial.
+                if not (state.get("nlm_answer") or "").strip():
+                    final_text = _TABLE_PARTIAL_NOTE + base_answer
         except Exception as exc:
             status = "error"
             logger.warning("table_node failed: %s", exc)
+            if not (state.get("nlm_answer") or "").strip():
+                final_text = _TABLE_PARTIAL_NOTE + base_answer
 
         if span is not None:
             try:

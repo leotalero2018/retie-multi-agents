@@ -188,9 +188,9 @@ class NotebookLMClient:
             resp.raise_for_status()
         except httpx.HTTPStatusError as exc:
             body = exc.response.text[:400]
-            if "already connected" in body.lower():
-                # Server has a stale transport — our cached session ID is no longer
-                # valid. Clear cache so next _ensure_session() calls initialize().
+            if "already connected" in body.lower() or "no transport" in body.lower():
+                # Server has a stale/missing transport — our cached session ID is no
+                # longer valid. Clear cache so next _ensure_session() calls initialize().
                 self._mcp_session = None
                 self._nlm_session = None
                 self._clear_session_cache()

@@ -164,6 +164,49 @@ async def _diagnose_nlm(nlm_url: str) -> None:
         logging.warning("[NLM] Diagnóstico falló: %s", exc)
 
 
+async def _nlm_keepalive_loop(nlm_url: str) -> None:
+    """Mantiene viva la sesión de Google sin intervención manual.
+
+    Cada NOTEBOOKLM_KEEPALIVE_MINUTES:
+      1. Toca la sesión vía get_health (Playwright refresca cookies al navegar).
+      2. Si sigue autenticada, sube el browser_state RENOVADO a MinIO — así los
+         próximos deploys arrancan con cookies frescas en vez del snapshot
+         original que envejece hasta vencer.
+    Una sesión ya vencida NO se puede resucitar desde código (el login de
+    Google requiere interacción humana): este loop evita llegar a ese punto.
+    """
+    minutes = int(getattr(settings, "NOTEBOOKLM_KEEPALIVE_MINUTES", 240))
+    if minutes <= 0:
+        return
+    interval = minutes * 60
+
+    def _touch_and_backup() -> bool:
+        from retie_agent.agent.notebooklm_client import NotebookLMClient
+        from retie_agent.services.nlm_session import upload_nlm_session, default_browser_state_dir
+
+        client = NotebookLMClient(base_url=nlm_url, timeout=60.0)
+        if not client.is_authenticated():
+            return False
+        src = default_browser_state_dir()
+        if src.exists():
+            upload_nlm_session(str(src))
+        return True
+
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            ok = await asyncio.get_running_loop().run_in_executor(None, _touch_and_backup)
+            if ok:
+                logging.info("[NLM] keepalive ✓ — sesión refrescada y respaldada en MinIO")
+            else:
+                logging.warning(
+                    "[NLM] keepalive: la sesión de Google ya NO es válida — se "
+                    "requiere un login manual (setup_notebooklm.py) y --upload."
+                )
+        except Exception as exc:
+            logging.warning("[NLM] keepalive falló: %s", exc)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 
 dp = Dispatcher()
@@ -228,11 +271,13 @@ async def main() -> None:
     except Exception as e:
         logging.warning("[CHK2] Skipped Chroma check: %s", e)
 
-    # 4️⃣ Start NotebookLM MCP server (if enabled)
+    # 4️⃣ Start NotebookLM MCP server (if enabled) + keepalive de sesión
     nlm_enabled = str(getattr(settings, "NOTEBOOKLM_ENABLED", "false")).lower() in ("1", "true", "yes")
     if nlm_enabled:
         logging.info("[NLM] NOTEBOOKLM_ENABLED=true — starting MCP server...")
         await _setup_nlm_server()
+        nlm_url = getattr(settings, "NOTEBOOKLM_URL", "http://localhost:3000")
+        asyncio.create_task(_nlm_keepalive_loop(nlm_url))
 
     # 5️⃣ Start Telegram bot
     token = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("TELEGRAM_TOKEN")
