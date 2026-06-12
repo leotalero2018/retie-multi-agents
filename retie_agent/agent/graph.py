@@ -57,6 +57,40 @@ def _wants_table(text: str) -> bool:
     return bool(_TABLE_RE.search(text or ""))
 
 
+# Saludos / cortesías: se responden al instante, sin retrieval ni NotebookLM.
+# (Antes "Hola" disparaba el pipeline completo y esperaba al navegador de NLM
+# para terminar en "No tengo evidencia en los documentos".)
+_SMALLTALK_RE = re.compile(
+    r"^\s*(?:hola+|holi+|buen[oa]s(?:\s+(?:d[ií]as|tardes|noches))?|hey|hello|hi"
+    r"|(?:muchas\s+)?gracias+|ok(?:ey)?|vale|listo|perfecto|genial|excelente"
+    r"|adi[oó]s|hasta\s+luego|chao|nos\s+vemos"
+    r"|qu[ié][eé]n\s+eres|qu[eé]\s+puedes\s+hacer|ayuda)\s*[!.?¡¿]*\s*$",
+    re.IGNORECASE,
+)
+
+_SMALLTALK_THANKS_RE = re.compile(
+    r"gracias|adi[oó]s|hasta\s+luego|chao|nos\s+vemos|ok|vale|listo|perfecto|genial|excelente",
+    re.IGNORECASE,
+)
+
+_SMALLTALK_GREETING = (
+    "¡Hola! 👋 Soy el asistente de normativa eléctrica colombiana (RETIE y NTC 2050).\n\n"
+    "Pregúntame, por ejemplo:\n"
+    "• ¿Qué exige el RETIE sobre puesta a tierra?\n"
+    "• Dame la tabla 220.55 de factores de demanda\n"
+    "• Requisitos para instalaciones en zonas húmedas\n\n"
+    "Escribe /help para ver todos los comandos."
+)
+_SMALLTALK_THANKS = "¡Con gusto! 🙌 Si tienes otra consulta sobre el RETIE o la NTC 2050, aquí estoy."
+
+
+def _node_smalltalk(state: GraphState) -> GraphState:
+    q = state.get("question", "")
+    answer = _SMALLTALK_THANKS if _SMALLTALK_THANKS_RE.search(q) else _SMALLTALK_GREETING
+    with span_ctx(None, "smalltalk_node", as_type="chain", span_input={"question": q}):
+        return {"answer": answer}
+
+
 def make_state(question: str, *, user_id: str = "anon", session: str = "default", agent_key: Optional[str] = None, history: Optional[List[Dict[str, str]]] = None) -> GraphState:
     return {
         "question": (question or "").strip(),
@@ -262,11 +296,15 @@ def _node_retrieve(state: GraphState) -> GraphState:
         return {"hits": hits}
 
 def _node_route_entry(state: GraphState) -> GraphState:
-    """Entry point: routes to hybrid (Chroma+NLM parallel) or Chroma-only based on feature flag."""
+    """Entry point: smalltalk directo, o hybrid (Chroma+NLM) / Chroma-only según flag."""
+    q = state.get("question", "")
     nlm_enabled = str(getattr(settings, "NOTEBOOKLM_ENABLED", "false")).lower() in ("1", "true", "yes")
-    # hybrid_retrieve runs Chroma + NLM in parallel with caching; falls back to Chroma-only
-    route = "hybrid_retrieve" if nlm_enabled else "retrieve"
-    wants_table = _wants_table(state.get("question", ""))
+    if _SMALLTALK_RE.match(q):
+        route = "smalltalk"
+    else:
+        # hybrid_retrieve runs Chroma + NLM in parallel with caching; falls back to Chroma-only
+        route = "hybrid_retrieve" if nlm_enabled else "retrieve"
+    wants_table = _wants_table(q)
     with span_ctx(
         None, "route_entry", as_type="chain",
         span_input={"nlm_enabled": nlm_enabled, "wants_table": wants_table},
@@ -417,15 +455,36 @@ def _node_hybrid_retrieve(state: GraphState) -> GraphState:
     top_k = getattr(settings, "TOP_K", 4)
     nb_id = getattr(settings, "NOTEBOOKLM_NOTEBOOK_ID", None)
     conf_thr = float(getattr(settings, "CHROMA_HIGH_CONFIDENCE_THR", 0.25))
-    parallel_timeout = float(getattr(settings, "NOTEBOOKLM_PARALLEL_TIMEOUT", 45.0))
+    decent_thr = float(getattr(settings, "CHROMA_DECENT_THR", 0.40))
+    parallel_timeout = float(getattr(settings, "NOTEBOOKLM_PARALLEL_TIMEOUT", 25.0))
+    soft_timeout = float(getattr(settings, "NOTEBOOKLM_SOFT_TIMEOUT", 12.0))
+    min_chars = int(getattr(settings, "NOTEBOOKLM_MIN_QUERY_CHARS", 12))
+    sem_sim = float(getattr(settings, "NLM_SEMANTIC_CACHE_SIM", 0.93))
 
-    nlm_eligible = len(q.strip()) >= _NLM_MIN_QUERY_LEN
+    nlm_eligible = len(q.strip()) >= min_chars
     cache = _get_nlm_cache()
+    cache_kind = None
     cached = cache.get(q, nb_id) if nlm_eligible else None
+    if cached:
+        cache_kind = "exact"
+
+    # Caché semántico: una pregunta reformulada pero equivalente reutiliza la
+    # respuesta NLM previa. El embedding se comparte vía LRU con el retrieval
+    # de Chroma (no hay llamada extra a la API en el camino feliz).
+    q_emb: Optional[List[float]] = None
+    if nlm_eligible and not cached and sem_sim > 0:
+        try:
+            from retie_agent.retriever.retrieve import _embed_query_cached
+            q_emb = _embed_query_cached(q)
+            cached = cache.get_semantic(q_emb, nb_id, sem_sim)
+            if cached:
+                cache_kind = "semantic"
+        except Exception:
+            q_emb = None
 
     with span_ctx(
         None, "hybrid_retrieve", as_type="retriever",
-        span_input={"question": q, "nlm_cache_hit": cached is not None},
+        span_input={"question": q, "nlm_cache_hit": cache_kind},
     ) as span:
         hits: List[Dict[str, Any]] = []
         nlm_answer = ""
@@ -461,38 +520,49 @@ def _node_hybrid_retrieve(state: GraphState) -> GraphState:
         ]
         best_score = min(scores) if scores else 1.0
         high_confidence = bool(hits and best_score < conf_thr and not wants_table)
+        # Espera adaptativa: Chroma y NLM se ayudan — con evidencia decente de
+        # Chroma se espera poco a NLM (la respuesta puede salir solo con Chroma);
+        # sin evidencia, NLM es la única fuente y se le da el timeout completo;
+        # las tablas necesitan a NLM sí o sí → presupuesto propio más amplio.
+        decent = bool(hits and best_score < decent_thr and not wants_table)
+        if wants_table:
+            nlm_wait = float(getattr(settings, "NOTEBOOKLM_TABLE_TIMEOUT", 45.0))
+        elif decent:
+            nlm_wait = soft_timeout
+        else:
+            nlm_wait = parallel_timeout
+
+        # Cachear la respuesta tardía/abandonada de NLM: el navegador sigue
+        # trabajando y la siguiente pregunta igual o similar será cache-hit.
+        def _cache_late(fut, _q=q, _nb=nb_id, _emb=q_emb):
+            try:
+                raw, _ = fut.result()
+                if raw and raw.strip():
+                    cache.set(_q, _nb, raw.strip(), [], embedding=_emb)
+            except Exception:
+                pass
 
         if cached:
             nlm_answer, _ = cached
-            nlm_status = "cache_hit"
+            nlm_status = f"cache_hit_{cache_kind}"
         elif nlm_fut is not None:
             if high_confidence:
-                nlm_fut.cancel()  # si ya corre, sigue en background sin bloquear
+                if not nlm_fut.cancel():  # si ya corre, que termine y se cachee
+                    nlm_fut.add_done_callback(_cache_late)
                 nlm_status = "skipped_high_conf"
             else:
                 try:
-                    raw_answer, _ = nlm_fut.result(timeout=parallel_timeout)
+                    raw_answer, _ = nlm_fut.result(timeout=nlm_wait)
                     nlm_answer = (raw_answer or "").strip()
                     if nlm_answer:
-                        cache.set(q, nb_id, nlm_answer, [])
+                        cache.set(q, nb_id, nlm_answer, [], embedding=q_emb)
                     nlm_status = "ok"
                 except FutureTimeoutError:
-                    nlm_status = "timeout"
+                    nlm_status = "timeout_soft" if decent else "timeout"
                     logger.warning(
-                        "NotebookLM parallel timeout after %.0fs — using Chroma only",
-                        parallel_timeout,
+                        "NotebookLM wait of %.0fs exceeded (decent_chroma=%s) — using Chroma only",
+                        nlm_wait, decent,
                     )
-
-                    # El navegador sigue trabajando: cachear la respuesta tardía
-                    # para que una repetición de la pregunta sea cache-hit.
-                    def _cache_late(fut, _q=q, _nb=nb_id):
-                        try:
-                            raw, _ = fut.result()
-                            if raw and raw.strip():
-                                cache.set(_q, _nb, raw.strip(), [])
-                        except Exception:
-                            pass
-
                     nlm_fut.add_done_callback(_cache_late)
                 except Exception as exc:
                     nlm_status = "error"
@@ -515,6 +585,8 @@ def _node_hybrid_retrieve(state: GraphState) -> GraphState:
                     "hits_count": len(hits),
                     "best_chroma_score": round(best_score, 4) if scores else None,
                     "high_confidence": high_confidence,
+                    "decent_chroma": decent,
+                    "nlm_wait_budget_s": nlm_wait,
                     "wants_table": wants_table,
                     "nlm_answer_len": len(nlm_answer),
                     "nlm_status": nlm_status,
@@ -998,11 +1070,17 @@ def build_graph():
     g.add_node("stylist_node", _node_stylist)
     g.add_node("no_context", _node_no_context)
     g.add_node("table_node", _node_table)
+    g.add_node("smalltalk_node", _node_smalltalk)
 
-    # Entry: feature flag decides hybrid (Chroma+NLM) vs Chroma-only.
-    # condense_node reescribe preguntas de seguimiento antes del retrieval.
+    # Entry: smalltalk responde directo; lo demás pasa por condense_node
+    # (reescritura de seguimiento) y luego hybrid (Chroma+NLM) o Chroma-only.
     g.set_entry_point("route_entry")
-    g.add_edge("route_entry", "condense_node")
+    g.add_conditional_edges(
+        "route_entry",
+        lambda s: "smalltalk" if s.get("route") == "smalltalk" else "condense",
+        {"smalltalk": "smalltalk_node", "condense": "condense_node"},
+    )
+    g.add_edge("smalltalk_node", "stylist_node")
     g.add_conditional_edges(
         "condense_node",
         lambda s: s.get("route", "retrieve"),

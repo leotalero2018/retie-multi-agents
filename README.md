@@ -264,6 +264,16 @@ FETCH_K_MULTIPLIER=3                # Candidatos dense extra antes de fusionar
 QUERY_REWRITE_ENABLED=true          # Reescribe preguntas de seguimiento usando el historial
 HISTORY_LIMIT=10                    # Mensajes de historial por sesión
 
+# ── NotebookLM (híbrido) ───────────────────────────────────────────────
+NOTEBOOKLM_ENABLED=true
+NOTEBOOKLM_PARALLEL_TIMEOUT=25      # Espera máx. a NLM sin evidencia Chroma
+NOTEBOOKLM_SOFT_TIMEOUT=12          # Espera si Chroma ya tiene evidencia decente
+NOTEBOOKLM_TABLE_TIMEOUT=45         # Espera para tablas (dependen de NLM)
+CHROMA_HIGH_CONFIDENCE_THR=0.25     # Mejor distancia < esto → no se espera a NLM
+CHROMA_DECENT_THR=0.40              # Mejor distancia < esto → espera corta (soft)
+NLM_SEMANTIC_CACHE_SIM=0.93         # Reusa respuesta NLM de pregunta similar (0=off)
+NOTEBOOKLM_MIN_QUERY_CHARS=12       # Preguntas más cortas no consultan NLM
+
 # ── Enriquecimiento ────────────────────────────────────────────────────
 ENRICHMENT_ENABLED=true             # false = omite el assistant (~2x más rápido)
 ENRICHMENT_TIMEOUT=30               # Segundos máx. de espera del assistant
@@ -507,7 +517,7 @@ LANGFUSE_SECRET_KEY=sk-lf-...
 LANGFUSE_HOST=https://us.cloud.langfuse.com
 ```
 
-Cada consulta genera una traza con los nodos: `route_entry → condense_node → retrieve/hybrid_retrieve → answer_node → enrich_node → stylist_node` (más `table_node` cuando se pide una tabla).
+Cada consulta genera una traza con los nodos: `route_entry → condense_node → retrieve/hybrid_retrieve → answer_node → enrich_node → stylist_node` (más `table_node` cuando se pide una tabla, o `smalltalk_node` para saludos). El span `hybrid_retrieve` registra `nlm_status` (ok / cache_hit_exact / cache_hit_semantic / skipped_high_conf / timeout_soft / timeout / error) y el presupuesto de espera usado.
 
 ---
 

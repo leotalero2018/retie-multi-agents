@@ -32,16 +32,24 @@ class NotebookLMCache:
 
     Keyed by SHA-256(question + notebook_id) so collisions across different
     notebooks are impossible even when the same question is asked.
+    Optionally stores the question embedding to allow SEMANTIC lookups:
+    a re-worded question similar enough to a cached one reuses its answer
+    instead of paying ~30s of browser automation.
     Thread-safe for read-heavy workloads (GIL protects dict ops).
     """
 
-    def __init__(self, ttl: int = 3600) -> None:
+    def __init__(self, ttl: int = 3600, max_entries: int = 256) -> None:
         self._ttl = ttl
-        self._store: Dict[str, Tuple[str, List[Dict[str, Any]], float]] = {}
+        self._max = max_entries
+        # key -> (answer, sources, ts, embedding|None, notebook_id)
+        self._store: Dict[str, Tuple[str, List[Dict[str, Any]], float, Optional[List[float]], Optional[str]]] = {}
 
     def _key(self, question: str, notebook_id: Optional[str]) -> str:
         raw = f"{question.strip().lower()}|{notebook_id or ''}"
         return hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+    def _expired(self, ts: float) -> bool:
+        return (time.time() - ts) >= self._ttl
 
     def get(
         self, question: str, notebook_id: Optional[str]
@@ -50,9 +58,37 @@ class NotebookLMCache:
         entry = self._store.get(k)
         if entry is None:
             return None
-        if (time.time() - entry[2]) >= self._ttl:
+        if self._expired(entry[2]):
             del self._store[k]
             return None
+        return entry[0], entry[1]
+
+    def get_semantic(
+        self,
+        embedding: List[float],
+        notebook_id: Optional[str],
+        min_sim: float = 0.93,
+    ) -> Optional[Tuple[str, List[Dict[str, Any]]]]:
+        """Busca la entrada más similar por coseno entre las cacheadas con embedding."""
+        if not embedding or min_sim <= 0:
+            return None
+        import math
+        nq = math.sqrt(sum(x * x for x in embedding)) or 1.0
+        best: Optional[Tuple[float, str]] = None
+        for k, (answer, _src, ts, emb, nb) in list(self._store.items()):
+            if emb is None or nb != notebook_id:
+                continue
+            if self._expired(ts):
+                self._store.pop(k, None)
+                continue
+            dot = sum(a * b for a, b in zip(embedding, emb))
+            ne = math.sqrt(sum(x * x for x in emb)) or 1.0
+            sim = dot / (nq * ne)
+            if sim >= min_sim and (best is None or sim > best[0]):
+                best = (sim, k)
+        if best is None:
+            return None
+        entry = self._store[best[1]]
         return entry[0], entry[1]
 
     def set(
@@ -61,10 +97,16 @@ class NotebookLMCache:
         notebook_id: Optional[str],
         answer: str,
         sources: List[Dict[str, Any]],
+        embedding: Optional[List[float]] = None,
     ) -> None:
-        if answer:
-            k = self._key(question, notebook_id)
-            self._store[k] = (answer, sources, time.time())
+        if not answer:
+            return
+        if len(self._store) >= self._max:
+            # Expulsa la entrada más vieja (cache pequeño, escaneo lineal OK)
+            oldest = min(self._store.items(), key=lambda kv: kv[1][2])[0]
+            self._store.pop(oldest, None)
+        k = self._key(question, notebook_id)
+        self._store[k] = (answer, sources, time.time(), embedding, notebook_id)
 
 
 class NotebookLMClient:

@@ -71,8 +71,21 @@ class Settings(BaseSettings):
     NOTEBOOKLM_PAGE_TIMEOUT_MS: int = 15000
     # Hybrid RAG settings
     NOTEBOOKLM_CACHE_TTL: int = 3600          # seconds to cache NLM responses in memory
-    NOTEBOOKLM_PARALLEL_TIMEOUT: float = 45.0  # max seconds to wait for NLM in parallel mode
+    NOTEBOOKLM_PARALLEL_TIMEOUT: float = 25.0  # max seconds to wait for NLM in parallel mode
     CHROMA_HIGH_CONFIDENCE_THR: float = 0.25   # skip NLM when Chroma best score < this
+    # Espera adaptativa: con evidencia "decente" de Chroma (mejor distancia <
+    # CHROMA_DECENT_THR) solo se espera a NLM el soft timeout; la respuesta
+    # tardía de NLM igual se cachea para la siguiente pregunta similar.
+    CHROMA_DECENT_THR: float = 0.40
+    NOTEBOOKLM_SOFT_TIMEOUT: float = 12.0
+    # Las tablas dependen de NLM (Chroma rara vez tiene la tabla completa):
+    # conservan un presupuesto de espera mayor.
+    NOTEBOOKLM_TABLE_TIMEOUT: float = 45.0
+    # Caché semántico: reutiliza la respuesta NLM de una pregunta previa cuya
+    # similitud coseno de embeddings supere este umbral (0 = desactivado).
+    NLM_SEMANTIC_CACHE_SIM: float = 0.93
+    # NLM solo se consulta para preguntas con al menos estos caracteres.
+    NOTEBOOKLM_MIN_QUERY_CHARS: int = 12
     # Session persistence (Playwright user-data-dir backed up in MinIO)
     NOTEBOOKLM_SESSION_DIR: str = "/tmp/nlm-session"  # where Playwright stores the browser profile
     NOTEBOOKLM_SESSION_BUCKET: str = ""               # MinIO bucket (defaults to S3_BUCKET_NAME)
