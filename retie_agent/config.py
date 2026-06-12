@@ -70,6 +70,10 @@ class Settings(BaseSettings):
     ENRICHMENT_ENABLED: str = "true"               # "false" → respuesta ~2x más rápida
     ENRICHMENT_TIMEOUT: float = 30.0               # segundos máx. para el assistant
 
+    # --- Sugerencias de preguntas de seguimiento ---
+    SUGGESTIONS_ENABLED: str = "true"
+    SUGGESTIONS_COUNT: int = 3
+
     # --- Whisper ---
     WHISPER_PROVIDER: str = "openai"
     WHISPER_MODEL: str = "gpt-4o-transcribe"       # or "whisper-1"

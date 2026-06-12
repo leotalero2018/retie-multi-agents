@@ -12,7 +12,7 @@ from langgraph.graph import StateGraph, END
 from openai import OpenAI
 
 from retie_agent.config import settings, as_bool
-from retie_agent.retriever.retrieve import search
+from retie_agent.retriever.retrieve import search, expand_hits_with_page_context
 from retie_agent.agent.prompt import (
     make_prompt,
     make_hybrid_prompt,
@@ -47,6 +47,7 @@ class GraphState(TypedDict, total=False):
     table_image: Any        # PNG bytes when the table is rendered as an image
     nlm_answer: Optional[str]  # NotebookLM answer from parallel hybrid retrieve
     search_query: Optional[str]  # standalone query (condensed from history) used for retrieval
+    suggestions: List[str]  # follow-up questions offered to the user after the answer
 
 
 # Detección de intención de tabla por palabra clave (determinística).
@@ -284,7 +285,14 @@ def _node_retrieve(state: GraphState) -> GraphState:
     }
     with span_ctx(None, "retrieve", as_type="retriever", span_input=span_input) as span:
         try:
-            hits = _dedupe_hits(search(q, top_k=top_k, collection_name=coll))
+            raw_hits = search(q, top_k=top_k, collection_name=coll)
+            # Tablas: NO deduplicar por (source, page) — una página suele tener
+            # varios chunks y todos pueden contener filas. Se expande además a
+            # las páginas completas de los mejores hits.
+            if state.get("wants_table"):
+                hits = expand_hits_with_page_context(raw_hits)
+            else:
+                hits = _dedupe_hits(raw_hits)
         except Exception:
             hits = []
 
@@ -505,9 +513,16 @@ def _node_hybrid_retrieve(state: GraphState) -> GraphState:
 
         # Pool persistente: si se decide saltar/abandonar NotebookLM, el future
         # queda corriendo en background sin bloquear esta respuesta.
-        chroma_fut = _POOL.submit(
-            lambda: _dedupe_hits(search(q, top_k=top_k, collection_name=coll))
-        )
+        _wants_table_q = state.get("wants_table", False)
+
+        def _chroma_search():
+            raw = search(q, top_k=top_k, collection_name=coll)
+            # Tablas: sin dedupe por página (descarta filas) + páginas completas.
+            if _wants_table_q:
+                return expand_hits_with_page_context(raw)
+            return _dedupe_hits(raw)
+
+        chroma_fut = _POOL.submit(_chroma_search)
 
         nlm_fut = None
         if nlm_eligible and not cached:
@@ -813,8 +828,8 @@ _TABLE_PARTIAL_NOTE = (
 )
 
 # Tope de caracteres de fragmentos crudos que se anexan a la extracción de tabla
-# (~12k chars ≈ 3k tokens; suficiente para TOP_K_TABLES chunks de 800 chars).
-_TABLE_RAW_CONTEXT_CHARS = 12000
+# (~24k chars ≈ 6k tokens; cubre TOP_K_TABLES chunks + expansión de páginas).
+_TABLE_RAW_CONTEXT_CHARS = 24000
 
 
 def _node_table(state: GraphState) -> GraphState:
@@ -837,9 +852,16 @@ def _node_table(state: GraphState) -> GraphState:
     # Fragmentos crudos: la fuente más fiel para no omitir filas. La respuesta
     # del answer_node ya pasó por un LLM con límite de tokens y puede haber
     # resumido; los chunks de Chroma traen el texto literal del PDF.
-    raw_chunks = "\n\n".join(
-        h.get("text", "") for h in (state.get("hits") or []) if h.get("text")
-    )[:_TABLE_RAW_CONTEXT_CHARS]
+    # Orden de documento (source, página) con sort estable: los chunks de una
+    # misma página conservan su orden de inserción (ids secuenciales).
+    _hits_sorted = sorted(
+        (h for h in (state.get("hits") or []) if h.get("text")),
+        key=lambda h: (
+            str((h.get("meta") or {}).get("source", "")),
+            (h.get("meta") or {}).get("page", 0) or 0,
+        ),
+    )
+    raw_chunks = "\n\n".join(h.get("text", "") for h in _hits_sorted)[:_TABLE_RAW_CONTEXT_CHARS]
     info = base_answer
     if raw_chunks:
         info = f"{base_answer}\n\nFRAGMENTOS LITERALES DEL DOCUMENTO:\n{raw_chunks}"
@@ -1008,6 +1030,86 @@ def _node_enrich(state: GraphState) -> GraphState:
 
 
 # ===============================
+#  Suggestion Node (preguntas de seguimiento)
+# ===============================
+_SUGGEST_PROMPT = (
+    "Eres un asistente experto en normativa eléctrica colombiana (RETIE y NTC 2050).\n"
+    "Con base en los últimos mensajes del usuario y la respuesta que recibió, "
+    "genera {n} preguntas de seguimiento CORTAS (máx. 12 palabras cada una) que "
+    "el usuario probablemente quiera hacer a continuación sobre el mismo tema.\n"
+    "Reglas:\n"
+    "- Preguntas concretas y respondibles con el RETIE o la NTC 2050.\n"
+    "- No repitas preguntas que el usuario ya hizo.\n"
+    "- Responde ÚNICAMENTE con un array JSON de strings, sin texto adicional.\n"
+    'Ejemplo: ["¿Qué calibre de conductor exige la NTC 2050 para 40 A?"]\n\n'
+    "ÚLTIMOS MENSAJES DEL USUARIO:\n{user_messages}\n\n"
+    "RESPUESTA DADA (resumen):\n{answer}\n"
+)
+
+
+def _parse_suggestions(raw: str, limit: int) -> List[str]:
+    """Extrae el array JSON de la salida del LLM (tolerante a fences/texto)."""
+    if not raw:
+        return []
+    text = raw.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.IGNORECASE).strip()
+    start, end = text.find("["), text.rfind("]")
+    if start == -1 or end <= start:
+        return []
+    try:
+        data = _json.loads(text[start:end + 1])
+    except _json.JSONDecodeError:
+        return []
+    out = [s.strip() for s in data if isinstance(s, str) and s.strip()]
+    return out[:limit]
+
+
+def _node_suggest(state: GraphState) -> GraphState:
+    """Genera preguntas de seguimiento basadas en los últimos mensajes del usuario.
+
+    Falla en silencio: cualquier error deja suggestions=[] y la respuesta sale igual.
+    """
+    if not as_bool(getattr(settings, "SUGGESTIONS_ENABLED", "true")):
+        return {"suggestions": []}
+
+    n = max(1, int(getattr(settings, "SUGGESTIONS_COUNT", 3)))
+    # Últimos 3 mensajes del usuario (historial) + la pregunta actual.
+    user_msgs = [m.get("content", "") for m in (state.get("history") or []) if m.get("role") == "user"]
+    user_msgs = [m for m in user_msgs if m][-2:] + [state.get("question", "")]
+    answer = state.get("answer", "")
+    answer_text = answer.get("formatted_response", "") if isinstance(answer, dict) else str(answer or "")
+
+    with span_ctx(
+        None, "suggest_node", as_type="chain",
+        span_input={"user_messages": user_msgs},
+    ) as span:
+        suggestions: List[str] = []
+        try:
+            prompt = _SUGGEST_PROMPT.format(
+                n=n,
+                user_messages="\n".join(f"- {m[:300]}" for m in user_msgs),
+                answer=answer_text[:600],
+            )
+            resp = _client.chat.completions.create(
+                model=_resolve_model(state.get("agent_key"), explicit=None),
+                temperature=0.7,
+                max_tokens=200,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            suggestions = _parse_suggestions(resp.choices[0].message.content or "", n)
+        except Exception as exc:
+            logger.warning("suggest_node failed: %s", exc)
+
+        if span is not None:
+            try:
+                span.update(output={"suggestions": suggestions})
+            except Exception:
+                pass
+        return {"suggestions": suggestions}
+
+
+# ===============================
 #  Stylist Node (Output Formatter)
 # ===============================
 from datetime import datetime, timezone
@@ -1058,6 +1160,7 @@ def _node_stylist(state: GraphState) -> GraphState:
                 "formatted_response": styled_text,
                 "sources": sources,
                 "sources_text": sources_text,
+                "suggestions": state.get("suggestions") or [],
                 "image": table_image,  # PNG bytes → router sends it as a photo
                 "timestamp": _utcnow_iso(),
             }
@@ -1071,6 +1174,7 @@ def _node_stylist(state: GraphState) -> GraphState:
                 "formatted_response": enriched_answer,
                 "sources": sources,
                 "sources_text": sources_text,
+                "suggestions": state.get("suggestions") or [],
                 "image": table_image,
                 "error": str(e),
                 "timestamp": _utcnow_iso(),
@@ -1120,6 +1224,7 @@ def build_graph():
     g.add_node("no_context", _node_no_context)
     g.add_node("table_node", _node_table)
     g.add_node("smalltalk_node", _node_smalltalk)
+    g.add_node("suggest_node", _node_suggest)
 
     # Entry: smalltalk responde directo; lo demás pasa por condense_node
     # (reescritura de seguimiento) y luego hybrid (Chroma+NLM) o Chroma-only.
@@ -1160,8 +1265,10 @@ def build_graph():
         lambda s: "table_node" if s.get("wants_table") else "enrich_node",
         {"table_node": "table_node", "enrich_node": "enrich_node"},
     )
-    g.add_edge("enrich_node", "stylist_node")
-    g.add_edge("table_node", "stylist_node")
+    # Tras enriquecer/tabular se generan sugerencias de seguimiento y se estiliza.
+    g.add_edge("enrich_node", "suggest_node")
+    g.add_edge("table_node", "suggest_node")
+    g.add_edge("suggest_node", "stylist_node")
     g.add_edge("stylist_node", END)
     g.add_edge("no_context", END)
 

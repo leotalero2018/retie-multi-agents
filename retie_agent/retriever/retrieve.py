@@ -272,6 +272,89 @@ def _resolve_collections(collection_name: Optional[str]) -> List[Tuple[str, Any]
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Expansión por página: para consultas de tabla, trae TODOS los chunks de las
+# páginas de los mejores hits (±1 página). Las tablas largas ocupan páginas
+# completas y el top-k semántico solo captura algunos fragmentos sueltos.
+# ──────────────────────────────────────────────────────────────────────────────
+def expand_hits_with_page_context(
+    hits: List[Dict],
+    *,
+    max_anchor_pages: int = 4,
+    page_radius: int = 1,
+    max_extra: int = 30,
+) -> List[Dict]:
+    """Complementa los hits con los chunks completos de sus páginas.
+
+    Los extras se devuelven DESPUÉS de los hits originales, ordenados por
+    (documento, página) y preservando el orden de inserción dentro de la página
+    (los ids del índice son secuenciales), para que una tabla partida en varios
+    chunks se reconstruya en el orden correcto.
+    """
+    if not hits:
+        return hits
+
+    seen_texts = {hash(h.get("text", "")) for h in hits}
+    anchors: List[Tuple[str, str, int]] = []  # (collection, doc_id, pagina)
+    seen_anchor = set()
+    for h in hits:
+        meta = h.get("meta", {}) or {}
+        doc_id = meta.get("doc_id")
+        page = meta.get("pagina", meta.get("page"))
+        col_name = h.get("collection") or settings.COLLECTION_NAMES.split(",")[0].strip()
+        if doc_id is None or not isinstance(page, int):
+            continue
+        key = (col_name, doc_id, page)
+        if key in seen_anchor:
+            continue
+        seen_anchor.add(key)
+        anchors.append(key)
+        if len(anchors) >= max_anchor_pages:
+            break
+
+    extras: List[Dict] = []
+    for col_name, doc_id, page in anchors:
+        try:
+            col = get_collection(col_name)
+            pages = [p for p in range(page - page_radius, page + page_radius + 1) if p > 0]
+            res = col.get(
+                where={"$and": [{"doc_id": {"$eq": doc_id}}, {"pagina": {"$in": pages}}]},
+                include=["documents", "metadatas"],
+            )
+        except Exception as exc:
+            logger.debug("page expansion failed for %s p%s: %s", doc_id, page, exc)
+            continue
+        ids = res.get("ids", []) or []
+        docs = res.get("documents", []) or []
+        metas = res.get("metadatas", []) or []
+        # ids secuenciales (doc_chunk_00001…) → orden natural del documento
+        order = sorted(range(len(ids)), key=lambda i: str(ids[i]))
+        for i in order:
+            text = docs[i]
+            th = hash(text or "")
+            if th in seen_texts:
+                continue
+            seen_texts.add(th)
+            extras.append({
+                "text": text,
+                "meta": metas[i] or {},
+                "score": None,
+                "retrieval_method": "page_expand",
+                "score_type": "none",
+                "collection": col_name,
+            })
+            if len(extras) >= max_extra:
+                break
+        if len(extras) >= max_extra:
+            break
+
+    extras.sort(key=lambda h: (
+        str((h.get("meta") or {}).get("doc_id", "")),
+        (h.get("meta") or {}).get("pagina", 0) or 0,
+    ))
+    return _finalize_hits(list(hits) + extras)
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # API pública
 # ──────────────────────────────────────────────────────────────────────────────
 def search(

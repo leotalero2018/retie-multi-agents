@@ -11,7 +11,13 @@ from typing import Dict, Set, Optional, List
 
 from aiogram import Router, F
 from aiogram.enums import ChatAction
-from aiogram.types import Message, BufferedInputFile
+from aiogram.types import (
+    Message,
+    BufferedInputFile,
+    CallbackQuery,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+)
 from aiogram.filters import CommandStart, Command
 
 # Run the LangGraph pipeline (instrumented for Langfuse)
@@ -50,6 +56,9 @@ CHAT_AGENT: Dict[int, str] = {}
 # "auto" = sin agente fijo → consulta todas las colecciones (norma_vigente + normas_historicas)
 DEFAULT_AGENT = "auto"
 LAST_QUERY: Dict[int, str] = {}
+# Sugerencias vigentes por chat (callback_data de Telegram limita a 64 bytes,
+# así que los botones llevan solo el índice y el texto completo vive aquí).
+SUGGESTIONS: Dict[int, List[str]] = {}
 
 
 # --- output cleaning for non-admins ---
@@ -158,18 +167,37 @@ def _finalize_for_user(result, is_admin: bool) -> str:
 _TELEGRAM_CAPTION_LIMIT = 1024
 
 
+_SUGGESTION_LABEL_MAX = 38  # ancho cómodo de botón en el cliente de Telegram
+
+
+def _build_suggestions_keyboard(message: Message, result) -> Optional[InlineKeyboardMarkup]:
+    """Construye el teclado de preguntas sugeridas y las registra para el chat."""
+    suggestions = result.get("suggestions") if isinstance(result, dict) else None
+    if not suggestions:
+        SUGGESTIONS.pop(message.chat.id, None)
+        return None
+    SUGGESTIONS[message.chat.id] = list(suggestions)
+    rows = []
+    for i, s in enumerate(suggestions):
+        label = s if len(s) <= _SUGGESTION_LABEL_MAX else s[: _SUGGESTION_LABEL_MAX - 1] + "…"
+        rows.append([InlineKeyboardButton(text=f"💬 {label}", callback_data=f"sugg:{i}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 async def _send_response(message: Message, result, is_admin: bool) -> None:
     """Entrega la respuesta al usuario: como foto si el agente generó una imagen
-    de tabla, o como texto en cualquier otro caso."""
+    de tabla, o como texto en cualquier otro caso. Anexa botones con preguntas
+    sugeridas cuando el agente las generó."""
     image = result.get("image") if isinstance(result, dict) else None
+    keyboard = _build_suggestions_keyboard(message, result)
     if image:
         caption = _finalize_for_user(result, is_admin)
         if len(caption) > _TELEGRAM_CAPTION_LIMIT:
             caption = caption[: _TELEGRAM_CAPTION_LIMIT - 1] + "…"
         photo = BufferedInputFile(image, filename="tabla.png")
-        await message.answer_photo(photo, caption=caption or None)
+        await message.answer_photo(photo, caption=caption or None, reply_markup=keyboard)
     else:
-        await message.answer(_finalize_for_user(result, is_admin))
+        await message.answer(_finalize_for_user(result, is_admin), reply_markup=keyboard)
 
 
 # --- voice transcription ---
@@ -361,6 +389,43 @@ async def on_docs(message: Message):
         await message.answer("📄 Documentos más relevantes para la última consulta:\n" + "\n".join(lines))
     except Exception as e:
         await message.answer(f"⚠️ No se pudieron recuperar documentos: {e}")
+
+
+# ----------------------- suggested questions -----------------------
+@router.callback_query(F.data.startswith("sugg:"))
+async def on_suggestion_tap(cb: CallbackQuery):
+    """El usuario tocó una pregunta sugerida → se ejecuta como pregunta normal."""
+    try:
+        idx = int((cb.data or "sugg:-1").split(":", 1)[1])
+    except ValueError:
+        idx = -1
+    chat_id = cb.message.chat.id if cb.message else None
+    questions = SUGGESTIONS.get(chat_id) or []
+    if chat_id is None or not (0 <= idx < len(questions)):
+        return await cb.answer("Esa sugerencia ya no está disponible.", show_alert=False)
+
+    q = questions[idx]
+    await cb.answer()  # cierra el spinner del botón
+    await cb.message.answer(f"❓ <i>{q}</i>")
+    await cb.message.bot.send_chat_action(chat_id, ChatAction.TYPING)
+
+    agent_key = CHAT_AGENT.get(chat_id, DEFAULT_AGENT)
+    LAST_QUERY[chat_id] = q
+    try:
+        result = await _run_graph_with_feedback(
+            cb.message,
+            q,
+            user_id=str(cb.from_user.id) if cb.from_user else "anon",
+            session=f"telegram-chat-{chat_id}",
+            agent_key=_safe_agent_key(agent_key),
+            metadata={"via": "suggestion", "channel": "telegram"},
+        )
+    except Exception as e:
+        print(f"[⚠️ run_graph error] {e}")
+        result = {"formatted_response": f"⚠️ Ocurrió un error interno: {e}"}
+
+    is_admin = _is_admin(cb.from_user.id if cb.from_user else None)
+    await _send_response(cb.message, result, is_admin)
 
 
 # ----------------------- helpers -----------------------
