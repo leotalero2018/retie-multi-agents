@@ -67,6 +67,15 @@ def get_collection(name: str | None = None):
         )
 
 
+def list_collection_names() -> list[str]:
+    """Nombres de las colecciones existentes en la DB actual."""
+    cli = _ensure_client()
+    try:
+        return [c.name for c in cli.list_collections()]
+    except Exception:
+        return []
+
+
 def drop_collection(name: str):
     cli = _ensure_client()
     try:

@@ -31,7 +31,12 @@ class Settings(BaseSettings):
     # --- RAG / Chroma ---
     CHROMA_PERSIST_DIR: str = "data/chroma_db"     # primary
     CHROMA_DB_DIR: Optional[str] = None            # legacy env; normalized to the same path
-    COLLECTION_NAME: str = "retie_docs"
+    COLLECTION_NAME: str = "retie_docs"            # legacy single-collection (compat)
+    # Colección(es) que consulta el agente (admite varias separadas por coma).
+    # El pipeline (pipeline_indexacion/indexar_normativas.py) indexa TODO en la
+    # colección única "normativas"; si no existe, el retriever cae a las
+    # colecciones disponibles en la DB.
+    COLLECTION_NAMES: str = "normativas"
     TOP_K: int = 4
     CHUNK_TOKENS: int = 800
     CHUNK_OVERLAP: int = 150

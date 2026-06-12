@@ -5,8 +5,14 @@ from typing import Optional
 
 class EnrichmentAssistant:
     def __init__(self, assistant_id: str, vector_store_id: Optional[str] = None):
-        # read custom Railway variable or fallback
-        api_key = os.getenv("Openai_API_KEY") or os.getenv("OPENAI_API_KEY")
+        # Variable custom de Railway, env estándar, o settings (.env vía pydantic,
+        # que NO exporta a os.environ — sin este fallback fallaba en local).
+        from retie_agent.config import settings
+        api_key = (
+            os.getenv("Openai_API_KEY")
+            or os.getenv("OPENAI_API_KEY")
+            or settings.OPENAI_API_KEY
+        )
         if not api_key:
             raise RuntimeError("Missing OpenAI API key. Please set Openai_API_KEY or OPENAI_API_KEY.")
         
@@ -22,7 +28,10 @@ class EnrichmentAssistant:
             f"Draft response:\n{draft_response}\n\n"
             f"Your task: Improve, enrich, and make this response more complete and accurate "
             f"using your internal knowledge base and style guidelines. "
-            f"Keep the answer in the same language as the draft."
+            f"Keep the answer in the same language as the draft.\n"
+            f"IMPORTANT: Return ONLY the improved response text, with no preamble, "
+            f"no meta-comments (e.g. 'aquí tienes una versión mejorada') and no quotes around it — "
+            f"your output goes directly to the end user."
         )
 
         thread = self.client.beta.threads.create()

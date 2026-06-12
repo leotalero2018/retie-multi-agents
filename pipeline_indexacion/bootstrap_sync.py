@@ -105,6 +105,44 @@ def _markers(dirpath: str) -> Tuple[bool, bool, list[str]]:
     shards_ok = len(shard_dirs) > 0
     return sqlite_ok, shards_ok, shard_dirs
 
+
+def _local_db_usable(dirpath: str) -> bool:
+    """Valida que la DB local tenga las colecciones esperadas Y la dimensión de
+    embeddings correcta. Un volumen con una DB vieja (otras colecciones, u otro
+    modelo de embeddings) pasaba el check de markers y dejaba el bot sin datos
+    útiles aunque MinIO ya tuviera el índice bueno."""
+    expected = [
+        n.strip() for n in
+        (os.getenv("COLLECTION_NAMES") or "normativas").split(",")
+        if n.strip()
+    ]
+    try:
+        expected_dim = int(os.getenv("EXPECTED_EMBEDDING_DIM", "1536"))
+    except ValueError:
+        expected_dim = 1536
+    try:
+        import chromadb
+        cli = chromadb.PersistentClient(path=dirpath)
+        names = {c.name for c in cli.list_collections()}
+        present = [n for n in expected if n in names]
+        if not present:
+            log.warning("[SYNC] DB local sin colecciones esperadas %s (tiene %s)",
+                        expected, sorted(names))
+            return False
+        col = cli.get_collection(present[0])
+        peek = col.peek(1)
+        embs = peek.get("embeddings")
+        if embs is not None and len(embs) > 0:
+            dim = len(embs[0])
+            if dim != expected_dim:
+                log.warning("[SYNC] DB local con embeddings de %d dims (se esperan %d) — se re-descarga",
+                            dim, expected_dim)
+                return False
+        return True
+    except Exception as e:
+        log.warning("[SYNC] No se pudo validar la DB local (%s); se asume utilizable", e)
+        return True
+
 def _download_prefix(minio_cli, bucket: str, prefix: str, local_dir: str) -> int:
     _ensure_dir(local_dir)
     try:
@@ -151,18 +189,47 @@ def sync_chroma_from_minio() -> str:
 
     # If persist already complete and not forced, keep it
     sqlite_ok, shards_ok, shard_names = _markers(persist_dir)
-    if not force and sqlite_ok and shards_ok:
+    if not force and sqlite_ok and shards_ok and _local_db_usable(persist_dir):
         log.info("[SYNC] Local dir '%s' already complete; skipping download (shards=%s).",
                  persist_dir, shard_names)
     else:
         if not bucket:
             log.info("[SYNC] MINIO_BUCKET_NAME not set; skipping MinIO download.")
         else:
+            # Prefijos candidatos: el configurado primero y luego las rutas
+            # conocidas. El pipeline de normativas sube a data/chroma_db/;
+            # despliegues con MINIO_PREFIX desactualizado encontraban 0 objetos
+            # y el bot quedaba sin índice ("No tengo evidencia" para todo).
+            candidates = [prefix]
+            for alt in ("data/chroma_db/", "chroma_db/"):
+                if alt not in candidates:
+                    candidates.append(alt)
             try:
                 client = _minio_client()
-                log.info("[SYNC] Descargando minio://%s/%s -> %s (force=%s)", bucket, prefix, persist_dir, force)
-                count = _download_prefix(client, bucket=bucket, prefix=prefix, local_dir=persist_dir)
-                log.info("[SYNC] Descarga completa. Objetos descargados: %d", count)
+                for pfx in candidates:
+                    try:
+                        # Confirmar que el prefijo tiene objetos ANTES de tocar
+                        # el directorio local (no borrar la DB por un prefijo vacío).
+                        objs = list(client.list_objects(bucket, prefix=pfx, recursive=True))
+                        if not objs:
+                            log.warning("[SYNC] Prefijo '%s' sin objetos; probando siguiente", pfx)
+                            continue
+                        # Limpiar restos de una DB anterior para no mezclar índices
+                        # (shards huérfanos de otro modelo de embeddings).
+                        for child in Path(persist_dir).iterdir():
+                            try:
+                                child.unlink() if child.is_file() else shutil.rmtree(child)
+                            except Exception as rm_err:
+                                log.warning("[SYNC] No se pudo limpiar %s: %s", child, rm_err)
+                        log.info("[SYNC] Descargando minio://%s/%s -> %s (force=%s)",
+                                 bucket, pfx, persist_dir, force)
+                        count = _download_prefix(client, bucket=bucket, prefix=pfx, local_dir=persist_dir)
+                        log.info("[SYNC] Descarga completa. Objetos descargados: %d (prefix=%s)", count, pfx)
+                        break
+                    except Exception as e:
+                        log.warning("[SYNC] Prefijo '%s' falló: %s", pfx, e)
+                else:
+                    log.error("[SYNC] Ningún prefijo candidato tenía objetos: %s", candidates)
             except Exception as e:
                 log.error("[SYNC] Falló la descarga: %s", e)
 

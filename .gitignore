@@ -101,3 +101,6 @@ pipeline_indexacion/chroma_local/
 chroma_local/
 *.bin
 *.pickle
+
+pipeline_indexacion/docs/
+indexing_run.log

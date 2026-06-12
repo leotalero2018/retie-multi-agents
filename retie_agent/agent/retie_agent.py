@@ -54,11 +54,12 @@ def _resolve_collection(agent_key: Optional[str], explicit: Optional[str]) -> st
     if agent_key and agent_key in AGENTS and getattr(AGENTS[agent_key], "collection", None):
         return AGENTS[agent_key].collection
 
-    # Fallback if no registry present
-    if agent_key == "plumber":
-        return "retie_plumber"
-    if agent_key == "pymupdf":
-        return "retie_pymupdf"
+    # Sin agente explícito: consultar TODAS las colecciones por defecto
+    # (norma_vigente + normas_historicas). search() admite nombres separados
+    # por coma y cae a las colecciones existentes si ninguna coincide.
+    names = getattr(settings, "COLLECTION_NAMES", "") or ""
+    if names.strip():
+        return names
 
     return getattr(settings, "COLLECTION_NAME", "retie_docs")
 

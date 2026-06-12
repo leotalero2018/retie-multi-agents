@@ -253,7 +253,7 @@ MAX_TOKENS=600
 TELEGRAM_BOT_TOKEN=1234567890:AAE...
 
 # ── RAG / ChromaDB ─────────────────────────────────────────────────────
-COLLECTION_NAME=retie_docs
+COLLECTION_NAMES=normativas         # colección única que consulta el agente
 CHROMA_PERSIST_DIR=./data/chroma_db
 CHUNK_TOKENS=800                    # Tokens por chunk
 CHUNK_OVERLAP=150                   # Overlap entre chunks
@@ -353,9 +353,6 @@ Al arrancar, el bot:
 | `/start` | Inicia la conversación |
 | `/help` | Lista de comandos y capacidades del bot |
 | `/clear` | Borra el historial de la conversación actual |
-| `/agent plumber` | Cambia al agente pdfplumber (colección `retie_docs`) |
-| `/agent pymupdf` | Cambia al agente PyMuPDF (colección `retie_pymupdf`) |
-| `/who` | Muestra el agente activo |
 | `/admin <contraseña>` | Acceso administrador (activa citas y fuentes) |
 | `/docs [k]` | Muestra los k documentos más relevantes (solo admin) |
 | `/logout` | Cierra la sesión de administrador |
@@ -485,25 +482,17 @@ python test_langfuse.py
 
 ---
 
-## Agentes disponibles
+## Corpus y colección única
 
-El sistema tiene dos agentes configurados en `retie_agent/agent/registry.py`, cada uno apuntando a una colección ChromaDB diferente (indexada con parser distinto):
+Todo el corpus vive en la colección ChromaDB **`normativas`** (NTC 2050 V2 + fe de erratas + RETIE Libros 1-4). No hay cambio de agentes: la respuesta siempre es híbrida (Chroma dense + BM25 + NotebookLM en paralelo) y la vigencia de cada documento queda registrada en la metadata `vigente` de cada chunk.
 
-| Agente | Comando Bot | Colección ChromaDB | Parser PDF | Ideal para |
-|--------|-------------|-------------------|------------|-----------|
-| `plumber` | `/agent plumber` | `retie_docs` | pdfplumber | Documentos con tablas y layouts complejos |
-| `pymupdf` | `/agent pymupdf` | `retie_pymupdf` | PyMuPDF | Texto fluido, respuesta más rápida |
-
-Para indexar ambas colecciones:
+Para (re)generar el índice y subirlo a MinIO (`embeddings-store/data/chroma_db/`):
 
 ```bash
-# Colección plumber
-python index_docs.py --source ./docs --out ./data/chroma_db --engine pdfplumber
-# (configura COLLECTION_NAME=retie_docs en .env)
-
-# Colección pymupdf
-COLLECTION_NAME=retie_pymupdf python index_docs.py --source ./docs --out ./data/chroma_db --engine pymupdf
+python pipeline_indexacion/indexar_normativas.py
 ```
+
+> Los embeddings se generan con el mismo modelo que usa el agente (`text-embedding-3-small`, 1536 dims). Si cambias `EMBEDDING_MODEL`, debes re-indexar.
 
 ---
 

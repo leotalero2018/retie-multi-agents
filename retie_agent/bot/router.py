@@ -47,7 +47,8 @@ def _require_admin(message: Message) -> bool:
 
 # --- chat state ---
 CHAT_AGENT: Dict[int, str] = {}
-DEFAULT_AGENT = "plumber"  # este se forzará a default collection con _safe_agent_key
+# "auto" = sin agente fijo → consulta todas las colecciones (norma_vigente + normas_historicas)
+DEFAULT_AGENT = "auto"
 LAST_QUERY: Dict[int, str] = {}
 
 
@@ -186,11 +187,12 @@ async def _to_thread_ctx(func, *args, **kwargs):
     return await loop.run_in_executor(None, lambda: ctx.run(func, *args, **kwargs))
 
 
-# Force agent keys without collection (e.g. "plumber", "pymupdf") to default collection
+# Agente único: cualquier key legacy (auto/plumber/pymupdf/vigente/historica)
+# va al comportamiento por defecto — la colección única "normativas".
 def _safe_agent_key(k: Optional[str]) -> Optional[str]:
     if not k:
         return None
-    if k.lower() in {"plumber", "pymupdf"}:
+    if k.lower() in {"auto", "plumber", "pymupdf", "vigente", "historica"}:
         return None
     return k
 
@@ -201,11 +203,10 @@ _HELP_TEXT = (
     "/start — Inicia la conversación\n"
     "/help — Muestra esta ayuda\n"
     "/clear — Borra el historial de esta conversación\n"
-    "/agent &lt;key&gt; — Cambia de agente (plumber, pymupdf)\n"
-    "/who — Muestra el agente activo\n"
     "/admin &lt;contraseña&gt; — Acceso administrador\n"
     "/docs [k] — Documentos más relevantes de la última consulta (admin)\n"
     "/logout — Cierra la sesión de administrador\n\n"
+    "Respondo sobre el RETIE y la NTC 2050 (Código Eléctrico Colombiano).\n"
     "También puedes enviar <b>notas de voz</b> e <b>imágenes</b> de documentos.\n"
     "💡 Pide una «tabla» para recibir los datos en formato tabular."
 )
@@ -238,8 +239,12 @@ async def on_agent(message: Message):
     if len(parts) < 2:
         return await message.answer("Formato: /agent <key>")
     key = parts[1].lower()
+    if key == "auto":
+        CHAT_AGENT[message.chat.id] = "auto"
+        return await message.answer("✅ Agente: auto (busca en todas las colecciones)")
     if _AGENTS and key not in _AGENTS:
-        return await message.answer("Agente inválido.")
+        opciones = ", ".join(["auto", *_AGENTS.keys()])
+        return await message.answer(f"Agente inválido. Opciones: {opciones}")
     CHAT_AGENT[message.chat.id] = key
     if _AGENTS and key in _AGENTS:
         cfg = _AGENTS[key]

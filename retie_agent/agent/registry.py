@@ -26,22 +26,15 @@ class AgentConfig:
 
 
 
+# Agente único: todo el corpus (NTC 2050 V2 + erratas + RETIE Libros 1-4) vive
+# en la colección "normativas" y la respuesta es híbrida (Chroma + NotebookLM).
+# La vigencia de cada documento queda en la metadata `vigente` de cada chunk.
 AGENTS: Dict[str, AgentConfig] = {
-    # Agente basado en PDFPlumber 
-    "plumber": AgentConfig(
-        key="plumber",
-        collection="retie_docs",
-        chat_model="gpt-4o-mini",    
+    "normativas": AgentConfig(
+        key="normativas",
+        collection="normativas",
+        chat_model="gpt-4o-mini",
         top_k=4,
-        system_prompt="Eres un asistente experto en RETIE. Sé preciso y cita [archivo, página]."
+        system_prompt="Eres un asistente experto en normativa eléctrica colombiana (RETIE y NTC 2050). Sé preciso y cita [archivo, página].",
     ),
-    # Agente PyMuPDF
-    "pymupdf": AgentConfig(
-        key="pymupdf",
-        collection="retie_pymupdf",
-        chat_model="gpt-4o-mini",          
-        top_k=4,
-        system_prompt="Eres un asistente técnico. Responde completo y con citas exactas [archivo, página]."
-    ),
-
 }

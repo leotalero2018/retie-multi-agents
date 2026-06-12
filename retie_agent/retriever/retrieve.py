@@ -9,7 +9,7 @@ from collections import OrderedDict
 from typing import Any, Dict, List, Optional, Tuple
 
 from retie_agent.config import settings, as_bool
-from retie_agent.retriever.chroma_client import get_collection
+from retie_agent.retriever.chroma_client import get_collection, list_collection_names
 from retie_agent.llm.embedder import embed_texts
 
 logger = logging.getLogger(__name__)
@@ -218,6 +218,60 @@ def _rrf_fuse(ranked_lists: List[Tuple[List[Dict], float]], top_k: int, rrf_k: i
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Normalización de metadata: el pipeline de normativas indexa doc_name/pagina,
+# mientras el agente (dedupe, citas, trazas) espera source/page. Se completan
+# las claves esperadas sin perder las originales.
+# ──────────────────────────────────────────────────────────────────────────────
+def _normalize_meta(meta: Dict) -> Dict:
+    if not isinstance(meta, dict):
+        return {}
+    if not meta.get("source"):
+        src = meta.get("doc_name") or meta.get("doc_id")
+        if src:
+            meta["source"] = src
+    if meta.get("page") is None and meta.get("pagina") is not None:
+        meta["page"] = meta["pagina"]
+    return meta
+
+
+def _finalize_hits(hits: List[Dict]) -> List[Dict]:
+    for h in hits:
+        h["meta"] = _normalize_meta(h.get("meta", {}) or {})
+    return hits
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Resolución de colecciones: acepta nombres separados por coma y, si ninguna
+# de las configuradas existe (p. ej. COLLECTION_NAME obsoleto tras reindexar),
+# cae a las colecciones realmente presentes en la DB en vez de devolver vacío.
+# ──────────────────────────────────────────────────────────────────────────────
+def _resolve_collections(collection_name: Optional[str]) -> List[Tuple[str, Any]]:
+    requested = collection_name or getattr(settings, "COLLECTION_NAMES", "") or settings.COLLECTION_NAME
+    names = [n.strip() for n in str(requested).split(",") if n.strip()]
+
+    cols: List[Tuple[str, Any]] = []
+    for name in names:
+        try:
+            cols.append((name, get_collection(name)))
+        except Exception as exc:
+            logger.warning("Collection '%s' no disponible: %s", name, exc)
+
+    if not cols:
+        available = list_collection_names()
+        if available:
+            logger.warning(
+                "Ninguna de las colecciones configuradas %s existe; usando las disponibles: %s",
+                names, available,
+            )
+            for name in available:
+                try:
+                    cols.append((name, get_collection(name)))
+                except Exception:
+                    pass
+    return cols
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # API pública
 # ──────────────────────────────────────────────────────────────────────────────
 def search(
@@ -226,13 +280,13 @@ def search(
     collection_name: Optional[str] = None,
     distance_threshold: Optional[float] = None,
 ) -> List[Dict]:
-    """Recuperación híbrida:
+    """Recuperación híbrida sobre una o varias colecciones:
       1. Dense (embedding de la consulta, mismo modelo del índice) con umbral
          de distancia coseno (settings.RAG_DISTANCE_THRESHOLD).
       2. BM25 léxico sobre un índice cacheado por colección.
       3. Búsqueda dirigida cuando la consulta cita "artículo/tabla/anexo N".
-      Las listas se combinan con Reciprocal Rank Fusion; si el dense falla por
-      completo, BM25 actúa como fallback. Devuelve a lo sumo top_k hits.
+      `collection_name` admite varios nombres separados por coma; las listas
+      se combinan con Reciprocal Rank Fusion. Devuelve a lo sumo top_k hits.
     """
     k = top_k or settings.TOP_K
     thr = float(distance_threshold) if distance_threshold is not None else settings.RAG_DISTANCE_THRESHOLD
@@ -240,58 +294,81 @@ def search(
     fusion_enabled = as_bool(getattr(settings, "BM25_FUSION_ENABLED", "true"))
     rrf_k = int(getattr(settings, "RRF_K", 60))
 
-    col = get_collection(collection_name)
-    col_name = collection_name or settings.COLLECTION_NAME
+    cols = _resolve_collections(collection_name)
+    if not cols:
+        logger.error("No hay colecciones disponibles en la DB de Chroma")
+        return []
 
-    # 1) Dense retrieval
-    dense_hits: List[Dict] = []
     query_emb: Optional[List[float]] = None
     try:
         query_emb = _embed_query_cached(query)
-        res = col.query(
-            query_embeddings=[query_emb],
-            n_results=fetch_k,
-            include=["documents", "distances", "metadatas"],
-        )
-        docs = res.get("documents", [[]])[0] or []
-        metas = res.get("metadatas", [[]])[0] or []
-        dists = res.get("distances", [[]])[0] or []
-        for d, m, dist in zip(docs, metas, dists):
-            if dist <= thr:
-                dense_hits.append({
-                    "text": d,
-                    "meta": m or {},
-                    "score": float(dist),
-                    "retrieval_method": "dense",
-                    "score_type": "cosine_distance",  # menor = mejor
-                })
     except Exception as exc:
-        logger.warning("Dense retrieval failed (%s); relying on BM25 fallback", exc)
+        logger.warning("Query embedding failed (%s); relying on BM25 only", exc)
 
-    # 2) BM25 léxico (índice cacheado)
-    bm25_hits: List[Dict] = []
+    # 1) Dense retrieval (las distancias coseno son comparables entre colecciones
+    #    porque comparten el modelo de embeddings → merge directo por score)
+    dense_hits: List[Dict] = []
+    if query_emb is not None:
+        for col_name, col in cols:
+            try:
+                res = col.query(
+                    query_embeddings=[query_emb],
+                    n_results=fetch_k,
+                    include=["documents", "distances", "metadatas"],
+                )
+                docs = res.get("documents", [[]])[0] or []
+                metas = res.get("metadatas", [[]])[0] or []
+                dists = res.get("distances", [[]])[0] or []
+                for d, m, dist in zip(docs, metas, dists):
+                    if dist <= thr:
+                        dense_hits.append({
+                            "text": d,
+                            "meta": m or {},
+                            "score": float(dist),
+                            "retrieval_method": "dense",
+                            "score_type": "cosine_distance",  # menor = mejor
+                            "collection": col_name,
+                        })
+            except Exception as exc:
+                logger.warning("Dense retrieval failed on '%s': %s", col_name, exc)
+        dense_hits.sort(key=lambda h: h["score"])
+        dense_hits = dense_hits[:fetch_k]
+
+    # 2) BM25 léxico (índice cacheado por colección; cada colección aporta su
+    #    propia lista rankeada — los scores BM25 no son comparables entre corpus)
+    bm25_lists: List[List[Dict]] = []
     if BM25Okapi is not None and (fusion_enabled or not dense_hits):
-        idx = _get_bm25_index(col, col_name)
-        if idx is not None:
-            bm25_hits = _bm25_search(idx, query, fetch_k)
+        for col_name, col in cols:
+            idx = _get_bm25_index(col, col_name)
+            if idx is not None:
+                hits = _bm25_search(idx, query, fetch_k)
+                if hits:
+                    for h in hits:
+                        h["collection"] = col_name
+                    bm25_lists.append(hits)
 
     # 3) Búsqueda dirigida por referencia estructural ("artículo 20.3", "tabla 13.1")
     struct_hits: List[Dict] = []
     refs = _struct_refs(query)
     if refs and query_emb is not None:
-        struct_hits = _struct_search(col, query_emb, refs, k)
+        for col_name, col in cols:
+            col_struct = _struct_search(col, query_emb, refs, k)
+            for h in col_struct:
+                h["collection"] = col_name
+            struct_hits.extend(col_struct)
+        struct_hits.sort(key=lambda h: h["score"])
 
     # Fusión / fallback
     lists: List[Tuple[List[Dict], float]] = []
     if dense_hits:
         lists.append((dense_hits, 1.0))
-    if bm25_hits:
-        lists.append((bm25_hits, 0.7))
+    for bl in bm25_lists:
+        lists.append((bl, 0.7))
     if struct_hits:
         lists.append((struct_hits, 1.2))  # la cita literal pesa más
 
     if not lists:
         return []
     if len(lists) == 1:
-        return lists[0][0][:k]
-    return _rrf_fuse(lists, k, rrf_k)
+        return _finalize_hits(lists[0][0][:k])
+    return _finalize_hits(_rrf_fuse(lists, k, rrf_k))

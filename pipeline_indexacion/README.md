@@ -6,14 +6,16 @@ Indexa los PDFs de normativas eléctricas colombianas en ChromaDB y sincroniza l
 
 ## Documentos indexados
 
-| doc_id | Archivo | Colección |
+Todos los documentos se indexan en la **colección única `normativas`**; la vigencia queda en la metadata `vigente` de cada chunk.
+
+| doc_id | Archivo | vigente |
 |---|---|---|
-| `ntc2050_v2` | NTC 2050 V2 - Código Eléctrico Colombiano | `norma_vigente` |
-| `ntc2050_erratas` | NTC 2050 - Fe de Erratas | `norma_vigente` |
-| `retie_libro1` | RETIE Libro 1 - Disposiciones Generales | `normas_historicas` |
-| `retie_libro2` | RETIE Libro 2 - Productos | `normas_historicas` |
-| `retie_libro3` | RETIE Libro 3 - Instalaciones | `normas_historicas` |
-| `retie_libro4` | RETIE Libro 4 - Evaluación de la Conformidad | `normas_historicas` |
+| `ntc2050_v2` | NTC 2050 V2 - Código Eléctrico Colombiano | ✅ |
+| `ntc2050_erratas` | NTC 2050 - Fe de Erratas | ✅ |
+| `retie_libro1` | RETIE Libro 1 - Disposiciones Generales | — |
+| `retie_libro2` | RETIE Libro 2 - Productos | — |
+| `retie_libro3` | RETIE Libro 3 - Instalaciones | — |
+| `retie_libro4` | RETIE Libro 4 - Evaluación de la Conformidad | — |
 
 Los PDFs deben estar en `pipeline_indexacion/docs/`.
 
@@ -35,7 +37,7 @@ Desde la raíz del proyecto:
 pip install chromadb langchain langchain-community pypdf sentence-transformers minio python-dotenv
 ```
 
-> La primera ejecución descarga el modelo de embeddings `paraphrase-multilingual-mpnet-base-v2` (~440 MB). Las siguientes lo usan desde caché local.
+> Los embeddings se generan con OpenAI `text-embedding-3-small` (1536 dims) vía `retie_agent/llm/embedder.py` — **el mismo modelo con el que el agente embebe las consultas**. Requiere `OPENAI_API_KEY` en el `.env`. (El modelo HuggingFace local anterior, de 768 dims, producía un índice incompatible con el agente desplegado.)
 
 ### 3. Credenciales MinIO
 
@@ -72,16 +74,16 @@ python pipeline_indexacion/indexar_normativas.py
 ```
 1. Carga credenciales desde .env
 2. Conecta a MinIO y verifica que el bucket "embeddings-store" exista
-3. Elimina data/chroma_db/ del bucket (limpia la indexación anterior)
-4. Descarga/carga el modelo de embeddings (HuggingFace, local)
-5. Por cada PDF:
+3. Por cada PDF:
    a. Carga el archivo con PyPDFLoader
-   b. Divide en chunks (800 tokens, overlap 150)
+   b. Divide en chunks (800 caracteres, overlap 150)
    c. Agrega metadata: doc_id, colección, página, alias, vigencia...
-   d. Indexa en ChromaDB local (pipeline_indexacion/chroma_local/)
-6. Imprime resumen de chunks por colección
-7. Sube todos los archivos de chroma_local/ a MinIO → data/chroma_db/
-8. Confirma total de archivos subidos
+   d. Embebe con OpenAI text-embedding-3-small (1536 dims, igual que el agente)
+   e. Indexa en ChromaDB local (pipeline_indexacion/chroma_local/, distancia coseno)
+4. Imprime resumen de chunks por colección
+5. SOLO si la indexación terminó bien: elimina data/chroma_db/ del bucket
+6. Sube todos los archivos de chroma_local/ a MinIO → data/chroma_db/
+7. Confirma total de archivos subidos
 ```
 
 ### Salida esperada
@@ -125,10 +127,7 @@ embeddings-store/
 └── data/
     └── chroma_db/
         ├── chroma.sqlite3
-        ├── <uuid-norma_vigente>/
-        │   ├── data_level0.bin
-        │   └── ...
-        └── <uuid-normas_historicas>/
+        └── <uuid-normativas>/
             ├── data_level0.bin
             └── ...
 ```
