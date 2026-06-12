@@ -460,6 +460,9 @@ def _node_hybrid_retrieve(state: GraphState) -> GraphState:
     soft_timeout = float(getattr(settings, "NOTEBOOKLM_SOFT_TIMEOUT", 12.0))
     min_chars = int(getattr(settings, "NOTEBOOKLM_MIN_QUERY_CHARS", 12))
     sem_sim = float(getattr(settings, "NLM_SEMANTIC_CACHE_SIM", 0.93))
+    # Modo "siempre ambos": no se salta NLM ni se recorta su espera.
+    always_wait = as_bool(getattr(settings, "NOTEBOOKLM_ALWAYS_WAIT", "true"))
+    hard_timeout = float(getattr(settings, "NOTEBOOKLM_HARD_TIMEOUT", 180.0))
 
     nlm_eligible = len(q.strip()) >= min_chars
     cache = _get_nlm_cache()
@@ -519,13 +522,17 @@ def _node_hybrid_retrieve(state: GraphState) -> GraphState:
             and h.get("score_type", "cosine_distance") == "cosine_distance"
         ]
         best_score = min(scores) if scores else 1.0
-        high_confidence = bool(hits and best_score < conf_thr and not wants_table)
-        # Espera adaptativa: Chroma y NLM se ayudan — con evidencia decente de
-        # Chroma se espera poco a NLM (la respuesta puede salir solo con Chroma);
-        # sin evidencia, NLM es la única fuente y se le da el timeout completo;
+        # En modo always_wait NUNCA se salta NLM: la respuesta siempre es híbrida.
+        high_confidence = bool(
+            hits and best_score < conf_thr and not wants_table and not always_wait
+        )
+        # Espera adaptativa (solo con NOTEBOOKLM_ALWAYS_WAIT=false): con evidencia
+        # decente de Chroma se espera poco a NLM; sin evidencia, timeout completo;
         # las tablas necesitan a NLM sí o sí → presupuesto propio más amplio.
         decent = bool(hits and best_score < decent_thr and not wants_table)
-        if wants_table:
+        if always_wait:
+            nlm_wait = hard_timeout
+        elif wants_table:
             nlm_wait = float(getattr(settings, "NOTEBOOKLM_TABLE_TIMEOUT", 45.0))
         elif decent:
             nlm_wait = soft_timeout

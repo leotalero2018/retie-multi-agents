@@ -71,6 +71,11 @@ class Settings(BaseSettings):
     NOTEBOOKLM_PAGE_TIMEOUT_MS: int = 15000
     # Hybrid RAG settings
     NOTEBOOKLM_CACHE_TTL: int = 3600          # seconds to cache NLM responses in memory
+    # Modo "siempre ambos": la respuesta SIEMPRE combina Chroma + NotebookLM y
+    # se espera a NLM hasta NOTEBOOKLM_HARD_TIMEOUT, sin importar la confianza
+    # de Chroma. Con "false" se activa la espera adaptativa (timeouts de abajo).
+    NOTEBOOKLM_ALWAYS_WAIT: str = "true"
+    NOTEBOOKLM_HARD_TIMEOUT: float = 180.0     # tope absoluto de espera a NLM
     NOTEBOOKLM_PARALLEL_TIMEOUT: float = 25.0  # max seconds to wait for NLM in parallel mode
     CHROMA_HIGH_CONFIDENCE_THR: float = 0.25   # skip NLM when Chroma best score < this
     # Espera adaptativa: con evidencia "decente" de Chroma (mejor distancia <

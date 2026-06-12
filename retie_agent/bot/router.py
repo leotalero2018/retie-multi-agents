@@ -187,6 +187,38 @@ async def _to_thread_ctx(func, *args, **kwargs):
     return await loop.run_in_executor(None, lambda: ctx.run(func, *args, **kwargs))
 
 
+# Entrega con feedback: el "typing" de Telegram expira a los ~5s, así que en
+# consultas largas (NotebookLM puede tardar >30s) el chat parecía muerto.
+# Mantiene el typing vivo y, pasado un umbral, avisa que se está consultando.
+_PROGRESS_NOTICE = (
+    "🔎 Estoy consultando la base normativa y NotebookLM para darte una "
+    "respuesta completa; puede tardar un poco más…"
+)
+_PROGRESS_AFTER_S = 10.0
+_TYPING_REFRESH_S = 4.0
+
+
+async def _run_graph_with_feedback(message: Message, *args, **kwargs):
+    task = asyncio.create_task(_to_thread_ctx(run_graph, *args, **kwargs))
+    elapsed = 0.0
+    notified = False
+    while True:
+        done, _ = await asyncio.wait({task}, timeout=_TYPING_REFRESH_S)
+        if done:
+            return task.result()
+        elapsed += _TYPING_REFRESH_S
+        try:
+            await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
+        except Exception:
+            pass
+        if not notified and elapsed >= _PROGRESS_AFTER_S:
+            notified = True
+            try:
+                await message.answer(_PROGRESS_NOTICE)
+            except Exception:
+                pass
+
+
 # Agente único: cualquier key legacy (auto/plumber/pymupdf/vigente/historica)
 # va al comportamiento por defecto — la colección única "normativas".
 def _safe_agent_key(k: Optional[str]) -> Optional[str]:
@@ -433,8 +465,8 @@ async def on_voice(message: Message):
     LAST_QUERY[message.chat.id] = transcript
 
     # Ejecuta LangGraph (con su propia traza 'LangGraph')
-    raw_resp = await _to_thread_ctx(
-        run_graph,
+    raw_resp = await _run_graph_with_feedback(
+        message,
         transcript,
         user_id=str(message.from_user.id) if message.from_user else "anon",
         session=f"telegram-chat-{message.chat.id}",
@@ -477,8 +509,8 @@ async def on_photo(message: Message):
     question = _compose_question_from_image(message.caption or "", ocr_txt, vision_txt)
     LAST_QUERY[message.chat.id] = question
 
-    raw_resp = await _to_thread_ctx(
-        run_graph,
+    raw_resp = await _run_graph_with_feedback(
+        message,
         question,
         user_id=str(message.from_user.id) if message.from_user else "anon",
         session=f"telegram-chat-{message.chat.id}",
@@ -510,8 +542,8 @@ async def on_text(message: Message):
     # Step 1️⃣: Run the LangGraph pipeline safely
     result = None
     try:
-        result = await _to_thread_ctx(
-            run_graph,
+        result = await _run_graph_with_feedback(
+            message,
             q,
             user_id=str(message.from_user.id) if message.from_user else "anon",
             session=f"telegram-chat-{message.chat.id}",

@@ -266,13 +266,17 @@ HISTORY_LIMIT=10                    # Mensajes de historial por sesión
 
 # ── NotebookLM (híbrido) ───────────────────────────────────────────────
 NOTEBOOKLM_ENABLED=true
+NOTEBOOKLM_ALWAYS_WAIT=true         # true = SIEMPRE Chroma + NLM, espera completa
+NOTEBOOKLM_HARD_TIMEOUT=180         # Tope absoluto de espera a NLM (always_wait)
+NLM_SEMANTIC_CACHE_SIM=0.93         # Reusa respuesta NLM de pregunta similar (0=off)
+NOTEBOOKLM_MIN_QUERY_CHARS=12       # Preguntas más cortas no consultan NLM
+
+# Espera adaptativa — SOLO aplica con NOTEBOOKLM_ALWAYS_WAIT=false:
 NOTEBOOKLM_PARALLEL_TIMEOUT=25      # Espera máx. a NLM sin evidencia Chroma
 NOTEBOOKLM_SOFT_TIMEOUT=12          # Espera si Chroma ya tiene evidencia decente
 NOTEBOOKLM_TABLE_TIMEOUT=45         # Espera para tablas (dependen de NLM)
 CHROMA_HIGH_CONFIDENCE_THR=0.25     # Mejor distancia < esto → no se espera a NLM
 CHROMA_DECENT_THR=0.40              # Mejor distancia < esto → espera corta (soft)
-NLM_SEMANTIC_CACHE_SIM=0.93         # Reusa respuesta NLM de pregunta similar (0=off)
-NOTEBOOKLM_MIN_QUERY_CHARS=12       # Preguntas más cortas no consultan NLM
 
 # ── Enriquecimiento ────────────────────────────────────────────────────
 ENRICHMENT_ENABLED=true             # false = omite el assistant (~2x más rápido)
