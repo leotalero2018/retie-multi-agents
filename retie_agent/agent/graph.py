@@ -252,7 +252,10 @@ def _node_answer(state: GraphState) -> GraphState:
     messages.append({"role": "user", "content": prompt})
 
     temperature = 0.0
-    max_tokens = getattr(settings, "MAX_TOKENS", 600)
+    # Tables need more tokens to reproduce all rows; regular answers stay at default.
+    wants_table = state.get("wants_table", False)
+    default_max = getattr(settings, "MAX_TOKENS", 600)
+    max_tokens = 2000 if wants_table else default_max
 
     with span_ctx(
         None, "answer_node",
