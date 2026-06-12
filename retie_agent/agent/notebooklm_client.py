@@ -343,10 +343,13 @@ class NotebookLMClient:
             is_session_error = any(
                 k in msg for k in ("session", "already connected", "no transport", "transport")
             )
+            # Un 500 genérico suele ser un transporte/pestaña en mal estado del
+            # lado del servidor; un reintento con sesión fresca lo resuelve.
+            is_server_error = "http 500" in msg or "internal server error" in msg
             is_timeout = any(
                 k in msg for k in ("timeout", "page.click", "intercept")
             )
-            if not (is_session_error or is_timeout):
+            if not (is_session_error or is_timeout or is_server_error):
                 raise
 
             logger.warning(
@@ -354,7 +357,7 @@ class NotebookLMClient:
                 str(exc).splitlines()[0],
             )
             # A stale MCP transport needs a brand-new protocol session…
-            if is_session_error:
+            if is_session_error or is_server_error:
                 self._mcp_session = None
                 self._clear_session_cache()
             # …and either way, drop the conversational session so the retry opens

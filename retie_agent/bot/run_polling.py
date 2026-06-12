@@ -95,15 +95,73 @@ async def _setup_nlm_server() -> None:
                             "clientInfo": {"name": "healthcheck", "version": "0"},
                         },
                     },
+                    headers={
+                        "Content-Type": "application/json",
+                        # Sin Accept dual el server responde 406 Not Acceptable.
+                        "Accept": "application/json, text/event-stream",
+                    },
                     timeout=5,
                 )
             if resp.status_code < 500:
                 logging.info("[NLM] MCP server ready at %s", mcp_url)
+                await _diagnose_nlm(nlm_url)
                 return
         except Exception:
             pass
 
     logging.warning("[NLM] Server not ready after %ds — NLM disabled for this session", startup_timeout)
+
+
+async def _diagnose_nlm(nlm_url: str) -> None:
+    """Diagnóstico de arranque: ¿hay sesión de Google? ¿qué notebooks existen?
+
+    Convierte el genérico "HTTP 500 internal server error" en logs accionables:
+    sin esto era imposible saber si el problema era la sesión vencida o un
+    NOTEBOOKLM_NOTEBOOK_ID que no existe en la librería del servidor.
+    """
+    import json as _json
+
+    def _run_diagnosis() -> None:
+        from retie_agent.agent.notebooklm_client import NotebookLMClient
+        client = NotebookLMClient(base_url=nlm_url, timeout=30.0)
+
+        if client.is_authenticated():
+            logging.info("[NLM] Sesión de Google válida ✓")
+        else:
+            logging.warning(
+                "[NLM] ⚠️ SIN sesión de Google válida — las consultas a NotebookLM "
+                "fallarán. Regenera la sesión en local (python setup_notebooklm.py) "
+                "y súbela a MinIO con: python setup_notebooklm.py --upload"
+            )
+
+        configured = getattr(settings, "NOTEBOOKLM_NOTEBOOK_ID", None)
+        try:
+            resp = client._call_tool("list_notebooks", {})
+            content = resp.get("result", {}).get("content", [])
+            text = content[0].get("text", "{}") if isinstance(content, list) and content else "{}"
+            data = _json.loads(text) if isinstance(text, str) else (text or {})
+            notebooks = data.get("notebooks", []) if isinstance(data, dict) else []
+            ids = [nb.get("id") for nb in notebooks]
+            for nb in notebooks:
+                logging.info("[NLM] notebook disponible: [%s] %s", nb.get("id"), nb.get("title", "?"))
+            if configured and ids and configured not in ids:
+                logging.warning(
+                    "[NLM] ⚠️ NOTEBOOKLM_NOTEBOOK_ID=%r NO está en la librería del "
+                    "servidor (disponibles: %s). Corrige la variable en Railway.",
+                    configured, ids,
+                )
+            elif not notebooks:
+                logging.warning(
+                    "[NLM] La librería del servidor no tiene notebooks registrados; "
+                    "agrégalo con setup_notebooklm.py y vuelve a subir la sesión."
+                )
+        except Exception as exc:
+            logging.warning("[NLM] No se pudo listar notebooks: %s", exc)
+
+    try:
+        await asyncio.get_running_loop().run_in_executor(None, _run_diagnosis)
+    except Exception as exc:
+        logging.warning("[NLM] Diagnóstico falló: %s", exc)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
