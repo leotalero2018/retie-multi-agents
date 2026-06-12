@@ -14,6 +14,16 @@ def as_bool(value: object) -> bool:
     return str(value).strip().lower() in ("1", "true", "yes", "on")
 
 
+# ── Saneo del entorno ANTES de cargar Settings ────────────────────────────────
+# Caso real en Railway: `NOTEBOOKLM_ENABLED ="true"` (espacio antes del `=`)
+# crea una env var llamada "NOTEBOOKLM_ENABLED " que pydantic nunca encuentra,
+# dejando el flag en su default. Se duplica bajo el nombre limpio.
+for _k in list(os.environ):
+    _ks = _k.strip()
+    if _ks and _ks != _k and _ks not in os.environ:
+        os.environ[_ks] = os.environ[_k]
+
+
 class Settings(BaseSettings):
     # --- Providers / keys ---
     OPENAI_API_KEY: Optional[str] = Field(default=None, description="OpenAI API key")
@@ -119,6 +129,24 @@ class Settings(BaseSettings):
 
 
 settings = Settings()
+
+# ── Saneo de valores ──────────────────────────────────────────────────────────
+# El editor raw de Railway conserva comillas y espacios como parte del VALOR
+# (`URL="http://x:3000 "` llega con comillas y espacio final). Un espacio en la
+# URL de NotebookLM o una comilla en una key rompen la integración en silencio.
+def _clean_setting_str(v: str) -> str:
+    s = v.strip()
+    while len(s) >= 2 and s[0] == s[-1] and s[0] in ('"', "'"):
+        s = s[1:-1].strip()
+    return s
+
+
+for _name in type(settings).model_fields:
+    _val = getattr(settings, _name, None)
+    if isinstance(_val, str):
+        _cleaned = _clean_setting_str(_val)
+        if _cleaned != _val:
+            setattr(settings, _name, _cleaned)
 
 # ---- Post-load normalization / compatibility ----
 # Prefer CHROMA_PERSIST_DIR; keep CHROMA_DB_DIR as a mirror for legacy imports.
