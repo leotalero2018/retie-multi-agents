@@ -19,6 +19,7 @@ from aiogram.types import (
     InlineKeyboardButton,
 )
 from aiogram.filters import CommandStart, Command
+from aiogram.exceptions import TelegramBadRequest
 
 # Run the LangGraph pipeline (instrumented for Langfuse)
 from retie_agent.agent.graph import run_graph
@@ -165,6 +166,55 @@ def _finalize_for_user(result, is_admin: bool) -> str:
 
 
 _TELEGRAM_CAPTION_LIMIT = 1024
+# Límite real de Telegram: 4096 chars. Margen para no rozar el borde con
+# entidades HTML que Telegram cuenta distinto.
+_TELEGRAM_TEXT_LIMIT = 4000
+
+
+def _split_for_telegram(text: str, limit: int = _TELEGRAM_TEXT_LIMIT) -> List[str]:
+    """Divide un mensaje largo en partes aptas para Telegram.
+
+    Corta preferentemente por párrafos y trata los bloques <pre> como unidades
+    indivisibles (su alineación de tabla depende de no partirse). Una unidad
+    que por sí sola excede el límite se corta por líneas como último recurso.
+    """
+    if len(text) <= limit:
+        return [text]
+
+    # Tokenizar: bloques <pre> intactos + párrafos del resto
+    units: List[str] = []
+    for token in re.split(r"(<pre>.*?</pre>)", text, flags=re.DOTALL | re.IGNORECASE):
+        if not token:
+            continue
+        if token.lower().startswith("<pre>"):
+            units.append(token)
+        else:
+            units.extend(p for p in re.split(r"\n{2,}", token) if p.strip())
+
+    parts: List[str] = []
+    current = ""
+    for unit in units:
+        candidate = f"{current}\n\n{unit}" if current else unit
+        if len(candidate) <= limit:
+            current = candidate
+            continue
+        if current:
+            parts.append(current)
+            current = ""
+        if len(unit) <= limit:
+            current = unit
+            continue
+        # Unidad gigante: cortar por líneas; por duro si una línea no cabe.
+        while len(unit) > limit:
+            cut = unit.rfind("\n", limit // 2, limit)
+            if cut == -1:
+                cut = limit
+            parts.append(unit[:cut])
+            unit = unit[cut:].lstrip("\n")
+        current = unit
+    if current:
+        parts.append(current)
+    return parts or [text[:limit]]
 
 
 _SUGGESTION_LABEL_MAX = 38  # ancho cómodo de botón en el cliente de Telegram
@@ -186,8 +236,8 @@ def _build_suggestions_keyboard(message: Message, result) -> Optional[InlineKeyb
 
 async def _send_response(message: Message, result, is_admin: bool) -> None:
     """Entrega la respuesta al usuario: como foto si el agente generó una imagen
-    de tabla, o como texto en cualquier otro caso. Anexa botones con preguntas
-    sugeridas cuando el agente las generó."""
+    de tabla, o como texto (particionado si excede el límite de Telegram).
+    Anexa botones con preguntas sugeridas cuando el agente las generó."""
     image = result.get("image") if isinstance(result, dict) else None
     keyboard = _build_suggestions_keyboard(message, result)
     if image:
@@ -196,8 +246,21 @@ async def _send_response(message: Message, result, is_admin: bool) -> None:
             caption = caption[: _TELEGRAM_CAPTION_LIMIT - 1] + "…"
         photo = BufferedInputFile(image, filename="tabla.png")
         await message.answer_photo(photo, caption=caption or None, reply_markup=keyboard)
-    else:
-        await message.answer(_finalize_for_user(result, is_admin), reply_markup=keyboard)
+        return
+
+    text = _finalize_for_user(result, is_admin)
+    parts = _split_for_telegram(text)
+    total = len(parts)
+    for i, part in enumerate(parts):
+        if total > 1:
+            part = f"{part}\n\n<i>({i + 1}/{total})</i>" if i < total - 1 else part
+        # Botones solo en el último mensaje, junto al cierre de la respuesta.
+        kb = keyboard if i == total - 1 else None
+        try:
+            await message.answer(part, reply_markup=kb)
+        except TelegramBadRequest:
+            # HTML roto por el corte (tag partido) → reenviar como texto plano.
+            await message.answer(re.sub(r"<[^>]+>", "", part), reply_markup=kb, parse_mode=None)
 
 
 # --- voice transcription ---

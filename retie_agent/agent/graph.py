@@ -44,6 +44,7 @@ class GraphState(TypedDict, total=False):
     metadata: Optional[Dict[str, Any]]  # new, for passing channel info
     history: List[Dict[str, str]]
     wants_table: bool       # user asked for a "tabla" → route through table_node
+    wants_full: bool        # user asked for an exhaustive answer (todos los numerales…)
     table_image: Any        # PNG bytes when the table is rendered as an image
     nlm_answer: Optional[str]  # NotebookLM answer from parallel hybrid retrieve
     search_query: Optional[str]  # standalone query (condensed from history) used for retrieval
@@ -56,6 +57,21 @@ _TABLE_RE = re.compile(r"\btablas?\b", re.IGNORECASE)
 
 def _wants_table(text: str) -> bool:
     return bool(_TABLE_RE.search(text or ""))
+
+
+# Intención de respuesta EXHAUSTIVA ("dame todos los numerales", "la lista
+# completa", "sin omitir"): requiere más contexto recuperado y más tokens de
+# salida — los artículos con literales a)–y) no caben en el presupuesto normal.
+_FULL_RE = re.compile(
+    r"\b(todos?|todas?|completa|completos?|completas?|sin\s+omitir|"
+    r"lista\s+completa|al\s+pie\s+de\s+la\s+letra|literal(?:es)?|"
+    r"numerales?|cada\s+uno|exhaustiv[oa])\b",
+    re.IGNORECASE,
+)
+
+
+def _wants_full(text: str) -> bool:
+    return bool(_FULL_RE.search(text or ""))
 
 
 # Saludos / cortesías: se responden al instante, sin retrieval ni NotebookLM.
@@ -269,10 +285,12 @@ def _node_retrieve(state: GraphState) -> GraphState:
     q = state.get("search_query") or state["question"]
     agent_key = state.get("agent_key")
     coll = _resolve_collection(agent_key, explicit=None)
-    # Tablas: más chunks — las tablas largas viven partidas en varios fragmentos.
+    # Tablas y respuestas exhaustivas: más chunks — el contenido largo
+    # (tablas, artículos con literales a–y) vive partido en varios fragmentos.
+    needs_breadth = state.get("wants_table") or state.get("wants_full")
     top_k = (
         getattr(settings, "TOP_K_TABLES", 12)
-        if state.get("wants_table")
+        if needs_breadth
         else getattr(settings, "TOP_K", 4)
     )
     thr = getattr(settings, "RAG_DISTANCE_THRESHOLD", 0.45)
@@ -286,10 +304,10 @@ def _node_retrieve(state: GraphState) -> GraphState:
     with span_ctx(None, "retrieve", as_type="retriever", span_input=span_input) as span:
         try:
             raw_hits = search(q, top_k=top_k, collection_name=coll)
-            # Tablas: NO deduplicar por (source, page) — una página suele tener
-            # varios chunks y todos pueden contener filas. Se expande además a
-            # las páginas completas de los mejores hits.
-            if state.get("wants_table"):
+            # Tablas/exhaustivas: NO deduplicar por (source, page) — una página
+            # suele tener varios chunks y todos pueden contener filas o literales.
+            # Se expande además a las páginas completas de los mejores hits.
+            if needs_breadth:
                 hits = expand_hits_with_page_context(raw_hits)
             else:
                 hits = _dedupe_hits(raw_hits)
@@ -318,16 +336,17 @@ def _node_route_entry(state: GraphState) -> GraphState:
         # hybrid_retrieve runs Chroma + NLM in parallel with caching; falls back to Chroma-only
         route = "hybrid_retrieve" if nlm_enabled else "retrieve"
     wants_table = _wants_table(q)
+    wants_full = _wants_full(q)
     with span_ctx(
         None, "route_entry", as_type="chain",
-        span_input={"nlm_enabled": nlm_enabled, "wants_table": wants_table},
+        span_input={"nlm_enabled": nlm_enabled, "wants_table": wants_table, "wants_full": wants_full},
     ) as span:
         if span is not None:
             try:
-                span.update(output={"route": route, "wants_table": wants_table})
+                span.update(output={"route": route, "wants_table": wants_table, "wants_full": wants_full})
             except Exception:
                 pass
-    return {"route": route, "wants_table": wants_table}
+    return {"route": route, "wants_table": wants_table, "wants_full": wants_full}
 
 
 def _node_router(state: GraphState) -> GraphState:
@@ -363,10 +382,12 @@ def _node_answer(state: GraphState) -> GraphState:
     messages.append({"role": "user", "content": prompt})
 
     temperature = 0.0
-    # Tables need more tokens to reproduce ALL rows; regular answers stay at default.
+    # Tablas y respuestas exhaustivas (todos los numerales a–y) necesitan mucho
+    # más presupuesto de salida; las respuestas normales conservan el default.
     wants_table = state.get("wants_table", False)
+    wants_full = state.get("wants_full", False)
     default_max = getattr(settings, "MAX_TOKENS", 600)
-    max_tokens = 3000 if wants_table else default_max
+    max_tokens = 4000 if (wants_table or wants_full) else default_max
 
     with span_ctx(
         None, "answer_node",
@@ -465,10 +486,11 @@ def _node_hybrid_retrieve(state: GraphState) -> GraphState:
     q = state.get("search_query") or state["question"]
     agent_key = state.get("agent_key")
     coll = _resolve_collection(agent_key, explicit=None)
-    # Tablas: más chunks — las tablas largas viven partidas en varios fragmentos.
+    # Tablas y respuestas exhaustivas: más chunks (contenido partido en fragmentos).
+    needs_breadth = state.get("wants_table") or state.get("wants_full")
     top_k = (
         getattr(settings, "TOP_K_TABLES", 12)
-        if state.get("wants_table")
+        if needs_breadth
         else getattr(settings, "TOP_K", 4)
     )
     nb_id = getattr(settings, "NOTEBOOKLM_NOTEBOOK_ID", None)
@@ -513,12 +535,11 @@ def _node_hybrid_retrieve(state: GraphState) -> GraphState:
 
         # Pool persistente: si se decide saltar/abandonar NotebookLM, el future
         # queda corriendo en background sin bloquear esta respuesta.
-        _wants_table_q = state.get("wants_table", False)
-
         def _chroma_search():
             raw = search(q, top_k=top_k, collection_name=coll)
-            # Tablas: sin dedupe por página (descarta filas) + páginas completas.
-            if _wants_table_q:
+            # Tablas/exhaustivas: sin dedupe por página (descarta contenido)
+            # + expansión a páginas completas de los mejores hits.
+            if needs_breadth:
                 return expand_hits_with_page_context(raw)
             return _dedupe_hits(raw)
 
@@ -1259,11 +1280,16 @@ def build_graph():
         {"answer_node": "answer_node", "no_context": "no_context", "table_node": "table_node"},
     )
 
-    # Shared answer path: answer_node → (table | enrich) → stylist → end
+    # Shared answer path: answer_node → (table | enrich | suggest) → stylist → end
+    # Las respuestas exhaustivas (wants_full) saltan el enriquecedor: reescribe
+    # la respuesta y puede recortar numerales que costó recuperar completos.
     g.add_conditional_edges(
         "answer_node",
-        lambda s: "table_node" if s.get("wants_table") else "enrich_node",
-        {"table_node": "table_node", "enrich_node": "enrich_node"},
+        lambda s: (
+            "table_node" if s.get("wants_table")
+            else ("suggest_node" if s.get("wants_full") else "enrich_node")
+        ),
+        {"table_node": "table_node", "enrich_node": "enrich_node", "suggest_node": "suggest_node"},
     )
     # Tras enriquecer/tabular se generan sugerencias de seguimiento y se estiliza.
     g.add_edge("enrich_node", "suggest_node")
