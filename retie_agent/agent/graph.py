@@ -38,7 +38,13 @@ class GraphState(TypedDict, total=False):
     user_id: str
     session: str
     agent_key: Optional[str]
-    hits: List[Dict[str, Any]]
+    # Salidas SEPARADAS de cada fuente de recuperación. Cada rama paralela escribe
+    # en su propia clave (sin solaparse) para que la traza de Langfuse muestre, al
+    # hacer clic en chromadb_node / notebooklm_node, exactamente lo que aportó esa
+    # fuente. answer_node hace el fan-in: lee ambas y deriva `hits`/`nlm_answer`.
+    chromadb_docs: List[Dict[str, Any]]   # documentos recuperados de ChromaDB
+    notebooklm_docs: Optional[str]        # respuesta de NotebookLM
+    hits: List[Dict[str, Any]]            # = chromadb_docs (lo consumen table/stylist)
     route: str
     answer: Any   # may now hold dict for styled payload
     metadata: Optional[Dict[str, Any]]  # new, for passing channel info
@@ -46,7 +52,8 @@ class GraphState(TypedDict, total=False):
     wants_table: bool       # user asked for a "tabla" → route through table_node
     wants_full: bool        # user asked for an exhaustive answer (todos los numerales…)
     table_image: Any        # PNG bytes when the table is rendered as an image
-    nlm_answer: Optional[str]  # NotebookLM answer from parallel hybrid retrieve
+    nlm_answer: Optional[str]  # = notebooklm_docs (derivado en answer_node para table_node)
+    notebooklm_enabled: bool   # flag que activa/desactiva el fan-out a notebooklm_node
     search_query: Optional[str]  # standalone query (condensed from history) used for retrieval
     suggestions: List[str]  # follow-up questions offered to the user after the answer
 
@@ -281,7 +288,13 @@ def _node_condense(state: GraphState) -> GraphState:
         return {"search_query": search_query}
 
 
-def _node_retrieve(state: GraphState) -> GraphState:
+def _node_chromadb(state: GraphState) -> GraphState:
+    """Rama de recuperación contra ChromaDB (paralela a notebooklm_node).
+
+    Nodo independiente: escribe su salida en `chromadb_docs` para que, en la
+    traza de Langfuse, al hacer clic en chromadb_node se vean exactamente los
+    documentos/scores recuperados de Chroma — separados de lo que aportó NLM.
+    """
     q = state.get("search_query") or state["question"]
     agent_key = state.get("agent_key")
     coll = _resolve_collection(agent_key, explicit=None)
@@ -301,7 +314,7 @@ def _node_retrieve(state: GraphState) -> GraphState:
         "top_k": top_k,
         "distance_threshold": thr,
     }
-    with span_ctx(None, "retrieve", as_type="retriever", span_input=span_input) as span:
+    with span_ctx(None, "chromadb_node", as_type="retriever", span_input=span_input) as span:
         try:
             raw_hits = search(q, top_k=top_k, collection_name=coll)
             # Tablas/exhaustivas: NO deduplicar por (source, page) — una página
@@ -324,17 +337,18 @@ def _node_retrieve(state: GraphState) -> GraphState:
                 )
             except Exception:
                 pass
-        return {"hits": hits}
+        return {"chromadb_docs": hits}
 
 def _node_route_entry(state: GraphState) -> GraphState:
-    """Entry point: smalltalk directo, o hybrid (Chroma+NLM) / Chroma-only según flag."""
+    """Entry point: smalltalk directo, o recuperación (Chroma ± NLM) en el resto.
+
+    El bifurcado activo/desactivado de NotebookLM NO se decide aquí: se publica el
+    flag `notebooklm_enabled` en el estado y la conditional edge desde condense_node
+    (`_fanout_retrieval`) lo usa para incluir o no a notebooklm_node en el fan-out.
+    """
     q = state.get("question", "")
     nlm_enabled = str(getattr(settings, "NOTEBOOKLM_ENABLED", "false")).lower() in ("1", "true", "yes")
-    if _SMALLTALK_RE.match(q):
-        route = "smalltalk"
-    else:
-        # hybrid_retrieve runs Chroma + NLM in parallel with caching; falls back to Chroma-only
-        route = "hybrid_retrieve" if nlm_enabled else "retrieve"
+    route = "smalltalk" if _SMALLTALK_RE.match(q) else "retrieve"
     wants_table = _wants_table(q)
     wants_full = _wants_full(q)
     with span_ctx(
@@ -346,31 +360,31 @@ def _node_route_entry(state: GraphState) -> GraphState:
                 span.update(output={"route": route, "wants_table": wants_table, "wants_full": wants_full})
             except Exception:
                 pass
-    return {"route": route, "wants_table": wants_table, "wants_full": wants_full}
+    return {
+        "route": route,
+        "wants_table": wants_table,
+        "wants_full": wants_full,
+        "notebooklm_enabled": nlm_enabled,
+    }
 
-
-def _node_router(state: GraphState) -> GraphState:
-    hits = state.get("hits") or []
-    route = "answer_node" if hits else "no_context"
-    with span_ctx(
-        None, "router", as_type="chain",
-        span_input={"hits_count": len(hits)},
-    ) as span:
-        if span is not None:
-            try:
-                span.update(output={"route": route})
-            except Exception:
-                pass
-        return {"route": route}
 
 def _node_answer(state: GraphState) -> GraphState:
     q = state["question"]
     agent_key = state.get("agent_key")
-    hits = state.get("hits") or []
-    nlm_answer = (state.get("nlm_answer") or "").strip()
+    # Fan-in de las dos ramas de recuperación: cada nodo escribió en su propia
+    # clave (chromadb_docs / notebooklm_docs) sin solaparse. Aquí se combinan para
+    # el LLM y se derivan `hits`/`nlm_answer`, que consumen los nodos posteriores
+    # (table_node, stylist_node) tal como antes.
+    hits = state.get("chromadb_docs") or []
+    nlm_answer = (state.get("notebooklm_docs") or "").strip()
 
     if not hits and not nlm_answer:
-        return {"answer": "No tengo evidencia en los documentos."}
+        return {
+            "answer": "No tengo evidencia en los documentos.",
+            "hits": hits,
+            "nlm_answer": nlm_answer,
+            "route": "no_context",
+        }
 
     model = _resolve_model(agent_key, explicit=None)
     sys = SYSTEM_PROMPT_RETIE
@@ -433,7 +447,9 @@ def _node_answer(state: GraphState) -> GraphState:
             except Exception:
                 pass
 
-        return {"answer": answer}
+        # `hits`/`nlm_answer` se exponen para los nodos posteriores (table_node usa
+        # los chunks crudos y la nota de "tabla parcial"; stylist_node arma las citas).
+        return {"answer": answer, "hits": hits, "nlm_answer": nlm_answer, "route": "answer"}
 
 def _node_no_context(_state: GraphState) -> GraphState:
     with span_ctx(None, "no_context", as_type="chain"):
@@ -459,7 +475,7 @@ def _get_notebooklm_client() -> NotebookLMClient:
 
 
 # ===============================
-#  Hybrid RAG Node (Chroma + NLM in parallel with cache)
+#  NotebookLM Node (rama independiente, paralela a chromadb_node)
 # ===============================
 _nlm_cache: Optional[NotebookLMCache] = None
 
@@ -472,36 +488,29 @@ def _get_nlm_cache() -> NotebookLMCache:
     return _nlm_cache
 
 
-def _node_hybrid_retrieve(state: GraphState) -> GraphState:
-    """Hybrid RAG: runs Chroma and NotebookLM in parallel, merges both results.
+def _node_notebooklm(state: GraphState) -> GraphState:
+    """Rama de recuperación contra NotebookLM (paralela a chromadb_node).
 
-    Fast-path exits:
-    - Cache hit on NLM → answer available immediately, no browser wait.
-    - Chroma high-confidence (best score < CHROMA_HIGH_CONFIDENCE_THR) → NLM skipped.
+    Nodo independiente: escribe su salida en `notebooklm_docs` para que, en la
+    traza de Langfuse, al hacer clic en notebooklm_node se vea EXACTAMENTE lo que
+    aportó NotebookLM — separado de lo recuperado por Chroma. Solo se ejecuta
+    cuando el fan-out condicional lo incluye (NOTEBOOKLM_ENABLED=true); con el flag
+    apagado el nodo ni siquiera aparece en la traza.
 
-    Otherwise waits up to NOTEBOOKLM_PARALLEL_TIMEOUT seconds for NLM, then
-    falls back to Chroma-only. Always routes to answer_node (merged LLM call)
-    or no_context when both sources are empty.
+    Conserva el caché (exacto + semántico) y un tope de espera
+    (`NOTEBOOKLM_HARD_TIMEOUT`) para que un navegador colgado no bloquee el fan-in
+    hacia answer_node. La respuesta tardía/abandonada se cachea en segundo plano
+    para que la siguiente pregunta igual o similar sea cache-hit.
+
+    Nota: al ser una rama paralela, este nodo NO ve los resultados de Chroma, así
+    que el atajo de "alta confianza de Chroma → saltar NLM" del antiguo
+    hybrid_retrieve ya no aplica (coincide con el modo por defecto
+    NOTEBOOKLM_ALWAYS_WAIT=true, que nunca saltaba NLM).
     """
     q = state.get("search_query") or state["question"]
-    agent_key = state.get("agent_key")
-    coll = _resolve_collection(agent_key, explicit=None)
-    # Tablas y respuestas exhaustivas: más chunks (contenido partido en fragmentos).
-    needs_breadth = state.get("wants_table") or state.get("wants_full")
-    top_k = (
-        getattr(settings, "TOP_K_TABLES", 12)
-        if needs_breadth
-        else getattr(settings, "TOP_K", 4)
-    )
     nb_id = getattr(settings, "NOTEBOOKLM_NOTEBOOK_ID", None)
-    conf_thr = float(getattr(settings, "CHROMA_HIGH_CONFIDENCE_THR", 0.25))
-    decent_thr = float(getattr(settings, "CHROMA_DECENT_THR", 0.40))
-    parallel_timeout = float(getattr(settings, "NOTEBOOKLM_PARALLEL_TIMEOUT", 25.0))
-    soft_timeout = float(getattr(settings, "NOTEBOOKLM_SOFT_TIMEOUT", 12.0))
     min_chars = int(getattr(settings, "NOTEBOOKLM_MIN_QUERY_CHARS", 12))
     sem_sim = float(getattr(settings, "NLM_SEMANTIC_CACHE_SIM", 0.93))
-    # Modo "siempre ambos": no se salta NLM ni se recorta su espera.
-    always_wait = as_bool(getattr(settings, "NOTEBOOKLM_ALWAYS_WAIT", "true"))
     hard_timeout = float(getattr(settings, "NOTEBOOKLM_HARD_TIMEOUT", 180.0))
 
     nlm_eligible = len(q.strip()) >= min_chars
@@ -512,8 +521,8 @@ def _node_hybrid_retrieve(state: GraphState) -> GraphState:
         cache_kind = "exact"
 
     # Caché semántico: una pregunta reformulada pero equivalente reutiliza la
-    # respuesta NLM previa. El embedding se comparte vía LRU con el retrieval
-    # de Chroma (no hay llamada extra a la API en el camino feliz).
+    # respuesta NLM previa. El embedding se comparte vía LRU con el retrieval de
+    # Chroma (no hay llamada extra a la API en el camino feliz).
     q_emb: Optional[List[float]] = None
     if nlm_eligible and not cached and sem_sim > 0:
         try:
@@ -526,64 +535,11 @@ def _node_hybrid_retrieve(state: GraphState) -> GraphState:
             q_emb = None
 
     with span_ctx(
-        None, "hybrid_retrieve", as_type="retriever",
+        None, "notebooklm_node", as_type="retriever",
         span_input={"question": q, "nlm_cache_hit": cache_kind},
     ) as span:
-        hits: List[Dict[str, Any]] = []
         nlm_answer = ""
-        nlm_status = "disabled"
-
-        # Pool persistente: si se decide saltar/abandonar NotebookLM, el future
-        # queda corriendo en background sin bloquear esta respuesta.
-        def _chroma_search():
-            raw = search(q, top_k=top_k, collection_name=coll)
-            # Tablas/exhaustivas: sin dedupe por página (descarta contenido)
-            # + expansión a páginas completas de los mejores hits.
-            if needs_breadth:
-                return expand_hits_with_page_context(raw)
-            return _dedupe_hits(raw)
-
-        chroma_fut = _POOL.submit(_chroma_search)
-
-        nlm_fut = None
-        if nlm_eligible and not cached:
-            client = _get_notebooklm_client()
-            nlm_fut = _POOL.submit(client.ask_question, q, "footnotes", nb_id)
-            nlm_status = "submitted"
-
-        # Chroma is fast — retrieve results first
-        try:
-            hits = chroma_fut.result(timeout=15)
-        except Exception:
-            hits = []
-
-        # Confidence check: skip NLM wait if Chroma is highly confident.
-        # EXCEPTION: never skip NLM for table queries — table data requires
-        # NotebookLM's full-PDF access; Chroma chunks rarely contain full tables.
-        wants_table = state.get("wants_table", False)
-        # Solo distancias coseno: los scores BM25 (mayor=mejor) no son comparables.
-        scores = [
-            h["score"] for h in hits
-            if isinstance(h.get("score"), (int, float))
-            and h.get("score_type", "cosine_distance") == "cosine_distance"
-        ]
-        best_score = min(scores) if scores else 1.0
-        # En modo always_wait NUNCA se salta NLM: la respuesta siempre es híbrida.
-        high_confidence = bool(
-            hits and best_score < conf_thr and not wants_table and not always_wait
-        )
-        # Espera adaptativa (solo con NOTEBOOKLM_ALWAYS_WAIT=false): con evidencia
-        # decente de Chroma se espera poco a NLM; sin evidencia, timeout completo;
-        # las tablas necesitan a NLM sí o sí → presupuesto propio más amplio.
-        decent = bool(hits and best_score < decent_thr and not wants_table)
-        if always_wait:
-            nlm_wait = hard_timeout
-        elif wants_table:
-            nlm_wait = float(getattr(settings, "NOTEBOOKLM_TABLE_TIMEOUT", 45.0))
-        elif decent:
-            nlm_wait = soft_timeout
-        else:
-            nlm_wait = parallel_timeout
+        status = "disabled"
 
         # Cachear la respuesta tardía/abandonada de NLM: el navegador sigue
         # trabajando y la siguiente pregunta igual o similar será cache-hit.
@@ -596,127 +552,45 @@ def _node_hybrid_retrieve(state: GraphState) -> GraphState:
                 pass
 
         if cached:
-            nlm_answer, _ = cached
-            nlm_status = f"cache_hit_{cache_kind}"
-        elif nlm_fut is not None:
-            if high_confidence:
-                if not nlm_fut.cancel():  # si ya corre, que termine y se cachee
-                    nlm_fut.add_done_callback(_cache_late)
-                nlm_status = "skipped_high_conf"
-            else:
-                try:
-                    raw_answer, _ = nlm_fut.result(timeout=nlm_wait)
-                    nlm_answer = (raw_answer or "").strip()
-                    if nlm_answer:
-                        cache.set(q, nb_id, nlm_answer, [], embedding=q_emb)
-                    nlm_status = "ok"
-                except FutureTimeoutError:
-                    nlm_status = "timeout_soft" if decent else "timeout"
-                    logger.warning(
-                        "NotebookLM wait of %.0fs exceeded (decent_chroma=%s) — using Chroma only",
-                        nlm_wait, decent,
-                    )
-                    nlm_fut.add_done_callback(_cache_late)
-                except Exception as exc:
-                    nlm_status = "error"
-                    logger.warning("NotebookLM parallel query failed: %s", exc)
-
-        # Routing:
-        # - Table query + NLM answer → skip answer_node synthesis (preserves tabular format)
-        # - Any other query with content → answer_node (LLM synthesis of both sources)
-        # - Nothing found → no_context
-        if wants_table and nlm_answer:
-            route = "table_node"
-        elif hits or nlm_answer:
-            route = "answer_node"
+            nlm_answer = (cached[0] or "").strip()
+            status = f"cache_hit_{cache_kind}"
+        elif not nlm_eligible:
+            status = "skipped_short_query"
         else:
-            route = "no_context"
-
-        if span is not None:
-            try:
-                span.update(output={
-                    "hits_count": len(hits),
-                    "best_chroma_score": round(best_score, 4) if scores else None,
-                    "high_confidence": high_confidence,
-                    "decent_chroma": decent,
-                    "nlm_wait_budget_s": nlm_wait,
-                    "wants_table": wants_table,
-                    "nlm_answer_len": len(nlm_answer),
-                    "nlm_status": nlm_status,
-                    "route": route,
-                })
-            except Exception:
-                pass
-
-        out: GraphState = {"hits": hits, "nlm_answer": nlm_answer, "route": route}
-        # For table_node, answer must be pre-loaded with the NLM response
-        if route == "table_node":
-            out["answer"] = nlm_answer
-        return out
-
-
-# Mensajes para el usuario cuando NotebookLM no entrega una respuesta útil.
-_NLM_MSG_ERROR = (
-    "⚠️ En este momento no pude procesar tu consulta. "
-    "Por favor reformúlala con términos relacionados al RETIE "
-    "(p. ej. instalaciones eléctricas, puesta a tierra, protecciones, tableros)."
-)
-_NLM_MSG_EMPTY = (
-    "No encontré información sobre eso en el RETIE. "
-    "¿Podrías reformular tu pregunta con más detalle?"
-)
-_NLM_MIN_QUERY_LEN = 4  # consultas más cortas casi nunca dan resultado y gastan ~30s
-
-
-def _node_notebooklm(state: GraphState) -> GraphState:
-    """Fallback retrieval via NotebookLM MCP when Chroma has no relevant hits.
-
-    Distingue tres desenlaces para dar siempre un output claro al usuario:
-      - ok:    respuesta válida de NotebookLM → continúa al stylist
-      - error: fallo técnico (timeout del navegador, sesión, etc.) → mensaje para reformular
-      - empty: NotebookLM respondió pero sin contenido útil → mensaje "sin información"
-    """
-    q = (state.get("question") or "").strip()
-
-    # Rechazo rápido de consultas triviales para no gastar ~30s en el navegador.
-    if len(q) < _NLM_MIN_QUERY_LEN:
-        return {"answer": _NLM_MSG_EMPTY, "route": "deliver"}
-
-    with span_ctx(None, "notebooklm_node", as_type="retriever", span_input={"question": q}) as span:
-        status = "ok"
-        answer = ""
-        error_msg = ""
-        try:
+            # Pool persistente: si se agota la espera, el future queda corriendo en
+            # background (se cachea vía callback) sin bloquear el fan-in.
             client = _get_notebooklm_client()
-            answer, _sources = client.ask_question(q, source_format="footnotes")
-        except Exception as exc:
-            status = "error"
-            error_msg = str(exc)
-            logger.warning("NotebookLM query failed: %s", exc)
-
-        has_answer = bool(answer and len(answer.strip()) > 10)
-        if not has_answer and status == "ok":
-            status = "empty"
+            nlm_fut = _POOL.submit(client.ask_question, q, "footnotes", nb_id)
+            try:
+                raw_answer, _ = nlm_fut.result(timeout=hard_timeout)
+                nlm_answer = (raw_answer or "").strip()
+                if nlm_answer:
+                    cache.set(q, nb_id, nlm_answer, [], embedding=q_emb)
+                status = "ok" if nlm_answer else "empty"
+            except FutureTimeoutError:
+                status = "timeout"
+                logger.warning(
+                    "notebooklm_node: espera de %.0fs agotada — sin aporte de NLM",
+                    hard_timeout,
+                )
+                nlm_fut.add_done_callback(_cache_late)
+            except Exception as exc:
+                status = "error"
+                logger.warning("notebooklm_node query failed: %s", exc)
 
         if span is not None:
             try:
                 span.update(
-                    output={"answer_preview": answer[:200] if answer else error_msg[:200]},
-                    metadata={"status": status},
+                    output={
+                        "nlm_answer": nlm_answer,
+                        "nlm_answer_len": len(nlm_answer),
+                    },
+                    metadata={"status": status, "nlm_cache_hit": cache_kind},
                 )
             except Exception:
                 pass
 
-        if has_answer:
-            # Si el usuario pidió tabla, formatearla antes de entregar.
-            route = "table_node" if state.get("wants_table") else "stylist_node"
-            return {"answer": answer, "route": route}
-
-        # Fallo técnico → pedir reformular; respuesta vacía → "sin información".
-        # route="deliver" entrega el mensaje tal cual (no pasa por no_context,
-        # que lo sobreescribiría con "No tengo evidencia en los documentos").
-        user_msg = _NLM_MSG_ERROR if status == "error" else _NLM_MSG_EMPTY
-        return {"answer": user_msg, "route": "deliver"}
+        return {"notebooklm_docs": nlm_answer}
 
 
 # ===============================
@@ -1236,9 +1110,10 @@ def build_graph():
     g = StateGraph(GraphState)
     g.add_node("route_entry", _node_route_entry)
     g.add_node("condense_node", _node_condense)
-    g.add_node("retrieve", _node_retrieve)
-    g.add_node("router", _node_router)
-    g.add_node("hybrid_retrieve", _node_hybrid_retrieve)
+    # Ramas de recuperación INDEPENDIENTES → cada una genera su propio span en
+    # Langfuse (chromadb_node vs notebooklm_node), con su salida en clave propia.
+    g.add_node("chromadb_node", _node_chromadb)
+    g.add_node("notebooklm_node", _node_notebooklm)
     g.add_node("answer_node", _node_answer)
     g.add_node("enrich_node", _node_enrich)
     g.add_node("stylist_node", _node_stylist)
@@ -1248,7 +1123,7 @@ def build_graph():
     g.add_node("suggest_node", _node_suggest)
 
     # Entry: smalltalk responde directo; lo demás pasa por condense_node
-    # (reescritura de seguimiento) y luego hybrid (Chroma+NLM) o Chroma-only.
+    # (reescritura de seguimiento) y de ahí al fan-out de recuperación.
     g.set_entry_point("route_entry")
     g.add_conditional_edges(
         "route_entry",
@@ -1256,40 +1131,54 @@ def build_graph():
         {"smalltalk": "smalltalk_node", "condense": "condense_node"},
     )
     g.add_edge("smalltalk_node", "stylist_node")
+
+    # ── Fan-out de recuperación (ramas paralelas que convergen) ──────────────
+    # La conditional edge devuelve la LISTA de ramas a ejecutar:
+    #   - NotebookLM ACTIVO    → ["chromadb_node", "notebooklm_node"]  (paralelo)
+    #   - NotebookLM DESACTIVADO → ["chromadb_node"]  (notebooklm_node no se ejecuta
+    #                              ni aparece en la traza)
+    # LangGraph corre ambas ramas en el mismo super-step y espera a que terminen
+    # (fan-in) antes de ejecutar answer_node.
+    def _fanout_retrieval(s: GraphState) -> List[str]:
+        targets = ["chromadb_node"]
+        if s.get("notebooklm_enabled"):
+            targets.append("notebooklm_node")
+        return targets
+
     g.add_conditional_edges(
         "condense_node",
-        lambda s: s.get("route", "retrieve"),
-        {"retrieve": "retrieve", "hybrid_retrieve": "hybrid_retrieve"},
+        _fanout_retrieval,
+        {"chromadb_node": "chromadb_node", "notebooklm_node": "notebooklm_node"},
     )
 
-    # Chroma-only path: retrieve → router → answer → (table | enrich) → stylist → end
-    g.add_edge("retrieve", "router")
-    g.add_conditional_edges(
-        "router",
-        lambda s: s.get("route", "no_context"),
-        {"answer_node": "answer_node", "no_context": "no_context"},
-    )
+    # Fan-in: ambas ramas convergen en answer_node. LangGraph lo ejecuta una sola
+    # vez, tras completarse las ramas que se hayan activado en el fan-out.
+    g.add_edge("chromadb_node", "answer_node")
+    g.add_edge("notebooklm_node", "answer_node")
 
-    # Hybrid path:
-    #   table query + NLM answer → table_node (skips answer_node to preserve tabular format)
-    #   any content found        → answer_node (LLM synthesis of Chroma + NLM)
-    #   nothing found            → no_context
-    g.add_conditional_edges(
-        "hybrid_retrieve",
-        lambda s: s.get("route", "no_context"),
-        {"answer_node": "answer_node", "no_context": "no_context", "table_node": "table_node"},
-    )
+    # answer_node combina ambas fuentes y enruta:
+    #   - sin evidencia en ninguna fuente → no_context
+    #   - tabla solicitada                → table_node
+    #   - respuesta exhaustiva (wants_full) salta el enriquecedor (recortaría numerales)
+    #   - resto                           → enrich_node
+    def _after_answer(s: GraphState) -> str:
+        if s.get("route") == "no_context":
+            return "no_context"
+        if s.get("wants_table"):
+            return "table_node"
+        if s.get("wants_full"):
+            return "suggest_node"
+        return "enrich_node"
 
-    # Shared answer path: answer_node → (table | enrich | suggest) → stylist → end
-    # Las respuestas exhaustivas (wants_full) saltan el enriquecedor: reescribe
-    # la respuesta y puede recortar numerales que costó recuperar completos.
     g.add_conditional_edges(
         "answer_node",
-        lambda s: (
-            "table_node" if s.get("wants_table")
-            else ("suggest_node" if s.get("wants_full") else "enrich_node")
-        ),
-        {"table_node": "table_node", "enrich_node": "enrich_node", "suggest_node": "suggest_node"},
+        _after_answer,
+        {
+            "no_context": "no_context",
+            "table_node": "table_node",
+            "enrich_node": "enrich_node",
+            "suggest_node": "suggest_node",
+        },
     )
     # Tras enriquecer/tabular se generan sugerencias de seguimiento y se estiliza.
     g.add_edge("enrich_node", "suggest_node")

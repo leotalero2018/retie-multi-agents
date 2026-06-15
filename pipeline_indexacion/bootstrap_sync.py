@@ -197,11 +197,12 @@ def sync_chroma_from_minio() -> str:
             log.info("[SYNC] MINIO_BUCKET_NAME not set; skipping MinIO download.")
         else:
             # Prefijos candidatos: el configurado primero y luego las rutas
-            # conocidas. El pipeline de normativas sube a data/chroma_db/;
-            # despliegues con MINIO_PREFIX desactualizado encontraban 0 objetos
-            # y el bot quedaba sin índice ("No tengo evidencia" para todo).
+            # conocidas. El pipeline v2 publica en chroma_v2/ y el legacy en
+            # data/chroma_db/. Incluir ambos como fallback evita que el bot
+            # quede sin índice ("No tengo evidencia") si MINIO_PREFIX quedó
+            # desactualizado o si se borró el prefijo legacy tras migrar a v2.
             candidates = [prefix]
-            for alt in ("data/chroma_db/", "chroma_db/"):
+            for alt in ("chroma_v2/", "data/chroma_db/", "chroma_db/"):
                 if alt not in candidates:
                     candidates.append(alt)
             try:

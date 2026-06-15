@@ -99,6 +99,8 @@ retie_agent/agent/.nlm_session_cache.json
 
 pipeline_indexacion/chroma_local/
 chroma_local/
+pipeline_indexacion/v2_work/
+pipeline_indexacion/chroma_v2/
 *.bin
 *.pickle
 
