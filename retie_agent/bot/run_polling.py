@@ -147,13 +147,18 @@ async def _diagnose_nlm(nlm_url: str) -> None:
         from retie_agent.agent.notebooklm_client import NotebookLMClient
         client = NotebookLMClient(base_url=nlm_url, timeout=30.0)
 
+        # OJO: en modo persistente el contexto del navegador se lanza de forma
+        # PEREZOSA (en la 1ª ask_question), así que get_health al arranque reporta
+        # authenticated=false aunque las cookies existan. Por eso este chequeo es
+        # solo informativo — la auth real se confirma en la primera consulta, cuando
+        # el server carga browser_state/state.json al lanzar el contexto.
         if client.is_authenticated():
             logging.info("[NLM] Sesión de Google válida ✓")
         else:
-            logging.warning(
-                "[NLM] ⚠️ SIN sesión de Google válida — las consultas a NotebookLM "
-                "fallarán. Regenera la sesión en local (python setup_notebooklm.py) "
-                "y súbela a MinIO con: python setup_notebooklm.py --upload"
+            logging.info(
+                "[NLM] Auth aún sin verificar al arranque (el navegador se lanza en "
+                "la 1ª consulta). Si una consulta falla por auth, re-loguea local: "
+                "python setup_notebooklm.py → --pack/--upload."
             )
 
         configured = getattr(settings, "NOTEBOOKLM_NOTEBOOK_ID", None)
@@ -162,10 +167,22 @@ async def _diagnose_nlm(nlm_url: str) -> None:
             content = resp.get("result", {}).get("content", [])
             text = content[0].get("text", "{}") if isinstance(content, list) and content else "{}"
             data = _json.loads(text) if isinstance(text, str) else (text or {})
-            notebooks = data.get("notebooks", []) if isinstance(data, dict) else []
+            # El server envuelve la salida en {"success":true,"data":{...}}; hay que
+            # desempaquetar `data` antes de leer `notebooks` (si no, contaba 0).
+            if isinstance(data, dict):
+                inner = data.get("data", data)
+                if isinstance(inner, list):
+                    notebooks = inner
+                elif isinstance(inner, dict):
+                    notebooks = inner.get("notebooks", [])
+                else:
+                    notebooks = []
+            else:
+                notebooks = []
             ids = [nb.get("id") for nb in notebooks]
             for nb in notebooks:
-                logging.info("[NLM] notebook disponible: [%s] %s", nb.get("id"), nb.get("title", "?"))
+                logging.info("[NLM] notebook disponible: [%s] %s",
+                             nb.get("id"), nb.get("name") or nb.get("title", "?"))
             if configured and ids and configured not in ids:
                 logging.warning(
                     "[NLM] ⚠️ NOTEBOOKLM_NOTEBOOK_ID=%r NO está en la librería del "

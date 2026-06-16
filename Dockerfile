@@ -24,8 +24,20 @@ RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \
 # Pre-install notebooklm-mcp globally so npx doesn't download it on every boot
 RUN npm install -g notebooklm-mcp@latest
 
-# Install Playwright's Chromium + all its system dependencies in one step
-RUN npx playwright install chromium --with-deps
+# notebooklm-mcp usa Patchright (fork de Playwright). En headless lanza
+# `chrome-headless-shell`, que `playwright install chromium` NO instala y cuyo
+# revision (p. ej. chromium_headless_shell-1223) debe coincidir con el de Patchright.
+# Sin esto ask_question falla: "Executable doesn't exist at
+# .../chromium_headless_shell-XXXX/chrome-headless-shell". Instalamos los
+# navegadores con el Patchright QUE TRAE notebooklm-mcp para que el revision
+# coincida (fallback a `npx patchright` y, como último recurso, a playwright).
+RUN NLM="$(npm root -g)/notebooklm-mcp"; \
+    PR="$NLM/node_modules/.bin/patchright"; \
+    [ -x "$PR" ] || PR="npx --yes patchright"; \
+    $PR install --with-deps chromium; \
+    $PR install chromium-headless-shell \
+      || npx --yes playwright install chromium-headless-shell \
+      || true
 
 # -------------------------------
 # Workdir
