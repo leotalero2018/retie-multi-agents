@@ -4,10 +4,10 @@ Only the browser_state/ subfolder is backed up — it contains the Playwright
 storageState (cookies + localStorage, ~50 KB) that keeps the Google session
 alive.  The full chrome_profile/ is OS-specific and too large to backup.
 
-Default data-dir locations (notebooklm-mcp convention):
+Default data-dir locations (convención `env-paths`; solo Windows lleva `Data`):
   Windows : %LOCALAPPDATA%\\notebooklm-mcp\\Data
-  Linux   : ~/.local/share/notebooklm-mcp/Data
-  macOS   : ~/Library/Application Support/notebooklm-mcp/Data
+  Linux   : ~/.local/share/notebooklm-mcp
+  macOS   : ~/Library/Application Support/notebooklm-mcp
 
 MinIO key:  <bucket>/nlm-browser-state.tar.gz
 """
@@ -28,15 +28,22 @@ _MINIO_KEY = "nlm-browser-state.tar.gz"
 # ── OS-default data directory ─────────────────────────────────────────────────
 
 def _default_data_dir() -> Path:
-    """Returns the OS-default directory where notebooklm-mcp stores its data."""
+    """Directorio de datos de notebooklm-mcp según el SO (convención `env-paths`).
+
+    OJO: SOLO Windows añade el sufijo `Data`; macOS y Linux NO. Antes se agregaba
+    `/Data` en todos los SO, así que en Railway (Linux) la sesión se restauraba en
+    `~/.local/share/notebooklm-mcp/Data/browser_state` mientras el server la busca
+    en `~/.local/share/notebooklm-mcp/browser_state` → la sesión de Google nunca se
+    cargaba (server con "Notebooks: 0" y sin auth).
+    """
     system = platform.system()
     if system == "Windows":
         base = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
-    elif system == "Darwin":
-        base = str(Path.home() / "Library" / "Application Support")
-    else:
-        base = os.environ.get("XDG_DATA_HOME") or str(Path.home() / ".local" / "share")
-    return Path(base) / "notebooklm-mcp" / "Data"
+        return Path(base) / "notebooklm-mcp" / "Data"
+    if system == "Darwin":
+        return Path.home() / "Library" / "Application Support" / "notebooklm-mcp"
+    base = os.environ.get("XDG_DATA_HOME") or str(Path.home() / ".local" / "share")
+    return Path(base) / "notebooklm-mcp"
 
 
 def default_browser_state_dir() -> Path:

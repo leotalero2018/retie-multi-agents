@@ -98,40 +98,38 @@ async def _setup_nlm_server() -> None:
         logging.warning("[NLM] Failed to start MCP server: %s", exc)
         return
 
-    # 3. Poll until the server is ready (non-blocking)
-    import httpx
-    mcp_url = f"http://localhost:{port}/mcp"
+    # 3. Poll hasta que el server esté listo E INICIALIZA la sesión MCP UNA vez.
+    #
+    #    notebooklm-mcp admite UN solo transporte activo a la vez. El healthcheck
+    #    anterior abría el transporte con httpx y DESCARTABA el Mcp-Session-Id, así
+    #    que los clientes siguientes (diagnose, keepalive, grafo) no podían
+    #    reinicializar ("Already connected to a transport" → HTTP 500) ni tenían un
+    #    session id que reusar. Ahora inicializamos con NotebookLMClient, que
+    #    PERSISTE el Mcp-Session-Id en disco; todos los demás clientes lo recargan
+    #    y comparten ese único transporte.
+    from retie_agent.agent.notebooklm_client import NotebookLMClient
     loop = asyncio.get_event_loop()
     deadline = loop.time() + startup_timeout
+
+    def _init_mcp_session() -> bool:
+        client = NotebookLMClient(base_url=nlm_url, timeout=10.0)
+        # Arranque fresco: descarta cualquier session id viejo (baked en la imagen
+        # o de un contenedor anterior) — el server recién arrancado no tiene aún
+        # transporte, así que un id viejo provocaría el conflicto que evitamos.
+        client._clear_session_cache()
+        client._mcp_session = None
+        return client.initialize()  # captura y persiste el Mcp-Session-Id
 
     while loop.time() < deadline:
         await asyncio.sleep(3)
         try:
-            async with httpx.AsyncClient() as hc:
-                resp = await hc.post(
-                    mcp_url,
-                    json={
-                        "jsonrpc": "2.0", "id": 0,
-                        "method": "initialize",
-                        "params": {
-                            "protocolVersion": "2024-11-05",
-                            "capabilities": {},
-                            "clientInfo": {"name": "healthcheck", "version": "0"},
-                        },
-                    },
-                    headers={
-                        "Content-Type": "application/json",
-                        # Sin Accept dual el server responde 406 Not Acceptable.
-                        "Accept": "application/json, text/event-stream",
-                    },
-                    timeout=5,
-                )
-            if resp.status_code < 500:
-                logging.info("[NLM] MCP server ready at %s", mcp_url)
-                await _diagnose_nlm(nlm_url)
-                return
+            ready = await asyncio.get_running_loop().run_in_executor(None, _init_mcp_session)
         except Exception:
-            pass
+            ready = False
+        if ready:
+            logging.info("[NLM] MCP server ready — sesión MCP inicializada y persistida")
+            await _diagnose_nlm(nlm_url)
+            return
 
     logging.warning("[NLM] Server not ready after %ds — NLM disabled for this session", startup_timeout)
 
