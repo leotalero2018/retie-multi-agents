@@ -75,8 +75,33 @@ def _bucket() -> str:
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
+def _add_session_to_tar(tar: "tarfile.TarFile", browser_state: Path) -> list[str]:
+    """Añade al tar la sesión completa: `browser_state/` (cookies de Google) y,
+    si existe, `library.json` (registro de notebooks).
+
+    library.json es IMPRESCINDIBLE: sin él, el server arranca con la librería
+    vacía y `ask_question` falla con "Notebook not found in library: <id>" aunque
+    pases NOTEBOOKLM_NOTEBOOK_ID. Vive como hermano de browser_state, en la raíz
+    del data-dir de notebooklm-mcp.
+    """
+    added: list[str] = []
+    tar.add(str(browser_state), arcname="browser_state")
+    added.append("browser_state/")
+    library = browser_state.parent / "library.json"
+    if library.exists():
+        tar.add(str(library), arcname="library.json")
+        added.append("library.json")
+    else:
+        logger.warning(
+            "[NLM] library.json no encontrado junto a %s — el server tendrá la "
+            "librería vacía y ask_question fallará con 'Notebook not found'. "
+            "Registra el notebook con: python setup_notebooklm.py", browser_state,
+        )
+    return added
+
+
 def upload_nlm_session(source_dir: str | None = None) -> None:
-    """Compress the browser_state directory and upload it to MinIO.
+    """Compress the session (browser_state + library.json) and upload it to MinIO.
 
     source_dir: path to the browser_state/ folder.  Defaults to the OS-specific
                 notebooklm-mcp default location.
@@ -95,19 +120,19 @@ def upload_nlm_session(source_dir: str | None = None) -> None:
 
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w:gz") as tar:
-        tar.add(str(src), arcname="browser_state")
+        added = _add_session_to_tar(tar, src)
     size = buf.tell()
     buf.seek(0)
 
     cli.put_object(bucket, _MINIO_KEY, buf, size, content_type="application/gzip")
     logger.info(
-        "[NLM] browser_state uploaded to MinIO (%s/%s, %.1f KB)",
-        bucket, _MINIO_KEY, size / 1024,
+        "[NLM] session uploaded to MinIO (%s/%s, %.1f KB) — incluye: %s",
+        bucket, _MINIO_KEY, size / 1024, ", ".join(added),
     )
 
 
 def pack_nlm_session(source_dir: str | None = None, dest_dir: str | None = None) -> Path:
-    """Comprime browser_state/ a un .tar.gz LOCAL, sin tocar MinIO.
+    """Comprime la sesión (browser_state + library.json) a un .tar.gz LOCAL.
 
     Pensado para cuando MinIO no es alcanzable: genera el archivo para subirlo
     manualmente al bucket. El nombre del archivo coincide EXACTAMENTE con la clave
@@ -129,11 +154,11 @@ def pack_nlm_session(source_dir: str | None = None, dest_dir: str | None = None)
     out_path = out_dir / _MINIO_KEY
 
     with tarfile.open(str(out_path), mode="w:gz") as tar:
-        tar.add(str(src), arcname="browser_state")
+        added = _add_session_to_tar(tar, src)
 
     logger.info(
-        "[NLM] browser_state packed → %s (%.1f KB)",
-        out_path, out_path.stat().st_size / 1024,
+        "[NLM] session packed → %s (%.1f KB) — incluye: %s",
+        out_path, out_path.stat().st_size / 1024, ", ".join(added),
     )
     return out_path
 
@@ -174,7 +199,11 @@ def download_nlm_session(dest_dir: str | None = None) -> None:
     dest = Path(dest_dir) if dest_dir else _default_data_dir()
     dest.mkdir(parents=True, exist_ok=True)
     with tarfile.open(fileobj=buf, mode="r:gz") as tar:
+        names = tar.getnames()
         tar.extractall(dest)
 
-    restored = dest / "browser_state"
-    logger.info("[NLM] browser_state restored from MinIO → %s", restored)
+    has_library = any(n == "library.json" or n.endswith("/library.json") for n in names)
+    logger.info(
+        "[NLM] session restored from MinIO → %s (browser_state%s)",
+        dest, " + library.json" if has_library else " — SIN library.json (re-empaqueta con --pack)",
+    )
