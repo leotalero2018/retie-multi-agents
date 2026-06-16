@@ -22,6 +22,27 @@ logging.basicConfig(level=logging.INFO, force=True)
 _nlm_proc: "asyncio.subprocess.Process | None" = None
 
 
+async def _drain_nlm_logs(proc: "asyncio.subprocess.Process") -> None:
+    """Reemite el stdout/stderr del servidor MCP en los logs del agente.
+
+    Imprescindible: sin esto el output del MCP cae en un PIPE que nadie lee, así
+    que (1) la causa real de los "HTTP 500 internal server error" (errores de
+    Playwright/navegador) queda OCULTA, y (2) el buffer del PIPE se llena (~64 KB)
+    y BLOQUEA el proceso MCP cuando intenta escribir más → cuelgues y 500s.
+    """
+    stream = proc.stdout
+    if stream is None:
+        return
+    try:
+        while True:
+            line = await stream.readline()
+            if not line:  # EOF: el proceso MCP terminó
+                break
+            logging.info("[NLM-MCP] %s", line.decode(errors="replace").rstrip())
+    except Exception as exc:
+        logging.warning("[NLM] log drain terminó: %s", exc)
+
+
 async def _setup_nlm_server() -> None:
     """Download the Playwright session from MinIO, start notebooklm-mcp in the
     background, and wait until the server is ready to accept requests.
@@ -67,6 +88,9 @@ async def _setup_nlm_server() -> None:
             stderr=asyncio.subprocess.STDOUT,
         )
         logging.info("[NLM] MCP server started (pid=%d, port=%d)", _nlm_proc.pid, port)
+        # Drena los logs del MCP a los nuestros: revela la causa real de los 500
+        # y evita que el PIPE sin leer se llene y cuelgue el proceso.
+        asyncio.create_task(_drain_nlm_logs(_nlm_proc))
     except FileNotFoundError:
         logging.warning("[NLM] 'npx' not found — install Node.js 20+ or set NOTEBOOKLM_ENABLED=false")
         return
