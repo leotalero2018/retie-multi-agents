@@ -99,6 +99,43 @@ def upload_nlm_session(source_dir: str | None = None) -> None:
     )
 
 
+def pack_nlm_session(source_dir: str | None = None, dest_dir: str | None = None) -> Path:
+    """Comprime browser_state/ a un .tar.gz LOCAL, sin tocar MinIO.
+
+    Pensado para cuando MinIO no es alcanzable: genera el archivo para subirlo
+    manualmente al bucket. El nombre del archivo coincide EXACTAMENTE con la clave
+    que Railway descarga (`_MINIO_KEY`), para que la subida manual use esa clave.
+
+    source_dir: carpeta browser_state/ (por defecto, la ruta del SO).
+    dest_dir:   carpeta de salida (por defecto ./sessions).
+    Devuelve la ruta del .tar.gz generado.
+    """
+    src = Path(source_dir) if source_dir else default_browser_state_dir()
+    if not src.exists():
+        raise FileNotFoundError(
+            f"browser_state directory not found: {src}\n"
+            "Make sure you authenticated first with: python setup_notebooklm.py"
+        )
+
+    out_dir = Path(dest_dir) if dest_dir else (Path.cwd() / "sessions")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / _MINIO_KEY
+
+    with tarfile.open(str(out_path), mode="w:gz") as tar:
+        tar.add(str(src), arcname="browser_state")
+
+    logger.info(
+        "[NLM] browser_state packed → %s (%.1f KB)",
+        out_path, out_path.stat().st_size / 1024,
+    )
+    return out_path
+
+
+def session_target() -> tuple[str, str]:
+    """(bucket, key) donde Railway espera la sesión — para la subida manual."""
+    return _bucket(), _MINIO_KEY
+
+
 def download_nlm_session(dest_dir: str | None = None) -> None:
     """Download and restore the browser_state archive from MinIO.
 

@@ -25,6 +25,7 @@ from aiogram.exceptions import TelegramBadRequest
 from retie_agent.agent.graph import run_graph
 from retie_agent.agent.registry import AGENTS as _AGENTS
 from retie_agent.services.history import clear_history
+from retie_agent.config import settings, as_bool
 
 # --- create router FIRST (before any @router.message decorators) ---
 router = Router(name="telegram_router")
@@ -281,12 +282,26 @@ async def _to_thread_ctx(func, *args, **kwargs):
 # Entrega con feedback: el "typing" de Telegram expira a los ~5s, así que en
 # consultas largas (NotebookLM puede tardar >30s) el chat parecía muerto.
 # Mantiene el typing vivo y, pasado un umbral, avisa que se está consultando.
-_PROGRESS_NOTICE = (
+#
+# El aviso menciona NotebookLM SOLO si la fuente está activada (NOTEBOOKLM_ENABLED):
+# con el flag apagado NotebookLM no se consulta, así que nombrarlo confundía.
+_PROGRESS_NOTICE_HYBRID = (
     "🔎 Estoy consultando la base normativa y NotebookLM para darte una "
+    "respuesta completa; puede tardar un poco más…"
+)
+_PROGRESS_NOTICE_CHROMA = (
+    "🔎 Estoy consultando la base normativa para darte una "
     "respuesta completa; puede tardar un poco más…"
 )
 _PROGRESS_AFTER_S = 10.0
 _TYPING_REFRESH_S = 4.0
+
+
+def _progress_notice() -> str:
+    """Aviso de progreso acorde al feature flag de NotebookLM (leído en cada uso
+    para reflejar cambios de configuración sin reiniciar el bot)."""
+    nlm_enabled = as_bool(getattr(settings, "NOTEBOOKLM_ENABLED", "false"))
+    return _PROGRESS_NOTICE_HYBRID if nlm_enabled else _PROGRESS_NOTICE_CHROMA
 
 
 async def _run_graph_with_feedback(message: Message, *args, **kwargs):
@@ -305,7 +320,7 @@ async def _run_graph_with_feedback(message: Message, *args, **kwargs):
         if not notified and elapsed >= _PROGRESS_AFTER_S:
             notified = True
             try:
-                await message.answer(_PROGRESS_NOTICE)
+                await message.answer(_progress_notice())
             except Exception:
                 pass
 

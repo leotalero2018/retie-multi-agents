@@ -10,9 +10,14 @@ Uso típico (ejecutar en LOCAL, no en Railway):
   # Terminal 2 — autenticar y configurar:
   python setup_notebooklm.py           # login + configuración
   python setup_notebooklm.py --upload  # sube la sesión a MinIO (para Railway)
+  python setup_notebooklm.py --pack    # solo comprime a ./sessions (subes a mano)
 
-La sesión de Playwright se guarda en ./nlm-session y se sube a MinIO como
-nlm-session.tar.gz para que Railway la descargue automáticamente al arrancar.
+Flags opcionales: --session-dir <ruta> (browser_state de origen),
+                  --out-dir <ruta>     (carpeta de salida de --pack, def. ./sessions)
+
+La sesión de Playwright (browser_state) se empaqueta como nlm-browser-state.tar.gz.
+--upload la sube a MinIO; --pack la deja local para subirla manualmente al bucket
+con esa misma clave. Railway la descarga al arrancar para restaurar la sesión.
 """
 import json
 import os
@@ -46,6 +51,11 @@ def _upload_session(session_dir: str | None = None) -> None:
     # MINIO_PRIVATE_ENDPOINT solo es accesible desde dentro de Railway.
     # Al correr localmente lo suprimimos para que _client() use MINIO_PUBLIC_ENDPOINT.
     _priv = os.environ.pop("MINIO_PRIVATE_ENDPOINT", None)
+
+    endpoint = os.getenv("MINIO_PUBLIC_ENDPOINT", "(no definido)")
+    print(f"Endpoint MinIO (público): {endpoint}")
+    # Falla rápido si el endpoint no responde, en vez de colgarse 5 min.
+    os.environ.setdefault("MINIO_CONNECT_TIMEOUT", "10")
     print("Comprimiendo y subiendo a MinIO ...")
     try:
         upload_nlm_session(str(src))
@@ -56,10 +66,70 @@ def _upload_session(session_dir: str | None = None) -> None:
         print("    NOTEBOOKLM_NOTEBOOK_ID=<tu_notebook_id>")
     except Exception as e:
         print(f"  ERROR al subir: {e}")
+        low = str(e).lower()
+        if "timed out" in low or "timeout" in low or "max retries" in low or "connection" in low:
+            print(
+                "\n  El endpoint público no respondió (problema de alcanzabilidad, no del archivo).\n"
+                f"  Endpoint usado: MINIO_PUBLIC_ENDPOINT={endpoint}\n\n"
+                "  Verifica que MINIO_PUBLIC_ENDPOINT apunte al host:puerto correctos:\n"
+                "    • En Railway, el acceso público a MinIO suele ser por un TCP Proxy con un\n"
+                "      puerto propio (NO el 443). Revísalo en Settings → Networking → TCP Proxy\n"
+                "      del servicio MinIO y usa, p. ej.:\n"
+                "        MINIO_PUBLIC_ENDPOINT=https://bucket-production-xxxx.up.railway.app:<PUERTO>\n"
+                "    • Comprueba la conectividad: curl -v "
+                "https://<host>:<puerto>/minio/health/live\n"
+                "  Alternativa: ejecuta este --upload desde un entorno con acceso a la red\n"
+                "  interna de Railway (MINIO_PRIVATE_ENDPOINT)."
+            )
         sys.exit(1)
     finally:
         if _priv:
             os.environ["MINIO_PRIVATE_ENDPOINT"] = _priv
+
+
+def _pack_session(session_dir: str | None = None, out_dir: str | None = None) -> None:
+    """Comprime la sesión a un .tar.gz LOCAL (carpeta ./sessions) para subirla a mano.
+
+    No toca MinIO: útil cuando el bucket no es alcanzable. Imprime la ruta del
+    archivo y el bucket/clave exactos donde debe subirse para que Railway lo use.
+    """
+    from dotenv import load_dotenv
+    load_dotenv()
+    from retie_agent.services.nlm_session import (
+        pack_nlm_session,
+        default_browser_state_dir,
+        _MINIO_KEY,
+    )
+
+    src = Path(session_dir) if session_dir else default_browser_state_dir()
+    print(f"\nDirectorio de sesión a comprimir: {src}")
+    if not src.exists():
+        print(f"\n  ERROR: No se encontró el directorio de sesión: {src}")
+        print("  Autentica primero con: python setup_notebooklm.py")
+        print("  O pasa la ruta explícita: python setup_notebooklm.py --pack --session-dir <ruta>")
+        sys.exit(1)
+
+    print("Comprimiendo a archivo local ...")
+    try:
+        out_path = pack_nlm_session(str(src), out_dir)
+    except Exception as e:
+        print(f"  ERROR al comprimir: {e}")
+        sys.exit(1)
+
+    size_kb = out_path.stat().st_size / 1024
+    print(f"\n  ✅ Sesión comprimida: {out_path}  ({size_kb:.1f} KB)")
+
+    # Bucket/clave destino (solo lee variables de entorno, sin red).
+    bucket = "<tu_bucket_MinIO>"
+    try:
+        from retie_agent.services.nlm_session import _bucket
+        bucket = _bucket()
+    except Exception:
+        pass
+    print("\n  Súbelo manualmente al bucket de MinIO con ESTA clave exacta:")
+    print(f"    bucket : {bucket}")
+    print(f"    key    : {_MINIO_KEY}   (en la raíz del bucket, sin prefijo)")
+    print("\n  Railway descargará esa clave al arrancar para restaurar la sesión de NotebookLM.")
 
 
 def main() -> None:
@@ -134,18 +204,25 @@ def main() -> None:
     session_dir = os.environ.get("PLAYWRIGHT_USER_DATA_DIR", DEFAULT_SESSION_DIR)
     if Path(session_dir).exists():
         print(f"\n  Sesión guardada en: {session_dir}")
-        print(f"  Para subir a MinIO (Railway): python setup_notebooklm.py --upload")
+        print(f"  Subir a MinIO (Railway):   python setup_notebooklm.py --upload")
+        print(f"  O comprimir para subir a mano: python setup_notebooklm.py --pack")
     print("  Puedes iniciar el bot.")
 
 
+def _flag_value(name: str) -> str | None:
+    """Devuelve el valor que sigue a un flag (p. ej. --session-dir <ruta>)."""
+    if name in sys.argv:
+        idx = sys.argv.index(name)
+        if idx + 1 < len(sys.argv):
+            return sys.argv[idx + 1]
+    return None
+
+
 if __name__ == "__main__":
-    if "--upload" in sys.argv:
-        # Soporte para --session-dir <ruta> explícita
-        session_dir: str | None = None
-        if "--session-dir" in sys.argv:
-            idx = sys.argv.index("--session-dir")
-            if idx + 1 < len(sys.argv):
-                session_dir = sys.argv[idx + 1]
-        _upload_session(session_dir)
+    if "--pack" in sys.argv:
+        # Comprime a ./sessions (o --out-dir) para subir a mano; no usa MinIO.
+        _pack_session(_flag_value("--session-dir"), _flag_value("--out-dir"))
+    elif "--upload" in sys.argv:
+        _upload_session(_flag_value("--session-dir"))
     else:
         main()

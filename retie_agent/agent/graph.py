@@ -147,6 +147,29 @@ def _format_chunks_for_trace(hits: List[Dict[str, Any]]) -> List[Dict[str, Any]]
     return docs
 
 
+def _format_nlm_sources(sources: List[Any], limit: int = 20) -> List[Dict[str, Any]]:
+    """Normaliza las fuentes/citas (footnotes) que devuelve NotebookLM para que
+    sean legibles en Langfuse, igual que _format_chunks_for_trace hace con Chroma.
+    La estructura real varía (items MCP 'resource' o dicts de 'data.sources'), así
+    que se extraen campos comunes de forma defensiva."""
+    out: List[Dict[str, Any]] = []
+    for i, s in enumerate((sources or [])[:limit], start=1):
+        if isinstance(s, dict):
+            text = s.get("text")
+            item: Dict[str, Any] = {
+                "rank": i,
+                "title": s.get("title") or s.get("name") or s.get("label"),
+                "uri": s.get("uri") or s.get("url") or s.get("source"),
+                "type": s.get("type"),
+            }
+            if isinstance(text, str) and text:
+                item["text"] = text[:500]
+            out.append({k: v for k, v in item.items() if v is not None})
+        else:
+            out.append({"rank": i, "value": str(s)[:500]})
+    return out
+
+
 def _retrieval_stats(hits: List[Dict[str, Any]], coll: str, top_k: int, thr: float) -> Dict[str, Any]:
     scores = [h.get("score") for h in hits if isinstance(h.get("score"), (int, float))]
     method = hits[0].get("retrieval_method", "dense") if hits else "none"
@@ -539,20 +562,23 @@ def _node_notebooklm(state: GraphState) -> GraphState:
         span_input={"question": q, "nlm_cache_hit": cache_kind},
     ) as span:
         nlm_answer = ""
+        nlm_sources: List[Dict[str, Any]] = []
+        error_msg = ""
         status = "disabled"
 
         # Cachear la respuesta tardía/abandonada de NLM: el navegador sigue
         # trabajando y la siguiente pregunta igual o similar será cache-hit.
         def _cache_late(fut, _q=q, _nb=nb_id, _emb=q_emb):
             try:
-                raw, _ = fut.result()
+                raw, raw_src = fut.result()
                 if raw and raw.strip():
-                    cache.set(_q, _nb, raw.strip(), [], embedding=_emb)
+                    cache.set(_q, _nb, raw.strip(), raw_src or [], embedding=_emb)
             except Exception:
                 pass
 
         if cached:
             nlm_answer = (cached[0] or "").strip()
+            nlm_sources = cached[1] or []
             status = f"cache_hit_{cache_kind}"
         elif not nlm_eligible:
             status = "skipped_short_query"
@@ -562,13 +588,17 @@ def _node_notebooklm(state: GraphState) -> GraphState:
             client = _get_notebooklm_client()
             nlm_fut = _POOL.submit(client.ask_question, q, "footnotes", nb_id)
             try:
-                raw_answer, _ = nlm_fut.result(timeout=hard_timeout)
+                raw_answer, raw_sources = nlm_fut.result(timeout=hard_timeout)
                 nlm_answer = (raw_answer or "").strip()
+                nlm_sources = raw_sources or []
                 if nlm_answer:
-                    cache.set(q, nb_id, nlm_answer, [], embedding=q_emb)
+                    cache.set(q, nb_id, nlm_answer, nlm_sources, embedding=q_emb)
+                # "empty" = NotebookLM respondió pero sin texto (sesión no
+                # autenticada, notebook_id inválido o sin coincidencias).
                 status = "ok" if nlm_answer else "empty"
             except FutureTimeoutError:
                 status = "timeout"
+                error_msg = f"NotebookLM no respondió en {hard_timeout:.0f}s"
                 logger.warning(
                     "notebooklm_node: espera de %.0fs agotada — sin aporte de NLM",
                     hard_timeout,
@@ -576,16 +606,33 @@ def _node_notebooklm(state: GraphState) -> GraphState:
                 nlm_fut.add_done_callback(_cache_late)
             except Exception as exc:
                 status = "error"
+                error_msg = str(exc)
                 logger.warning("notebooklm_node query failed: %s", exc)
 
         if span is not None:
             try:
+                # Output rico para depurar QUÉ trae NLM (y por qué viene vacío):
+                # el texto, las citas/footnotes, el status y el error si lo hubo.
+                output: Dict[str, Any] = {
+                    "answer": nlm_answer,
+                    "answer_len": len(nlm_answer),
+                    "answer_preview": nlm_answer[:1000],
+                    "sources": _format_nlm_sources(nlm_sources),
+                    "sources_count": len(nlm_sources),
+                    "status": status,
+                }
+                if error_msg:
+                    output["error"] = error_msg[:800]
                 span.update(
-                    output={
-                        "nlm_answer": nlm_answer,
-                        "nlm_answer_len": len(nlm_answer),
+                    output=output,
+                    metadata={
+                        "status": status,
+                        "nlm_cache_hit": cache_kind,
+                        "notebook_id": nb_id,
+                        "eligible": nlm_eligible,
+                        "wait_budget_s": hard_timeout,
+                        "question": q,
                     },
-                    metadata={"status": status, "nlm_cache_hit": cache_kind},
                 )
             except Exception:
                 pass
