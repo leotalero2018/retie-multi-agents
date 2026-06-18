@@ -11,11 +11,14 @@ import hashlib
 import json
 import logging
 import os
+import threading
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
+
+NLM_RECOVERY_NEEDED: threading.Event = threading.Event()
 
 logger = logging.getLogger(__name__)
 

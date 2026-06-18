@@ -23,7 +23,7 @@ from retie_agent.agent.prompt import (
 from retie_agent.agent.retie_agent import _dedupe_hits, _resolve_collection, _resolve_model
 from retie_agent.observability.obs import trace_ctx, span_ctx, log_generation
 from retie_agent.services.history import get_history, add_message
-from retie_agent.agent.notebooklm_client import NotebookLMClient, NotebookLMError, NotebookLMCache
+from retie_agent.agent.notebooklm_client import NotebookLMClient, NotebookLMError, NotebookLMCache, NLM_RECOVERY_NEEDED
 from retie_agent.agent.table_render import render_telegram_table, render_table_image
 
 # Executor compartido para trabajo paralelo (Chroma + NotebookLM, enrichment con
@@ -608,6 +608,10 @@ def _node_notebooklm(state: GraphState) -> GraphState:
                 status = "error"
                 error_msg = str(exc)
                 logger.warning("notebooklm_node query failed: %s", exc)
+                _msg = error_msg.lower()
+                if any(k in _msg for k in ("authenticated", "not auth", "login", "google", "expired", "cookie")):
+                    NLM_RECOVERY_NEEDED.set()
+                    logger.warning("notebooklm_node: sesión posiblemente expirada — recuperación on-demand programada")
 
         if span is not None:
             try:

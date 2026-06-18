@@ -203,21 +203,69 @@ async def _diagnose_nlm(nlm_url: str) -> None:
         logging.warning("[NLM] Diagnóstico falló: %s", exc)
 
 
+async def _try_recover_nlm_session(nlm_url: str) -> None:
+    """Reinicia el servidor MCP descargando la sesión más reciente desde MinIO.
+
+    Se invoca desde dos puntos:
+    - keepalive: cuando is_authenticated() devuelve False tras el intervalo normal.
+    - on-demand: cuando notebooklm_node señaliza NLM_RECOVERY_NEEDED por un error de auth.
+
+    Si MinIO no tiene sesión válida, el servidor arranca sin auth y los logs
+    indican que se requiere login manual (setup_notebooklm.py --upload).
+    """
+    global _nlm_proc
+    logging.info("[NLM] auto-recuperación: reiniciando servidor MCP...")
+
+    if _nlm_proc and _nlm_proc.returncode is None:
+        try:
+            _nlm_proc.terminate()
+            await asyncio.wait_for(_nlm_proc.wait(), timeout=10)
+        except (asyncio.TimeoutError, Exception):
+            try:
+                _nlm_proc.kill()
+            except Exception:
+                pass
+        _nlm_proc = None
+
+    await _setup_nlm_server()
+
+    def _check_auth() -> bool:
+        from retie_agent.agent.notebooklm_client import NotebookLMClient
+        return NotebookLMClient(base_url=nlm_url, timeout=30.0).is_authenticated()
+
+    try:
+        ok = await asyncio.get_running_loop().run_in_executor(None, _check_auth)
+        if ok:
+            logging.info("[NLM] auto-recuperación exitosa ✓ — sesión de Google restaurada")
+        else:
+            logging.warning(
+                "[NLM] auto-recuperación: servidor reiniciado pero sesión de Google "
+                "sigue inválida. Ejecuta setup_notebooklm.py localmente y sube con --upload."
+            )
+    except Exception as exc:
+        logging.warning("[NLM] auto-recuperación: verificación falló: %s", exc)
+
+
 async def _nlm_keepalive_loop(nlm_url: str) -> None:
-    """Mantiene viva la sesión de Google sin intervención manual.
+    """Mantiene viva la sesión de Google y reacciona a fallos sin intervención manual.
 
     Cada NOTEBOOKLM_KEEPALIVE_MINUTES:
       1. Toca la sesión vía get_health (Playwright refresca cookies al navegar).
-      2. Si sigue autenticada, sube el browser_state RENOVADO a MinIO — así los
-         próximos deploys arrancan con cookies frescas en vez del snapshot
-         original que envejece hasta vencer.
-    Una sesión ya vencida NO se puede resucitar desde código (el login de
-    Google requiere interacción humana): este loop evita llegar a ese punto.
+      2. Si sigue autenticada, sube el browser_state renovado a MinIO.
+      3. Si la sesión ya venció → intenta auto-recuperación (reinicia el proceso MCP).
+
+    Además revisa cada 60 s el flag NLM_RECOVERY_NEEDED: cuando notebooklm_node
+    detecta un error de autenticación lo activa para forzar recuperación inmediata
+    sin esperar al próximo intervalo de keepalive.
     """
+    from retie_agent.agent.notebooklm_client import NLM_RECOVERY_NEEDED
+
     minutes = int(getattr(settings, "NOTEBOOKLM_KEEPALIVE_MINUTES", 240))
     if minutes <= 0:
         return
-    interval = minutes * 60
+
+    POLL_INTERVAL = 60
+    elapsed = 0
 
     def _touch_and_backup() -> bool:
         from retie_agent.agent.notebooklm_client import NotebookLMClient
@@ -232,16 +280,27 @@ async def _nlm_keepalive_loop(nlm_url: str) -> None:
         return True
 
     while True:
-        await asyncio.sleep(interval)
+        await asyncio.sleep(POLL_INTERVAL)
+        elapsed += POLL_INTERVAL
+
+        if NLM_RECOVERY_NEEDED.is_set():
+            NLM_RECOVERY_NEEDED.clear()
+            elapsed = 0
+            logging.info("[NLM] recuperación on-demand solicitada por el grafo")
+            await _try_recover_nlm_session(nlm_url)
+            continue
+
+        if elapsed < minutes * 60:
+            continue
+
+        elapsed = 0
         try:
             ok = await asyncio.get_running_loop().run_in_executor(None, _touch_and_backup)
             if ok:
                 logging.info("[NLM] keepalive ✓ — sesión refrescada y respaldada en MinIO")
             else:
-                logging.warning(
-                    "[NLM] keepalive: la sesión de Google ya NO es válida — se "
-                    "requiere un login manual (setup_notebooklm.py) y --upload."
-                )
+                logging.warning("[NLM] keepalive: sesión inválida — iniciando auto-recuperación")
+                await _try_recover_nlm_session(nlm_url)
         except Exception as exc:
             logging.warning("[NLM] keepalive falló: %s", exc)
 
