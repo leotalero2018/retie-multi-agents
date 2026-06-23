@@ -25,6 +25,11 @@ from retie_agent.observability.obs import trace_ctx, span_ctx, log_generation
 from retie_agent.services.history import get_history, add_message
 from retie_agent.agent.notebooklm_client import NotebookLMClient, NotebookLMError, NotebookLMCache, NLM_RECOVERY_NEEDED
 from retie_agent.agent.table_render import render_telegram_table, render_table_image
+from retie_agent.agent.intent import (
+    classify_intent,
+    _TABLE_RE, _FULL_RE, _SMALLTALK_RE,   # re-exportados para compatibilidad
+    _wants_table, _wants_full,
+)
 
 # Executor compartido para trabajo paralelo (Chroma + NotebookLM, enrichment con
 # timeout). Es persistente a propósito: un `with ThreadPoolExecutor(...)` espera
@@ -56,41 +61,14 @@ class GraphState(TypedDict, total=False):
     notebooklm_enabled: bool   # flag que activa/desactiva el fan-out a notebooklm_node
     search_query: Optional[str]  # standalone query (condensed from history) used for retrieval
     suggestions: List[str]  # follow-up questions offered to the user after the answer
+    intent: Optional[str]        # exhaustiva | tabla | puntual | smalltalk (TICKET-001)
+    intent_source: Optional[str]  # "regex" | "llm" — origen de la clasificación
 
 
-# Detección de intención de tabla por palabra clave (determinística).
-_TABLE_RE = re.compile(r"\btablas?\b", re.IGNORECASE)
-
-
-def _wants_table(text: str) -> bool:
-    return bool(_TABLE_RE.search(text or ""))
-
-
-# Intención de respuesta EXHAUSTIVA ("dame todos los numerales", "la lista
-# completa", "sin omitir"): requiere más contexto recuperado y más tokens de
-# salida — los artículos con literales a)–y) no caben en el presupuesto normal.
-_FULL_RE = re.compile(
-    r"\b(todos?|todas?|completa|completos?|completas?|sin\s+omitir|"
-    r"lista\s+completa|al\s+pie\s+de\s+la\s+letra|literal(?:es)?|"
-    r"numerales?|cada\s+uno|exhaustiv[oa])\b",
-    re.IGNORECASE,
-)
-
-
-def _wants_full(text: str) -> bool:
-    return bool(_FULL_RE.search(text or ""))
-
-
-# Saludos / cortesías: se responden al instante, sin retrieval ni NotebookLM.
-# (Antes "Hola" disparaba el pipeline completo y esperaba al navegador de NLM
-# para terminar en "No tengo evidencia en los documentos".)
-_SMALLTALK_RE = re.compile(
-    r"^\s*(?:hola+|holi+|buen[oa]s(?:\s+(?:d[ií]as|tardes|noches))?|hey|hello|hi"
-    r"|(?:muchas\s+)?gracias+|ok(?:ey)?|vale|listo|perfecto|genial|excelente"
-    r"|adi[oó]s|hasta\s+luego|chao|nos\s+vemos"
-    r"|qu[ié][eé]n\s+eres|qu[eé]\s+puedes\s+hacer|ayuda)\s*[!.?¡¿]*\s*$",
-    re.IGNORECASE,
-)
+# La detección de intención (tabla / exhaustiva / smalltalk) vive en
+# retie_agent/agent/intent.py: clasificador LLM barato + regex como fallback
+# (_TABLE_RE, _FULL_RE, _SMALLTALK_RE, _wants_table, _wants_full se importan arriba).
+# route_entry usa classify_intent() como fuente primaria de decisión.
 
 _SMALLTALK_THANKS_RE = re.compile(
     r"gracias|adi[oó]s|hasta\s+luego|chao|nos\s+vemos|ok|vale|listo|perfecto|genial|excelente",
@@ -371,22 +349,39 @@ def _node_route_entry(state: GraphState) -> GraphState:
     """
     q = state.get("question", "")
     nlm_enabled = str(getattr(settings, "NOTEBOOKLM_ENABLED", "false")).lower() in ("1", "true", "yes")
-    route = "smalltalk" if _SMALLTALK_RE.match(q) else "retrieve"
-    wants_table = _wants_table(q)
-    wants_full = _wants_full(q)
+    # Clasificador de intención (TICKET-001): LLM barato con fallback a regex.
+    # Reemplaza el ruteo por regex como fuente PRIMARIA de la decisión.
+    intent = classify_intent(q, history=state.get("history"))
+    route = intent.route
+    wants_table = intent.wants_table
+    wants_full = intent.wants_full
     with span_ctx(
         None, "route_entry", as_type="chain",
-        span_input={"nlm_enabled": nlm_enabled, "wants_table": wants_table, "wants_full": wants_full},
+        span_input={
+            "nlm_enabled": nlm_enabled,
+            "intent": intent.intent,
+            "intent_source": intent.source,
+            "wants_table": wants_table,
+            "wants_full": wants_full,
+        },
     ) as span:
         if span is not None:
             try:
-                span.update(output={"route": route, "wants_table": wants_table, "wants_full": wants_full})
+                span.update(output={
+                    "route": route,
+                    "intent": intent.intent,
+                    "intent_source": intent.source,
+                    "wants_table": wants_table,
+                    "wants_full": wants_full,
+                })
             except Exception:
                 pass
     return {
         "route": route,
         "wants_table": wants_table,
         "wants_full": wants_full,
+        "intent": intent.intent,
+        "intent_source": intent.source,
         "notebooklm_enabled": nlm_enabled,
     }
 
