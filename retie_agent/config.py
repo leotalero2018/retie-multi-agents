@@ -73,7 +73,13 @@ class Settings(BaseSettings):
     QUERY_REWRITE_ENABLED: str = "true"
 
     # --- Enriquecimiento (OpenAI Assistants) ---
-    ENRICHMENT_ENABLED: str = "true"               # "false" → respuesta ~2x más rápida
+    # DECISIÓN (TICKET-003 / H-903): el enriquecimiento se MANTIENE pero queda
+    # restringido a redacción conectiva (instrucciones versionadas en
+    # enrichment_assistant.ENRICHMENT_INSTRUCTIONS) + verificador de fidelidad
+    # (agent/fidelity.py) que descarta toda salida que altere números, referencias
+    # o listas y entrega el borrador. Sigue habilitado por defecto porque la
+    # fidelidad ya se garantiza programáticamente; "false" → respuesta ~2x más rápida.
+    ENRICHMENT_ENABLED: str = "true"
     ENRICHMENT_TIMEOUT: float = 30.0               # segundos máx. para el assistant
 
     # --- Sugerencias de preguntas de seguimiento ---

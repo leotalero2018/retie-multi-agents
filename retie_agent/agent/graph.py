@@ -886,6 +886,7 @@ def _node_table(state: GraphState) -> GraphState:
 
 
 from retie_agent.agent.enrichment_assistant import EnrichmentAssistant
+from retie_agent.agent.fidelity import enrichment_preserves_fidelity, fidelity_diff
 import os
 from retie_agent.config import ENRICHMENT_ASSISTANT_ID, ENRICHMENT_VECTOR_STORE_ID
 from retie_agent.observability.obs import span_ctx, log_generation  # ✅ keep logs visible in Langfuse
@@ -950,6 +951,17 @@ def _node_enrich(state: GraphState) -> GraphState:
             enriched = base_answer
             status = "fallback"
 
+        # 🛡️ Guarda de fidelidad (TICKET-003 / H-903): el enriquecedor solo puede
+        # mejorar la redacción, NO alterar números, referencias ni listas. Si la
+        # versión enriquecida cambió, omitió o inventó algún token crítico respecto
+        # del borrador, se DESCARTA y se entrega el borrador (siempre fiel).
+        fidelity_drift = None
+        if status == "ok" and not enrichment_preserves_fidelity(base_answer, enriched):
+            fidelity_drift = fidelity_diff(base_answer, enriched)
+            logger.warning("enrich_node rechazado por deriva de fidelidad: %s", fidelity_drift)
+            enriched = base_answer
+            status = "rejected_fidelity"
+
         # 🔍 Registro en Langfuse: permite ver la salida y el estado del enriquecimiento
         try:
             log_generation(
@@ -962,6 +974,7 @@ def _node_enrich(state: GraphState) -> GraphState:
                     "assistant_id": ENRICHMENT_ASSISTANT_ID,
                     "vector_store_id": ENRICHMENT_VECTOR_STORE_ID,
                     "status": status,
+                    "fidelity_drift": fidelity_drift,
                 },
             )
         except Exception:
