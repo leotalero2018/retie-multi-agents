@@ -38,6 +38,12 @@ class Settings(BaseSettings):
     CHAT_MODEL: str = "gpt-4o-mini"
     MAX_TOKENS: int = 600
 
+    # --- Clasificación de intención (TICKET-001) ---
+    # Clasificador LLM barato con salida {exhaustiva, tabla, puntual, smalltalk}.
+    # "false" → solo el regex ampliado (fallback determinístico, sin red).
+    INTENT_LLM_ENABLED: str = "true"
+    INTENT_MODEL: str = "gpt-4o-mini"              # modelo barato para clasificar
+
     # --- RAG / Chroma ---
     CHROMA_PERSIST_DIR: str = "data/chroma_db"     # primary
     CHROMA_DB_DIR: Optional[str] = None            # legacy env; normalized to the same path
