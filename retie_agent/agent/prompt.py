@@ -9,6 +9,20 @@ SYSTEM_PROMPT_RETIE = (
     "reproduces fielmente sin redondear ni omitir."
 )
 
+# System prompt para consultas derivadas de imagen o nota de voz cuando NO hay
+# evidencia recuperada de la base (Chroma/NotebookLM). El material a interpretar
+# (texto OCR, lectura visual o transcripción) viaja dentro del propio mensaje, así
+# que aquí el asistente responde a partir de ese contenido en lugar de cortar con
+# el genérico "no tengo evidencia" (que ante una foto se sentía como ignorarla).
+SYSTEM_PROMPT_MEDIA = (
+    "Eres un asistente experto en normativa eléctrica colombiana (RETIE y NTC 2050). "
+    "El usuario te envió una imagen o una nota de voz; su contenido (texto detectado, "
+    "interpretación visual o transcripción) viene incluido en el mensaje. Responde su "
+    "consulta de forma breve y precisa con base en ese contenido. Si la consulta queda "
+    "fuera del alcance eléctrico/normativo, ayúdale igualmente con lo que sea visible en "
+    "el material aportado y acláralo en una frase. No inventes datos que no estén presentes."
+)
+
 # Reescritura de preguntas de seguimiento: convierte una pregunta que depende
 # del historial ("¿y eso aplica en baja tensión?") en una autocontenida para
 # que el retrieval (Chroma/NotebookLM) reciba todo el contexto necesario.

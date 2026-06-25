@@ -79,6 +79,20 @@ _SMALLTALK_RE = re.compile(
 )
 
 
+def _looks_like_question(text: str) -> bool:
+    """¿El texto trae una pregunta explícita (signo de interrogación)?
+
+    Backstop NARROW del clasificador LLM (capa primaria): si el usuario escribió
+    "?"/"¿" hay una pregunta real de por medio, así que el mensaje no puede ser
+    smalltalk —aunque empiece con un saludo ("hola, ¿qué es el RETIE?")—. Se
+    mantiene conservador a propósito (solo signos de interrogación) para no
+    confundir un saludo largo y cortés con una consulta; esa decisión matizada
+    (mezclas, imperativos sin signo) la toma el LLM con su prompt mejorado.
+    """
+    t = (text or "").strip()
+    return "?" in t or "¿" in t
+
+
 def _wants_table(text: str) -> bool:
     """Compat: True si el texto pide una tabla (regex determinístico)."""
     return bool(_TABLE_RE.search(text or ""))
@@ -121,7 +135,20 @@ _SYSTEM_PROMPT = (
     "(\"la tabla 220.55\", \"tabla de calibres\", \"ampacidades en tabla\").\n"
     "- puntual: pregunta por un dato único y acotado "
     "(\"¿cuál es la tensión nominal?\", \"¿qué significa GFCI?\", \"define acometida\").\n"
-    "- smalltalk: saludo, agradecimiento, despedida o pregunta sobre el propio bot.\n\n"
+    "- smalltalk: SOLO saludo, agradecimiento o despedida a secas, o una pregunta "
+    "sobre el propio bot (\"¿quién eres?\", \"¿qué puedes hacer?\").\n\n"
+    "REGLA CLAVE: si el mensaje MEZCLA un saludo o cortesía CON una pregunta o "
+    "petición de información (p. ej. \"hola, ¿qué es el RETIE?\"), clasifícalo por la "
+    "PREGUNTA y NUNCA como smalltalk. Solo es smalltalk cuando NO hay ninguna "
+    "pregunta ni petición sobre normativa eléctrica.\n\n"
+    "Ejemplos:\n"
+    "- \"hola\" → smalltalk\n"
+    "- \"gracias, muy amable\" → smalltalk\n"
+    "- \"buenas, ¿quién eres?\" → smalltalk\n"
+    "- \"hola, ¿qué es el RETIE?\" → puntual\n"
+    "- \"buenas tardes, dame los requisitos de puesta a tierra\" → exhaustiva\n"
+    "- \"hey, pásame la tabla 220.55\" → tabla\n"
+    "- \"¿cuál es la tensión nominal de servicio?\" → puntual\n\n"
     "Responde con una sola palabra: exhaustiva, tabla, puntual o smalltalk."
 )
 
@@ -165,7 +192,7 @@ def _llm_classify(question: str, history: Optional[List[Dict[str, str]]] = None)
         resp = client.chat.completions.create(
             model=model,
             temperature=0.0,
-            max_tokens=4,
+            max_tokens=8,
             messages=[
                 {"role": "system", "content": _SYSTEM_PROMPT},
                 {"role": "user", "content": (question or "").strip()[:500]},
@@ -205,6 +232,7 @@ def classify_intent(
     question: str,
     *,
     history: Optional[List[Dict[str, str]]] = None,
+    is_media: bool = False,
 ) -> IntentResult:
     """Clasifica la intención de la consulta.
 
@@ -212,15 +240,34 @@ def classify_intent(
       1. smalltalk puro por regex anclado → respuesta inmediata, sin LLM.
       2. clasificador LLM (si está habilitado y disponible) → fuente primaria.
       3. regex ampliado → fallback determinístico (cubre el léxico de negocio).
+      4. guardarraíl: una pregunta clara —o cualquier contenido de imagen/voz—
+         nunca es smalltalk, aunque el LLM lo etiquete así.
+
+    `is_media=True` indica que el texto proviene de una imagen (OCR/Vision) o de
+    una nota de voz (transcripción); ese material nunca es un saludo.
     """
     q = (question or "").strip()
 
-    # 1. Fast-path: smalltalk evidente no paga LLM.
-    if _SMALLTALK_RE.match(q):
+    # 1. Fast-path: smalltalk evidente no paga LLM. No aplica a contenido derivado
+    #    de imagen/voz: el texto compuesto (OCR/Vision/transcripción) podría
+    #    parecer un saludo, pero el usuario envió un medio para que lo procesemos.
+    if not is_media and _SMALLTALK_RE.match(q):
         return _build_result("smalltalk", "regex")
 
     # 2. LLM como fuente primaria; 3. regex como fallback.
     llm_label = _llm_classify(q, history)
     if llm_label is not None:
-        return _build_result(llm_label, "llm")
-    return _build_result(_regex_intent(q), "regex")
+        intent, source = llm_label, "llm"
+    else:
+        intent, source = _regex_intent(q), "regex"
+
+    # 4. Guardarraíl determinístico (raíz de los bugs reportados): una consulta
+    #    clara (con "?" o varias palabras) o cualquier contenido de imagen/voz
+    #    JAMÁS es smalltalk. Si quedó etiquetado así, se reclasifica para que pase
+    #    por recuperación en vez de devolver el mensaje de bienvenida.
+    if intent == "smalltalk" and (is_media or _looks_like_question(q)):
+        fallback = _regex_intent(q)
+        intent = fallback if fallback != "smalltalk" else "puntual"
+        source = f"{source}+guard"
+
+    return _build_result(intent, source)

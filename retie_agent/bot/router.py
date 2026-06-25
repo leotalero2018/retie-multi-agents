@@ -557,19 +557,38 @@ async def _download_image_to_tmp(message: Message) -> Optional[Path]:
 
 
 def _compose_question_from_image(caption: str, ocr_txt: str, vision_txt: str) -> str:
-    """Ensures the OCR/vision content is included in the prompt to the agent."""
+    """Ensures the OCR/vision content is included in the prompt to the agent.
+
+    Incluye AMBAS fuentes cuando existen: la lectura visual (razonamiento de Vision)
+    y el texto crudo del OCR. Antes solo se anexaba el OCR cuando lo había,
+    descartando la interpretación de Vision aunque se hubiera ejecutado.
+    """
     parts: List[str] = []
     if caption:
         parts.append(f"Usuario dijo sobre la imagen: {caption.strip()}")
+    if vision_txt:
+        parts.append(f"Contenido interpretado de la imagen:\n{vision_txt.strip()}")
     if ocr_txt:
         parts.append(f"Texto detectado en la imagen:\n{ocr_txt.strip()}")
-    elif vision_txt:
-        parts.append(f"Contenido interpretado de la imagen:\n{vision_txt.strip()}")
-    if not parts:
+    if not ocr_txt and not vision_txt:
         parts.append("Interpreta la imagen y responde según el RETIE.")
 
     parts.append("Con base en lo anterior, responde la consulta del usuario de forma breve y precisa.")
     return "\n\n".join(parts)
+
+
+# Léxico que indica que el caption es una PREGUNTA o instrucción sobre el contenido
+# visual (no solo "mira esto"): obliga a correr Vision aunque el OCR traiga texto.
+_IMAGE_QUESTION_RE = re.compile(
+    r"\?|¿|\b(qu[eé]|cu[aá]l(?:es)?|cu[aá]nto|c[oó]mo|seg[uú]n|tipo|clase|"
+    r"identifica|analiza|interpreta|explica|indica|dime)\b",
+    re.IGNORECASE,
+)
+
+
+def _caption_asks_about_image(caption: str) -> bool:
+    """True si el caption pide razonar sobre la imagen (pregunta o instrucción)."""
+    return bool(caption and _IMAGE_QUESTION_RE.search(caption))
 
 
 # ----------------------- VOICE/AUDIO -----------------------
@@ -631,15 +650,21 @@ async def on_photo(message: Message):
     if not img_path:
         return await message.answer("No pude descargar la imagen.")
 
-    ocr_lang = os.getenv("OCR_LANG", "eng")  # set OCR_LANG=spa if you installed Spanish data
+    # Default spa+eng (coincide con vision.py y el Dockerfile): el "eng" anterior
+    # producía OCR basura en etiquetas/documentos en español.
+    ocr_lang = os.getenv("OCR_LANG", "spa+eng")
     ocr_txt = ""
     try:
         ocr_txt = ocr_image(img_path, lang=ocr_lang)
     except Exception:
         ocr_txt = ""
 
+    # Vision corre no solo como fallback de OCR, también cuando el caption es una
+    # PREGUNTA sobre el contenido visual ("¿qué tipo de lavadora es?"): eso exige
+    # razonar sobre la imagen y no basta con extraer texto.
     vision_txt = ""
-    if not ocr_txt or len(ocr_txt) < 12:
+    need_vision = (not ocr_txt or len(ocr_txt) < 12) or _caption_asks_about_image(message.caption or "")
+    if need_vision:
         try:
             vision_txt = vision_extract_insights(
                 img_path,
@@ -648,6 +673,16 @@ async def on_photo(message: Message):
             )
         except Exception:
             vision_txt = ""
+
+    # Imagen ilegible: ni OCR ni Vision aportaron contenido. En vez de mandar una
+    # pregunta vacía al grafo (que terminaba en el saludo de bienvenida), avisamos
+    # con honestidad y pedimos describirla en texto. Rompe el loop de respuestas
+    # idénticas al reintentar la misma imagen.
+    if not ocr_txt.strip() and not vision_txt.strip():
+        return await message.answer(
+            "🖼️ No pude leer el contenido de la imagen. "
+            "¿Puedes describir lo que ves o escribir tu pregunta en texto?"
+        )
 
     question = _compose_question_from_image(message.caption or "", ocr_txt, vision_txt)
     LAST_QUERY[message.chat.id] = question

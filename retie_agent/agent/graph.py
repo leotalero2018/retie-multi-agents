@@ -17,6 +17,7 @@ from retie_agent.agent.prompt import (
     make_prompt,
     make_hybrid_prompt,
     SYSTEM_PROMPT_RETIE,
+    SYSTEM_PROMPT_MEDIA,
     CONDENSE_PROMPT,
     format_history_for_condense,
 )
@@ -63,6 +64,7 @@ class GraphState(TypedDict, total=False):
     suggestions: List[str]  # follow-up questions offered to the user after the answer
     intent: Optional[str]        # exhaustiva | tabla | puntual | smalltalk (TICKET-001)
     intent_source: Optional[str]  # "regex" | "llm" — origen de la clasificación
+    source: Optional[str]        # "text" | "image" | "voice" | "suggestion" — origen del mensaje
 
 
 # La detección de intención (tabla / exhaustiva / smalltalk) vive en
@@ -93,13 +95,14 @@ def _node_smalltalk(state: GraphState) -> GraphState:
         return {"answer": answer}
 
 
-def make_state(question: str, *, user_id: str = "anon", session: str = "default", agent_key: Optional[str] = None, history: Optional[List[Dict[str, str]]] = None) -> GraphState:
+def make_state(question: str, *, user_id: str = "anon", session: str = "default", agent_key: Optional[str] = None, history: Optional[List[Dict[str, str]]] = None, source: Optional[str] = None) -> GraphState:
     return {
         "question": (question or "").strip(),
         "user_id": user_id or "anon",
         "session": session or "default",
         "agent_key": agent_key,
         "history": history or [],
+        "source": source,
     }
 
 _client = OpenAI(api_key=getattr(settings, "OPENAI_API_KEY", None))
@@ -351,7 +354,9 @@ def _node_route_entry(state: GraphState) -> GraphState:
     nlm_enabled = str(getattr(settings, "NOTEBOOKLM_ENABLED", "false")).lower() in ("1", "true", "yes")
     # Clasificador de intención (TICKET-001): LLM barato con fallback a regex.
     # Reemplaza el ruteo por regex como fuente PRIMARIA de la decisión.
-    intent = classify_intent(q, history=state.get("history"))
+    # `is_media`: el contenido derivado de imagen/voz nunca es smalltalk.
+    is_media = state.get("source") in ("image", "voice")
+    intent = classify_intent(q, history=state.get("history"), is_media=is_media)
     route = intent.route
     wants_table = intent.wants_table
     wants_full = intent.wants_full
@@ -395,19 +400,31 @@ def _node_answer(state: GraphState) -> GraphState:
     # (table_node, stylist_node) tal como antes.
     hits = state.get("chromadb_docs") or []
     nlm_answer = (state.get("notebooklm_docs") or "").strip()
+    source = state.get("source")
 
     if not hits and not nlm_answer:
-        return {
-            "answer": "No tengo evidencia en los documentos.",
-            "hits": hits,
-            "nlm_answer": nlm_answer,
-            "route": "no_context",
-        }
+        # Imagen/voz sin evidencia recuperada: el material a interpretar (texto
+        # OCR/Vision o transcripción) viaja en la propia pregunta, así que se
+        # responde desde ahí con un prompt dedicado en vez de cortar con el
+        # genérico "no tengo evidencia" (que ante una foto se sentía como ignorarla).
+        if source not in ("image", "voice"):
+            return {
+                "answer": "No tengo evidencia en los documentos.",
+                "hits": hits,
+                "nlm_answer": nlm_answer,
+                "route": "no_context",
+            }
 
     model = _resolve_model(agent_key, explicit=None)
-    sys = SYSTEM_PROMPT_RETIE
-    # Use hybrid prompt when both sources are available
-    prompt = make_hybrid_prompt(hits, nlm_answer, q, is_admin=False)
+    media_only = not hits and not nlm_answer
+    if media_only:
+        # El contenido de la imagen/voz ya está en `q` (lo compuso el router).
+        sys = SYSTEM_PROMPT_MEDIA
+        prompt = q
+    else:
+        sys = SYSTEM_PROMPT_RETIE
+        # Use hybrid prompt when both sources are available
+        prompt = make_hybrid_prompt(hits, nlm_answer, q, is_admin=False)
     messages = [{"role": "system", "content": sys}]
     for msg in state.get("history", []):
         messages.append(msg)
@@ -1294,12 +1311,17 @@ def run_graph(
     history = get_history(session, limit=getattr(settings, "HISTORY_LIMIT", 10))
     add_message(session, user_id, "user", question)
 
+    # `via` (text/image/voice/suggestion) viene del router; lo propagamos como
+    # `source` para que route_entry/answer_node sepan si el mensaje es multimodal.
+    source = (metadata or {}).get("via")
+
     state_in = make_state(
         question,
         user_id=user_id,
         session=session,
         agent_key=agent_key,
         history=history,
+        source=source,
     )
 
     trace_input = {
