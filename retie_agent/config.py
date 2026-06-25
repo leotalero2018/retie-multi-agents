@@ -35,14 +35,14 @@ class Settings(BaseSettings):
     EMBEDDING_PROVIDER: str = "openai"             # "openai" | "local"
     CHAT_PROVIDER: str = "openai"                  # "openai" | "extractive"
     EMBEDDING_MODEL: str = "text-embedding-3-small"
-    CHAT_MODEL: str = "gpt-4o-mini"
+    CHAT_MODEL: str = "gpt-5.4-nano-2026-03-17"
     MAX_TOKENS: int = 600
 
     # --- Clasificación de intención (TICKET-001) ---
     # Clasificador LLM barato con salida {exhaustiva, tabla, puntual, smalltalk}.
     # "false" → solo el regex ampliado (fallback determinístico, sin red).
     INTENT_LLM_ENABLED: str = "true"
-    INTENT_MODEL: str = "gpt-4o-mini"              # modelo barato para clasificar
+    INTENT_MODEL: str = "gpt-5.4-nano-2026-03-17"              # modelo barato para clasificar
 
     # --- RAG / Chroma ---
     CHROMA_PERSIST_DIR: str = "data/chroma_db"     # primary
