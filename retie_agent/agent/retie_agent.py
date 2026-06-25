@@ -9,6 +9,7 @@ from collections import OrderedDict
 from openai import OpenAI
 
 from retie_agent.config import settings
+from retie_agent.llm.provider import create_chat_completion
 from retie_agent.retriever.retrieve import search
 from retie_agent.agent.prompt import make_prompt
 
@@ -119,7 +120,8 @@ class RetieAgent:
         prompt = make_prompt(hits, question, is_admin=is_admin)
 
         # Call LLM
-        resp = _client.chat.completions.create(
+        resp = create_chat_completion(
+            _client,
             model=model,
             temperature=0.0,
             messages=[{"role": "system", "content": sys}, {"role": "user", "content": prompt}],

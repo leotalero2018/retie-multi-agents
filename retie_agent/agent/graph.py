@@ -12,6 +12,7 @@ from langgraph.graph import StateGraph, END
 from openai import OpenAI
 
 from retie_agent.config import settings, as_bool
+from retie_agent.llm.provider import create_chat_completion
 from retie_agent.retriever.retrieve import search, expand_hits_with_page_context
 from retie_agent.agent.prompt import (
     make_prompt,
@@ -283,7 +284,8 @@ def _node_condense(state: GraphState) -> GraphState:
             prompt = CONDENSE_PROMPT.format(
                 history=format_history_for_condense(history), question=q
             )
-            resp = _client.chat.completions.create(
+            resp = create_chat_completion(
+            _client,
                 model=_resolve_model(state.get("agent_key"), explicit=None),
                 temperature=0.0,
                 max_tokens=150,
@@ -459,7 +461,8 @@ def _node_answer(state: GraphState) -> GraphState:
         as_type="chain",
         span_input={"question": q},
     ) as span:
-        resp = _client.chat.completions.create(
+        resp = create_chat_completion(
+            _client,
             model=model,
             temperature=temperature,
             max_tokens=max_tokens,
@@ -852,7 +855,8 @@ def _node_table(state: GraphState) -> GraphState:
         final_text = base_answer
         image: Optional[bytes] = None
         try:
-            resp = _client.chat.completions.create(
+            resp = create_chat_completion(
+            _client,
                 model=model,
                 temperature=0.0,
                 max_tokens=_TABLE_MAX_TOKENS,
@@ -1077,7 +1081,8 @@ def _node_suggest(state: GraphState) -> GraphState:
                 user_messages="\n".join(f"- {m[:300]}" for m in user_msgs),
                 answer=answer_text[:600],
             )
-            resp = _client.chat.completions.create(
+            resp = create_chat_completion(
+            _client,
                 model=_resolve_model(state.get("agent_key"), explicit=None),
                 temperature=0.7,
                 max_tokens=200,
