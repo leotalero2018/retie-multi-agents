@@ -10,6 +10,7 @@ from typing import Optional, Dict, Any
 
 import httpx
 from retie_agent.config import settings
+from retie_agent.llm.provider import create_chat_completion
 
 
 # ---------------- OpenAI client ----------------
@@ -99,7 +100,8 @@ def vision_extract_insights(path: Path, user_prompt: str = "", *, model: Optiona
     )
 
     try:
-        r = client.chat.completions.create(
+        r = create_chat_completion(
+            client,
             model=mdl,
             temperature=0,
             max_tokens=600,
@@ -137,7 +139,8 @@ def vision_extract_question(path: Path, *, model: Optional[str] = None) -> str:
     )
 
     try:
-        r = client.chat.completions.create(
+        r = create_chat_completion(
+            client,
             model=mdl,
             temperature=0,
             max_tokens=120,
@@ -262,7 +265,8 @@ def analyze_question_image(path: Path, agent_key: str) -> Dict[str, Any]:
             f"Fragmentos del RETIE:\n{context_text}"
         )
 
-        r = client.chat.completions.create(
+        r = create_chat_completion(
+            client,
             model=mdl,
             temperature=0.0,
             max_tokens=200,

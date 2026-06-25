@@ -32,6 +32,7 @@ from typing import List, Dict, Optional
 from openai import OpenAI
 
 from retie_agent.config import settings, as_bool
+from retie_agent.llm.provider import create_chat_completion
 
 logger = logging.getLogger(__name__)
 
@@ -212,7 +213,8 @@ def _llm_classify(question: str, history: Optional[List[Dict[str, str]]] = None)
 
     model = getattr(settings, "INTENT_MODEL", None) or getattr(settings, "CHAT_MODEL", "gpt-4o-mini")
     try:
-        resp = client.chat.completions.create(
+        resp = create_chat_completion(
+            client,
             model=model,
             temperature=0.0,
             max_tokens=8,
