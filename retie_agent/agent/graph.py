@@ -95,6 +95,21 @@ def _node_smalltalk(state: GraphState) -> GraphState:
         return {"answer": answer}
 
 
+# Respuesta para consultas vagas/incompletas ("que", "que es"): se pide precisión
+# en vez de devolver el saludo de bienvenida o un genérico "sin evidencia".
+_AMBIGUOUS_CLARIFY = (
+    "🤔 ¿Podrías darme un poco más de detalle? Cuéntame sobre qué tema del RETIE o "
+    "la NTC 2050 quieres saber —por ejemplo: puesta a tierra, calibres de conductor, "
+    "tableros, tomas GFCI, distancias de seguridad— o escribe tu pregunta completa."
+)
+
+
+def _node_clarify(state: GraphState) -> GraphState:
+    q = state.get("question", "")
+    with span_ctx(None, "clarify_node", as_type="chain", span_input={"question": q}):
+        return {"answer": _AMBIGUOUS_CLARIFY}
+
+
 def make_state(question: str, *, user_id: str = "anon", session: str = "default", agent_key: Optional[str] = None, history: Optional[List[Dict[str, str]]] = None, source: Optional[str] = None) -> GraphState:
     return {
         "question": (question or "").strip(),
@@ -1196,17 +1211,32 @@ def build_graph():
     g.add_node("no_context", _node_no_context)
     g.add_node("table_node", _node_table)
     g.add_node("smalltalk_node", _node_smalltalk)
+    g.add_node("clarify_node", _node_clarify)
     g.add_node("suggest_node", _node_suggest)
 
     # Entry: smalltalk responde directo; lo demás pasa por condense_node
     # (reescritura de seguimiento) y de ahí al fan-out de recuperación.
     g.set_entry_point("route_entry")
+
+    def _entry_branch(s: GraphState) -> str:
+        route = s.get("route")
+        if route == "smalltalk":
+            return "smalltalk"
+        if route == "ambiguous":
+            return "ambiguous"
+        return "condense"
+
     g.add_conditional_edges(
         "route_entry",
-        lambda s: "smalltalk" if s.get("route") == "smalltalk" else "condense",
-        {"smalltalk": "smalltalk_node", "condense": "condense_node"},
+        _entry_branch,
+        {
+            "smalltalk": "smalltalk_node",
+            "ambiguous": "clarify_node",
+            "condense": "condense_node",
+        },
     )
     g.add_edge("smalltalk_node", "stylist_node")
+    g.add_edge("clarify_node", "stylist_node")
 
     # ── Fan-out de recuperación (ramas paralelas que convergen) ──────────────
     # La conditional edge devuelve la LISTA de ramas a ejecutar:

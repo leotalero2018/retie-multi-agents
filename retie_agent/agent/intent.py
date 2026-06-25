@@ -36,7 +36,8 @@ from retie_agent.config import settings, as_bool
 logger = logging.getLogger(__name__)
 
 # Categorías válidas de intención.
-_LABELS = ("exhaustiva", "tabla", "puntual", "smalltalk")
+#   ambiguous = fragmento vago/incompleto ("que", "que es") → se pide aclaración.
+_LABELS = ("exhaustiva", "tabla", "puntual", "smalltalk", "ambiguous")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -69,28 +70,50 @@ _FULL_RE = re.compile(
 
 
 # Saludos / cortesías: se responden al instante, sin retrieval ni NotebookLM.
-# El `[¡¿]*` inicial tolera signos de apertura ("¿quién eres?").
+# `_GREET_CLAUSE` es UNA cláusula de saludo; el patrón completo admite VARIAS
+# encadenadas ("hola buenas tardes", "hola, ¿cómo estás?") pero NO fragmentos
+# sueltos como "que" o "que es" (esos caen en `ambiguous`). El regex es la ÚNICA
+# autoridad para emitir el saludo: el LLM no puede, por sí solo, disparar el
+# mensaje de bienvenida (evita falsos positivos del tipo "que" → saludo).
+_GREET_CLAUSE = (
+    r"(?:hola+|holi+|holis+|buen[oa]s(?:\s+(?:d[ií]as|tardes|noches))?"
+    r"|hey+|hello+|hi+|saludos|qu[eé]\s+tal|qu[eé]\s+m[aá]s|c[oó]mo\s+est[aá]s"
+    r"|(?:muchas\s+)?gracias+|ok(?:ey)?|vale|listo|perfecto|genial|excelente|de\s+nada"
+    r"|adi[oó]s|hasta\s+luego|cha[uo]+|nos\s+vemos"
+    r"|qu[ié][eé]n\s+eres|qu[eé]\s+puedes\s+hacer|ayuda)"
+)
 _SMALLTALK_RE = re.compile(
-    r"^\s*[¡¿]*\s*(?:hola+|holi+|buen[oa]s(?:\s+(?:d[ií]as|tardes|noches))?|hey|hello|hi"
-    r"|(?:muchas\s+)?gracias+|ok(?:ey)?|vale|listo|perfecto|genial|excelente"
-    r"|adi[oó]s|hasta\s+luego|chao|nos\s+vemos"
-    r"|qu[ié][eé]n\s+eres|qu[eé]\s+puedes\s+hacer|ayuda)\s*[!.?¡¿]*\s*$",
+    r"^\s*[¡¿]*\s*"
+    + _GREET_CLAUSE
+    + r"(?:[\s,.!?¡¿]+(?:y\s+)?" + _GREET_CLAUSE + r")*"
+    + r"\s*[!.?¡¿]*\s*$",
     re.IGNORECASE,
 )
 
 
-def _looks_like_question(text: str) -> bool:
-    """¿El texto trae una pregunta explícita (signo de interrogación)?
+# Palabras funcionales/interrogativas que no aportan tema. Un mensaje compuesto
+# SOLO por ellas es demasiado vago para recuperar algo útil ("que", "que es").
+_STOPWORDS = {
+    "que", "qué", "es", "son", "el", "la", "los", "las", "un", "una", "unos",
+    "unas", "de", "del", "al", "en", "con", "por", "para", "se", "su", "sus",
+    "lo", "le", "me", "mi", "tu", "te", "como", "cómo", "cual", "cuál", "cuales",
+    "cuáles", "eso", "esa", "ese", "esto", "esta", "este", "asi", "así", "mas",
+    "más", "muy", "ya", "hay", "sobre", "cuanto", "cuánto", "cuando", "cuándo",
+}
 
-    Backstop NARROW del clasificador LLM (capa primaria): si el usuario escribió
-    "?"/"¿" hay una pregunta real de por medio, así que el mensaje no puede ser
-    smalltalk —aunque empiece con un saludo ("hola, ¿qué es el RETIE?")—. Se
-    mantiene conservador a propósito (solo signos de interrogación) para no
-    confundir un saludo largo y cortés con una consulta; esa decisión matizada
-    (mezclas, imperativos sin signo) la toma el LLM con su prompt mejorado.
+
+def _is_too_vague(text: str) -> bool:
+    """¿El mensaje es demasiado corto/incompleto para recuperar algo útil?
+
+    True cuando, quitando palabras funcionales/interrogativas, no queda ningún
+    término de contenido: "que", "que es", "y eso", "cómo así". No es un saludo
+    ni una consulta respondible → conviene pedir aclaración en vez de saludar.
     """
-    t = (text or "").strip()
-    return "?" in t or "¿" in t
+    content = [
+        w for w in re.findall(r"\w+", (text or "").lower(), re.UNICODE)
+        if len(w) > 1 and w not in _STOPWORDS
+    ]
+    return not content
 
 
 def _wants_table(text: str) -> bool:
@@ -210,19 +233,25 @@ def _llm_classify(question: str, history: Optional[List[Dict[str, str]]] = None)
 
 @dataclass
 class IntentResult:
-    intent: str          # exhaustiva | tabla | puntual | smalltalk
+    intent: str          # exhaustiva | tabla | puntual | smalltalk | ambiguous
     source: str          # "regex" | "llm"
-    route: str           # "smalltalk" | "retrieve"
+    route: str           # "smalltalk" | "ambiguous" | "retrieve"
     wants_table: bool
     wants_full: bool
 
 
 def _build_result(intent: str, source: str) -> IntentResult:
     intent = intent if intent in _LABELS else "puntual"
+    if intent == "smalltalk":
+        route = "smalltalk"
+    elif intent == "ambiguous":
+        route = "ambiguous"
+    else:
+        route = "retrieve"
     return IntentResult(
         intent=intent,
         source=source,
-        route="smalltalk" if intent == "smalltalk" else "retrieve",
+        route=route,
         wants_table=(intent == "tabla"),
         wants_full=(intent == "exhaustiva"),
     )
@@ -236,36 +265,42 @@ def classify_intent(
 ) -> IntentResult:
     """Clasifica la intención de la consulta.
 
-    Orden de decisión:
-      1. smalltalk puro por regex anclado → respuesta inmediata, sin LLM.
-      2. clasificador LLM (si está habilitado y disponible) → fuente primaria.
-      3. regex ampliado → fallback determinístico (cubre el léxico de negocio).
-      4. guardarraíl: una pregunta clara —o cualquier contenido de imagen/voz—
-         nunca es smalltalk, aunque el LLM lo etiquete así.
+    El SALUDO solo se emite si el mensaje se IDENTIFICA como saludo (regex anclado);
+    no hay otra vía. Orden de decisión:
+      1. Saludo/cortesía CONFIRMADO por regex anclado → smalltalk. Única puerta al
+         mensaje de bienvenida. No aplica a imagen/voz.
+      2. Fragmento vago/incompleto ("que", "que es") y SIN historial que lo
+         complete → ambiguous (se pide aclaración; ni saludo ni "sin evidencia").
+      3. Clasificador LLM (si está habilitado) → fuente primaria del resto.
+      4. Regex ampliado → fallback determinístico (léxico de negocio).
+      5. Guardarraíl: a esta altura el regex NO confirmó saludo, así que cualquier
+         'smalltalk' del LLM es un falso positivo → se enruta a recuperación.
 
-    `is_media=True` indica que el texto proviene de una imagen (OCR/Vision) o de
-    una nota de voz (transcripción); ese material nunca es un saludo.
+    `is_media=True` indica texto derivado de imagen (OCR/Vision) o voz; nunca es
+    saludo ni se trata como vago.
     """
     q = (question or "").strip()
 
-    # 1. Fast-path: smalltalk evidente no paga LLM. No aplica a contenido derivado
-    #    de imagen/voz: el texto compuesto (OCR/Vision/transcripción) podría
-    #    parecer un saludo, pero el usuario envió un medio para que lo procesemos.
+    # 1. Saludo confirmado por regex anclado → único camino al mensaje de bienvenida.
+    #    No aplica a imagen/voz: el usuario envió un medio para que lo procesemos.
     if not is_media and _SMALLTALK_RE.match(q):
         return _build_result("smalltalk", "regex")
 
-    # 2. LLM como fuente primaria; 3. regex como fallback.
+    # 2. Fragmento vago/incompleto (sin historial previo que lo complete) → aclarar.
+    if not is_media and not history and _is_too_vague(q):
+        return _build_result("ambiguous", "regex")
+
+    # 3. LLM como fuente primaria; 4. regex como fallback.
     llm_label = _llm_classify(q, history)
     if llm_label is not None:
         intent, source = llm_label, "llm"
     else:
         intent, source = _regex_intent(q), "regex"
 
-    # 4. Guardarraíl determinístico (raíz de los bugs reportados): una consulta
-    #    clara (con "?" o varias palabras) o cualquier contenido de imagen/voz
-    #    JAMÁS es smalltalk. Si quedó etiquetado así, se reclasifica para que pase
-    #    por recuperación en vez de devolver el mensaje de bienvenida.
-    if intent == "smalltalk" and (is_media or _looks_like_question(q)):
+    # 5. Guardarraíl: el saludo solo lo decide el regex anclado (paso 1). Si el LLM
+    #    etiquetó smalltalk pero el regex no lo confirmó, es un falso positivo
+    #    ("que", "explícame", "info") → se reclasifica hacia recuperación.
+    if intent == "smalltalk":
         fallback = _regex_intent(q)
         intent = fallback if fallback != "smalltalk" else "puntual"
         source = f"{source}+guard"
