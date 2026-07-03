@@ -440,8 +440,11 @@ def _node_answer(state: GraphState) -> GraphState:
         prompt = q
     else:
         sys = SYSTEM_PROMPT_RETIE
-        # Use hybrid prompt when both sources are available
-        prompt = make_hybrid_prompt(hits, nlm_answer, q, is_admin=False)
+        prompt = make_hybrid_prompt(
+            hits, nlm_answer, q,
+            is_admin=False,
+            wants_table=state.get("wants_table", False),
+        )
     messages = [{"role": "system", "content": sys}]
     for msg in state.get("history", []):
         messages.append(msg)
@@ -733,7 +736,6 @@ def _close_truncated_json(s: str) -> str:
     repaired = s
     if in_str:
         repaired += '"'
-    # Drop a dangling comma / incomplete trailing token before closing.
     repaired = repaired.rstrip()
     while repaired and repaired[-1] in ",":
         repaired = repaired[:-1].rstrip()
@@ -742,42 +744,55 @@ def _close_truncated_json(s: str) -> str:
     return repaired
 
 
-def _parse_table_json(raw: str) -> Optional[Dict[str, Any]]:
+_NUM_RE = re.compile(r"\b\d[\d.,]*\b")
+
+
+def _count_raw_row_candidates(text: str) -> int:
+    count = 0
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped and len(_NUM_RE.findall(stripped)) >= 2:
+            count += 1
+    return count
+
+
+def _parse_table_json(raw: str) -> tuple:
     """Extrae y valida el JSON {headers, rows} de la salida del LLM.
 
-    Tolera fences markdown, texto alrededor y truncamiento (token limit)."""
+    Tolera fences markdown, texto alrededor y truncamiento (token limit).
+    Devuelve (table_dict_o_None, was_repaired)."""
     if not raw:
-        return None
+        return None, False
     text = raw.strip()
-    # Quitar fences ```json ... ``` si los hubiera
     if text.startswith("```"):
         text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.IGNORECASE).strip()
 
     start = text.find("{")
     if start == -1:
-        return None
+        return None, False
     candidate = text[start:]
     end = candidate.rfind("}")
     snippet = candidate[: end + 1] if end != -1 else candidate
 
     data = None
-    for attempt in (snippet, _close_truncated_json(candidate)):
+    was_repaired = False
+    for i, attempt in enumerate((snippet, _close_truncated_json(candidate))):
         try:
             data = _json.loads(attempt)
+            was_repaired = i == 1
             break
         except _json.JSONDecodeError:
             continue
     if not isinstance(data, dict):
-        return None
+        return None, False
 
     headers = data.get("headers")
     rows = data.get("rows")
     if not isinstance(headers, list) or not isinstance(rows, list):
-        return None
+        return None, False
     if not headers or not rows:
-        return None
+        return None, False
 
-    # Normalizar: solo filas que sean listas, recortadas/rellenadas a len(headers).
     ncol = len(headers)
     norm_rows: List[List[Any]] = []
     for row in rows:
@@ -787,14 +802,69 @@ def _parse_table_json(raw: str) -> Optional[Dict[str, Any]]:
             row = row + [""] * (ncol - len(row))
         norm_rows.append(row[:ncol])
     if not norm_rows:
-        return None
+        return None, False
 
     title = data.get("title")
     return {
         "title": title if isinstance(title, str) else None,
         "headers": headers,
         "rows": norm_rows,
-    }
+    }, was_repaired
+
+
+def _fetch_continuation_rows(
+    partial_table: Dict[str, Any],
+    info: str,
+    model: str,
+    max_tokens: int,
+) -> List[List[Any]]:
+    headers = partial_table.get("headers", [])
+    existing_rows = partial_table.get("rows", [])
+    last_row = existing_rows[-1] if existing_rows else []
+    prompt = (
+        f"La extracción de la tabla fue cortada ({len(existing_rows)} filas obtenidas). "
+        f"Encabezados: {_json.dumps(headers, ensure_ascii=False)}. "
+        f"Última fila extraída: {_json.dumps(last_row, ensure_ascii=False)}.\n"
+        f"Devuelve SOLO las filas faltantes como un array JSON de arrays. "
+        f"Si no quedan filas, responde []. No repitas la última fila ya extraída.\n\n"
+        f"INFORMACIÓN:\n{info}"
+    )
+    try:
+        resp = create_chat_completion(
+            _client,
+            model=model,
+            temperature=0.0,
+            max_tokens=max_tokens,
+            messages=[
+                {"role": "system", "content": "Eres un formateador de datos a tablas. Solo devuelves JSON."},
+                {"role": "user", "content": prompt},
+            ],
+        )
+        cont_raw = (resp.choices[0].message.content or "").strip()
+        if cont_raw.startswith("```"):
+            cont_raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", cont_raw, flags=re.IGNORECASE).strip()
+        start = cont_raw.find("[")
+        if start == -1:
+            return []
+        arr_text = cont_raw[start:]
+        end = arr_text.rfind("]")
+        if end != -1:
+            arr_text = arr_text[: end + 1]
+        parsed = _json.loads(arr_text)
+        if not isinstance(parsed, list):
+            return []
+        ncol = len(headers)
+        result = []
+        for row in parsed:
+            if not isinstance(row, list):
+                continue
+            if len(row) < ncol:
+                row = row + [""] * (ncol - len(row))
+            result.append(row[:ncol])
+        return result
+    except Exception as exc:
+        logger.warning("table_node: continuación de filas falló: %s", exc)
+        return []
 
 
 _TABLE_PARTIAL_NOTE = (
@@ -803,33 +873,20 @@ _TABLE_PARTIAL_NOTE = (
     "Esta es la información encontrada en la base local:\n\n"
 )
 
-# Tope de caracteres de fragmentos crudos que se anexan a la extracción de tabla
-# (~24k chars ≈ 6k tokens; cubre TOP_K_TABLES chunks + expansión de páginas).
+_TABLE_INCOMPLETE_NOTE = (
+    "⚠️ Esta tabla puede estar incompleta: el contexto fue truncado o la extracción "
+    "se cortó antes de terminar. Puede haber filas faltantes.\n\n"
+)
+
 _TABLE_RAW_CONTEXT_CHARS = 24000
 
 
 def _node_table(state: GraphState) -> GraphState:
-    """Convierte la respuesta del agente en una tabla y la entrega como imagen PNG.
-
-    Pide al LLM estructurar los datos como JSON {title, headers, rows} y renderiza
-    una imagen (sin el botón "COPIAR CÓDIGO" que Telegram añade a los <pre>).
-    La extracción usa la respuesta sintetizada Y los fragmentos crudos del
-    retriever: la síntesis comprime/omite filas, los chunks originales no.
-    Degradación elegante:
-      - Si Pillow/imagen falla → tabla de texto adaptativa (<pre>).
-      - Si la información no es tabulable o el LLM falla → prosa original
-        (con nota de tabla parcial cuando NotebookLM no estuvo disponible).
-    """
     base_answer = state.get("answer", "") or ""
     question = state.get("question", "")
     if not base_answer.strip():
         return {"answer": base_answer, "route": "stylist_node"}
 
-    # Fragmentos crudos: la fuente más fiel para no omitir filas. La respuesta
-    # del answer_node ya pasó por un LLM con límite de tokens y puede haber
-    # resumido; los chunks de Chroma traen el texto literal del PDF.
-    # Orden de documento (source, página) con sort estable: los chunks de una
-    # misma página conservan su orden de inserción (ids secuenciales).
     _hits_sorted = sorted(
         (h for h in (state.get("hits") or []) if h.get("text")),
         key=lambda h: (
@@ -837,13 +894,28 @@ def _node_table(state: GraphState) -> GraphState:
             (h.get("meta") or {}).get("page", 0) or 0,
         ),
     )
-    raw_chunks = "\n\n".join(h.get("text", "") for h in _hits_sorted)[:_TABLE_RAW_CONTEXT_CHARS]
+
+    ctx_limit = int(getattr(settings, "TABLE_RAW_CONTEXT_CHARS", _TABLE_RAW_CONTEXT_CHARS))
+    raw_full = "\n\n".join(h.get("text", "") for h in _hits_sorted)
+    context_truncated = len(raw_full) > ctx_limit
+    if context_truncated:
+        logger.warning(
+            "table_node: contexto crudo truncado de %d a %d chars — puede haber filas faltantes",
+            len(raw_full), ctx_limit,
+        )
+    raw_chunks = raw_full[:ctx_limit]
+    raw_row_candidates = _count_raw_row_candidates(raw_chunks)
+
     info = base_answer
     if raw_chunks:
         info = f"{base_answer}\n\nFRAGMENTOS LITERALES DEL DOCUMENTO:\n{raw_chunks}"
 
     model = _resolve_model(state.get("agent_key"), explicit=None)
     prompt = _TABLE_PROMPT.format(question=question, answer=info)
+
+    table: Optional[Dict[str, Any]] = None
+    sanity_ok: Optional[bool] = None
+    incomplete = context_truncated
 
     with span_ctx(
         None, "table_node",
@@ -856,7 +928,7 @@ def _node_table(state: GraphState) -> GraphState:
         image: Optional[bytes] = None
         try:
             resp = create_chat_completion(
-            _client,
+                _client,
                 model=model,
                 temperature=0.0,
                 max_tokens=_TABLE_MAX_TOKENS,
@@ -866,26 +938,48 @@ def _node_table(state: GraphState) -> GraphState:
                 ],
             )
             raw = (resp.choices[0].message.content or "").strip()
-            table = _parse_table_json(raw)
+            finish_reason = resp.choices[0].finish_reason
+
+            table, was_repaired = _parse_table_json(raw)
+
+            if finish_reason == "length" or was_repaired:
+                logger.warning(
+                    "table_node: JSON cortado (finish_reason=%r, reparado=%s) — solicitando continuación",
+                    finish_reason, was_repaired,
+                )
+                incomplete = True
+                if table:
+                    extra_rows = _fetch_continuation_rows(table, info, model, _TABLE_MAX_TOKENS)
+                    if extra_rows:
+                        table["rows"].extend(extra_rows)
+                        logger.info("table_node: continuación añadió %d filas", len(extra_rows))
+                        incomplete = finish_reason == "length" and not extra_rows
+
+            if table and raw_row_candidates > 5:
+                sanity_ok = len(table["rows"]) >= raw_row_candidates * 0.5
+                if not sanity_ok:
+                    logger.warning(
+                        "table_node: sanity check — %d filas extraídas vs %d candidatas en contexto",
+                        len(table["rows"]), raw_row_candidates,
+                    )
+                    incomplete = True
+
             if not table:
-                # Diagnóstico: deja rastro del JSON que no se pudo parsear.
                 logger.warning("table_node: no se pudo parsear JSON (%d chars): %s",
                                len(raw), raw[:300])
             if table:
                 title = table.get("title")
                 try:
                     image = render_table_image(table["headers"], table["rows"], title=title)
-                    # Caption breve para acompañar la imagen.
-                    final_text = f"📊 {title}" if title else "📊 Tabla solicitada"
+                    caption = f"📊 {title}" if title else "📊 Tabla solicitada"
+                    final_text = (_TABLE_INCOMPLETE_NOTE + caption) if incomplete else caption
                 except Exception as img_exc:
-                    # Sin Pillow / sin fuente → degradar a tabla de texto.
                     status = "text_fallback"
                     logger.warning("table image failed, using text table: %s", img_exc)
-                    final_text = render_telegram_table(table["headers"], table["rows"])
+                    body = render_telegram_table(table["headers"], table["rows"])
+                    final_text = (_TABLE_INCOMPLETE_NOTE + body) if incomplete else body
             else:
-                status = "not_tabular"  # se conserva la prosa original
-                # Honestidad con el usuario: si NLM no aportó (fuente clave para
-                # tablas) y no se pudo tabular, avisar que el resultado es parcial.
+                status = "not_tabular"
                 if not (state.get("nlm_answer") or "").strip():
                     final_text = _TABLE_PARTIAL_NOTE + base_answer
         except Exception as exc:
@@ -898,7 +992,12 @@ def _node_table(state: GraphState) -> GraphState:
             try:
                 span.update(
                     output={"preview": final_text[:200], "has_image": image is not None},
-                    metadata={"status": status},
+                    metadata={
+                        "status": status,
+                        "context_truncated": context_truncated,
+                        "raw_row_candidates": raw_row_candidates,
+                        "sanity_ok": sanity_ok,
+                    },
                 )
             except Exception:
                 pass

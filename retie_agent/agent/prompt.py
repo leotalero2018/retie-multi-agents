@@ -1,4 +1,4 @@
-from typing import List, Dict, Optional
+from typing import List, Dict
 
 # System prompt compartido por los nodos de respuesta del grafo.
 SYSTEM_PROMPT_RETIE = (
@@ -117,16 +117,39 @@ def make_prompt(context_blocks: List[Dict], question: str, *, is_admin: bool = F
 
 PROMPT_TEMPLATE_HYBRID = (
     "Eres un asistente experto en el Reglamento Técnico de Instalaciones Eléctricas (RETIE). "
-    "Dispones de dos fuentes complementarias: fragmentos del documento oficial y un análisis "
-    "previo de NotebookLM. Sintetiza ambas fuentes para dar una respuesta precisa y en español. "
-    "No inventes información ni contradigas lo que dicen las fuentes. "
-    "Si hay contradicción entre fuentes, menciona ambas versiones.\n\n"
-    "REGLA IMPORTANTE: Si alguna fuente contiene tablas, listas o valores numéricos, "
-    "REPRODÚCELOS LITERALMENTE sin omitir filas ni resumir los datos.\n\n"
+    "Dispones de dos fuentes de información: fragmentos del documento oficial y un análisis "
+    "previo de NotebookLM. Usa la información disponible en ambas fuentes para responder "
+    "directamente la pregunta. No añadas comentarios sobre el origen de los datos ni "
+    "expliques qué fuente aportó qué — solo responde.\n\n"
+    "REGLAS:\n"
+    "- Si la información está en cualquiera de las dos fuentes, úsala directamente.\n"
+    "- Si alguna fuente contiene tablas, listas o valores numéricos, REPRODÚCELOS "
+    "LITERALMENTE sin omitir filas ni resumir los datos.\n"
+    "- No digas 'esta información no aparece en los fragmentos' si está en el análisis "
+    "de NotebookLM — ambas fuentes son igualmente válidas.\n"
+    "- No inventes datos que no estén en ninguna de las dos fuentes.\n\n"
     "FRAGMENTOS DEL DOCUMENTO RETIE:\n{context}\n\n"
     "ANÁLISIS COMPLEMENTARIO (NotebookLM):\n{nlm_answer}\n\n"
     "Pregunta: {question}\n"
-    "Responde en español con todos los datos relevantes de ambas fuentes."
+    "Responde en español con todos los datos relevantes."
+)
+
+PROMPT_TEMPLATE_HYBRID_TABLE = (
+    "Eres un asistente experto en el Reglamento Técnico de Instalaciones Eléctricas (RETIE). "
+    "El usuario pide una tabla. Tienes dos fuentes de datos: fragmentos del documento oficial "
+    "y un análisis previo de NotebookLM.\n\n"
+    "INSTRUCCIÓN: Extrae y presenta la tabla completa usando los datos de cualquiera de las "
+    "dos fuentes (o combinándolas). No expliques de dónde vienen los datos. No pongas "
+    "advertencias sobre qué fuente tiene qué. Solo devuelve la tabla con todos sus datos.\n\n"
+    "REGLAS:\n"
+    "- Incluye TODAS las filas y columnas disponibles en las fuentes.\n"
+    "- Si una fuente tiene más filas o columnas que la otra, usa la más completa.\n"
+    "- No omitas filas por resumir. No inventes filas que no estén en ninguna fuente.\n"
+    "- Si hay varias tablas relacionadas, preséntalas todas.\n\n"
+    "FRAGMENTOS DEL DOCUMENTO RETIE:\n{context}\n\n"
+    "ANÁLISIS COMPLEMENTARIO (NotebookLM):\n{nlm_answer}\n\n"
+    "Pregunta: {question}\n"
+    "Responde SOLO con los datos de la tabla, sin meta-comentarios."
 )
 
 
@@ -136,6 +159,7 @@ def make_hybrid_prompt(
     question: str,
     *,
     is_admin: bool = False,
+    wants_table: bool = False,
 ) -> str:
     """Prompt that merges Chroma chunks with a NotebookLM pre-synthesized answer."""
     has_chroma = bool(context_blocks)
@@ -143,12 +167,22 @@ def make_hybrid_prompt(
 
     if has_chroma and has_nlm:
         ctx = build_context(context_blocks, include_meta=is_admin)
-        return PROMPT_TEMPLATE_HYBRID.format(
+        template = PROMPT_TEMPLATE_HYBRID_TABLE if wants_table else PROMPT_TEMPLATE_HYBRID
+        return template.format(
             context=ctx, nlm_answer=nlm_answer.strip(), question=question
         )
     if has_chroma:
         return make_prompt(context_blocks, question, is_admin=is_admin)
     # NLM answer only
+    if wants_table:
+        return (
+            "Eres un experto en RETIE. El usuario pide una tabla. "
+            "Extrae y presenta la tabla completa con todos sus datos usando el análisis de abajo. "
+            "No expliques de dónde vienen los datos — solo devuelve la tabla.\n\n"
+            f"{nlm_answer.strip()}\n\n"
+            f"Pregunta: {question}\n"
+            "Responde SOLO con los datos de la tabla."
+        )
     return (
         "Eres un experto en RETIE. Responde con base en el siguiente análisis:\n\n"
         f"{nlm_answer.strip()}\n\n"
