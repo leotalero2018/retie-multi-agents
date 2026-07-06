@@ -160,6 +160,10 @@ Antes de comenzar, asegúrate de tener instalado:
 
 - **Python 3.11+** — [descargar](https://www.python.org/downloads/)
 - **Git** — [descargar](https://git-scm.com/)
+- **Node.js 20+** (para el servidor NotebookLM MCP)
+  - macOS: `brew install node`
+  - Ubuntu: `sudo apt install nodejs npm` (o [nvm](https://github.com/nvm-sh/nvm))
+  - Windows: [instalador](https://nodejs.org/)
 - **Docker + Docker Compose** (opcional, para ejecutar con contenedores)
 - **Tesseract OCR** (opcional, para procesar imágenes)
   - Ubuntu: `sudo apt install tesseract-ocr tesseract-ocr-spa`
@@ -412,6 +416,96 @@ curl "http://localhost:8000/query?q=¿Qué%20exige%20el%20RETIE%20sobre%20puesta
   "agent_key": "plumber"
 }
 ```
+
+### Servidor NotebookLM MCP (retrieval híbrido)
+
+El agente combina ChromaDB con **NotebookLM** a través del servidor MCP [`notebooklm-mcp`](https://www.npmjs.com/package/notebooklm-mcp) (Node.js), que controla NotebookLM con un navegador Playwright autenticado con tu cuenta de Google. Requiere **Node.js 20+**.
+
+> ⚠️ **La sesión de Google caduca periódicamente** (en cuestión de horas si el servidor no está corriendo con el keepalive activo). Si el agente empieza a responder solo con Chroma o ves en los logs `Could not find NotebookLM chat input`, la sesión expiró: repite el paso 3 (re-autenticación) y vuelve a subirla a MinIO (paso 5).
+
+#### 1. Instalar el servidor
+
+```bash
+npm install -g notebooklm-mcp@latest
+```
+
+#### 2. Arrancar el servidor (déjalo corriendo en su propia terminal)
+
+**Windows (PowerShell):**
+```powershell
+notebooklm-mcp --transport http --port 3000
+```
+
+**macOS / Linux:**
+```bash
+notebooklm-mcp --transport http --port 3000
+```
+
+El servidor guarda la sesión del navegador (cookies de Google + `library.json` con los notebooks registrados) en una carpeta que depende del sistema operativo:
+
+| SO | Carpeta de datos |
+|----|------------------|
+| Windows | `%LOCALAPPDATA%\notebooklm-mcp\Data` |
+| macOS | `~/Library/Application Support/notebooklm-mcp` |
+| Linux | `~/.local/share/notebooklm-mcp` |
+
+#### 3. Autenticarse con Google (primera vez o sesión caducada)
+
+Con el servidor corriendo, en **otra terminal** (con el venv activo y `PYTHONPATH` configurado):
+
+```bash
+python setup_notebooklm.py
+```
+
+El script detecta si la sesión es válida. Si no lo es, **abre una ventana de Chrome** para que inicies sesión con la cuenta de Google que tiene el notebook de RETIE. La ventana se cierra sola al llegar a NotebookLM (tienes hasta 10 minutos). Vuelve a ejecutar el script para confirmar `authenticated = True` y registrar el notebook si hace falta (pega el share link cuando lo pida; el ID queda en `NOTEBOOKLM_NOTEBOOK_ID` del `.env`).
+
+#### 4. (Alternativa) Restaurar una sesión válida desde MinIO
+
+Si otra máquina (o Railway) ya subió una sesión vigente a MinIO, puedes restaurarla sin re-autenticarte. **Detén primero el servidor MCP** y ejecuta:
+
+**Windows (PowerShell):**
+```powershell
+python -c "import os; from dotenv import load_dotenv; load_dotenv(); os.environ.pop('MINIO_PRIVATE_ENDPOINT', None); from retie_agent.services.nlm_session import download_nlm_session; download_nlm_session()"
+```
+
+**macOS / Linux:**
+```bash
+python -c "
+import os
+from dotenv import load_dotenv; load_dotenv()
+os.environ.pop('MINIO_PRIVATE_ENDPOINT', None)   # el endpoint privado solo existe dentro de Railway
+from retie_agent.services.nlm_session import download_nlm_session
+download_nlm_session()
+"
+```
+
+Luego arranca el servidor (paso 2). Si al preguntar sigue fallando, la sesión guardada también caducó → paso 3.
+
+#### 5. Subir la sesión renovada a MinIO (para Railway y otras máquinas)
+
+Cada vez que te re-autentiques, sube la sesión nueva para que Railway la restaure al arrancar:
+
+```bash
+python setup_notebooklm.py --upload
+# o, si MinIO no es alcanzable, comprime y súbela a mano:
+python setup_notebooklm.py --pack
+```
+
+#### 6. Verificar la conexión
+
+```bash
+python tests/_nlm_check.py
+```
+
+Debe mostrar `authenticated = True` y el notebook `retie` en la lista. Asegúrate de tener en el `.env`:
+
+```env
+NOTEBOOKLM_ENABLED=true
+NOTEBOOKLM_URL=http://localhost:3000
+NOTEBOOKLM_NOTEBOOK_ID=retie
+```
+
+> 💡 **Keepalive:** con el bot/API corriendo, `NOTEBOOKLM_KEEPALIVE_MINUTES` (default 240) refresca las cookies periódicamente y resube el estado a MinIO, manteniendo viva una sesión válida sin logins manuales. La caducidad ocurre sobre todo cuando el servidor pasa horas apagado.
 
 ---
 

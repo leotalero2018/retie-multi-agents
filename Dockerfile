@@ -24,6 +24,17 @@ RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \
 # Pre-install notebooklm-mcp globally so npx doesn't download it on every boot
 RUN npm install -g notebooklm-mcp@latest
 
+# HOTFIX (issue #50 de notebooklm-mcp, sin resolver en 2.0.0): el selector
+# `.to-user-container:last-child` deja de coincidir cuando NotebookLM añade
+# cualquier elemento después del último contenedor de respuesta (cambio de UI
+# de junio 2026), y ask_question expira aunque la respuesta sea visible.
+# Se quita el `:last-child`; el código ya usa `.last()` para tomar la más
+# reciente. Eliminar cuando upstream publique la corrección.
+RUN sed -i 's/latestAnswerText: "\.to-user-container:last-child \.message-text-content"/latestAnswerText: ".to-user-container .message-text-content"/' \
+    "$(npm root -g)/notebooklm-mcp/dist/notebooklm/selectors.js" && \
+    grep -q 'latestAnswerText: "\.to-user-container \.message-text-content"' \
+    "$(npm root -g)/notebooklm-mcp/dist/notebooklm/selectors.js"
+
 # notebooklm-mcp usa Patchright (fork de Playwright). En headless lanza
 # `chrome-headless-shell`, que `playwright install chromium` NO instala y cuyo
 # revision (p. ej. chromium_headless_shell-1223) debe coincidir con el de Patchright.
