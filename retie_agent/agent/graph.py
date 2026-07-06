@@ -817,7 +817,10 @@ def _fetch_continuation_rows(
     info: str,
     model: str,
     max_tokens: int,
-) -> List[List[Any]]:
+) -> tuple:
+    """Pide al LLM las filas faltantes de una tabla cortada.
+
+    Devuelve (filas_extra, continuación_también_cortada)."""
     headers = partial_table.get("headers", [])
     existing_rows = partial_table.get("rows", [])
     last_row = existing_rows[-1] if existing_rows else []
@@ -840,19 +843,24 @@ def _fetch_continuation_rows(
                 {"role": "user", "content": prompt},
             ],
         )
+        cont_truncated = resp.choices[0].finish_reason == "length"
         cont_raw = (resp.choices[0].message.content or "").strip()
         if cont_raw.startswith("```"):
             cont_raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", cont_raw, flags=re.IGNORECASE).strip()
         start = cont_raw.find("[")
         if start == -1:
-            return []
+            return [], cont_truncated
         arr_text = cont_raw[start:]
         end = arr_text.rfind("]")
         if end != -1:
             arr_text = arr_text[: end + 1]
+        elif cont_truncated:
+            # Array sin cerrar por corte de tokens: se rescatan las filas
+            # completas cerrando el JSON igual que en _parse_table_json.
+            arr_text = _close_truncated_json(arr_text)
         parsed = _json.loads(arr_text)
         if not isinstance(parsed, list):
-            return []
+            return [], cont_truncated
         ncol = len(headers)
         result = []
         for row in parsed:
@@ -861,10 +869,10 @@ def _fetch_continuation_rows(
             if len(row) < ncol:
                 row = row + [""] * (ncol - len(row))
             result.append(row[:ncol])
-        return result
+        return result, cont_truncated
     except Exception as exc:
         logger.warning("table_node: continuación de filas falló: %s", exc)
-        return []
+        return [], False
 
 
 _TABLE_PARTIAL_NOTE = (
@@ -949,11 +957,14 @@ def _node_table(state: GraphState) -> GraphState:
                 )
                 incomplete = True
                 if table:
-                    extra_rows = _fetch_continuation_rows(table, info, model, _TABLE_MAX_TOKENS)
+                    extra_rows, cont_truncated = _fetch_continuation_rows(
+                        table, info, model, _TABLE_MAX_TOKENS
+                    )
                     if extra_rows:
                         table["rows"].extend(extra_rows)
                         logger.info("table_node: continuación añadió %d filas", len(extra_rows))
-                        incomplete = finish_reason == "length" and not extra_rows
+                        # Completa solo si la continuación tampoco se cortó.
+                        incomplete = cont_truncated
 
             if table and raw_row_candidates > 5:
                 sanity_ok = len(table["rows"]) >= raw_row_candidates * 0.5

@@ -57,6 +57,10 @@ class Settings(BaseSettings):
     # Consultas de tabla: se recuperan MÁS chunks (las tablas largas quedan
     # partidas en varios fragmentos contiguos y omitir uno = filas faltantes).
     TOP_K_TABLES: int = 12
+    # Contexto crudo máximo (chars) anexado a la extracción de tablas; al
+    # superarlo se trunca y la tabla se marca como posiblemente incompleta
+    # (TICKET-005). ~24k chars ≈ 6k tokens.
+    TABLE_RAW_CONTEXT_CHARS: int = 24000
     CHUNK_TOKENS: int = 800
     CHUNK_OVERLAP: int = 150
     RAG_DISTANCE_THRESHOLD: float = 0.45           # cosine distance filter
