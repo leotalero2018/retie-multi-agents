@@ -19,9 +19,16 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
+
+# Gemini responde 503 UNAVAILABLE ("high demand", transitorio) o 429 (rate limit)
+# bajo carga. Son reintentables con backoff; el resto de errores no.
+_RETRYABLE_MARKERS = ("503", "unavailable", "429", "resource_exhausted", "high demand")
+_MAX_RETRIES = 3
+_BACKOFF_BASE = 2.0  # segundos: 2, 4, 8
 
 
 class GeminiError(RuntimeError):
@@ -87,31 +94,44 @@ class GeminiFileSearchClient:
             raise GeminiError("GEMINI_FILE_SEARCH_STORE no configurado.")
 
         client = self._ensure_client()
-        try:
-            from google.genai import types  # type: ignore
+        from google.genai import types  # type: ignore
 
-            config = types.GenerateContentConfig(
-                tools=[
-                    types.Tool(
-                        file_search=types.FileSearch(
-                            file_search_store_names=[self.store]
-                        )
+        config = types.GenerateContentConfig(
+            tools=[
+                types.Tool(
+                    file_search=types.FileSearch(
+                        file_search_store_names=[self.store]
                     )
-                ],
-            )
-            resp = client.models.generate_content(
-                model=self.model,
-                contents=query,
-                config=config,
-            )
-        except GeminiError:
-            raise
-        except Exception as exc:
-            raise GeminiError(f"Gemini File Search falló: {exc}") from exc
+                )
+            ],
+        )
 
-        answer = (getattr(resp, "text", None) or "").strip()
-        sources = self._extract_citations(resp)
-        return answer, sources
+        # Reintento con backoff ante 503/429 (saturación temporal de Gemini).
+        last_exc: Optional[Exception] = None
+        for attempt in range(_MAX_RETRIES + 1):
+            try:
+                resp = client.models.generate_content(
+                    model=self.model,
+                    contents=query,
+                    config=config,
+                )
+                answer = (getattr(resp, "text", None) or "").strip()
+                sources = self._extract_citations(resp)
+                return answer, sources
+            except Exception as exc:
+                last_exc = exc
+                msg = str(exc).lower()
+                retryable = any(m in msg for m in _RETRYABLE_MARKERS)
+                if not retryable or attempt == _MAX_RETRIES:
+                    break
+                wait = _BACKOFF_BASE ** (attempt + 1)
+                logger.warning(
+                    "Gemini 503/429 (intento %d/%d) — reintentando en %.0fs",
+                    attempt + 1, _MAX_RETRIES, wait,
+                )
+                time.sleep(wait)
+
+        raise GeminiError(f"Gemini File Search falló: {last_exc}") from last_exc
 
     @staticmethod
     def _extract_citations(resp: Any) -> List[Dict[str, Any]]:

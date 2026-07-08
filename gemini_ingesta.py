@@ -13,6 +13,7 @@ Requiere:  pip install google-genai
 import os
 import sys
 import time
+import unicodedata
 from pathlib import Path
 
 # Carga el .env del repo si existe (para tomar GEMINI_API_KEY sin exportarla a mano).
@@ -27,6 +28,17 @@ from google import genai
 
 DISPLAY_NAME = "retie-corpus"
 EMBEDDING_MODEL = "models/gemini-embedding-2"
+
+
+def _ascii_display_name(stem: str) -> str:
+    """display_name seguro para el API (sin tildes ni no-ASCII).
+
+    El SDK codifica display_name como ASCII; un nombre con 'ó'/'ñ' lo rompía.
+    Se normaliza (NFKD), se descartan las marcas de acento y se limpia."""
+    norm = unicodedata.normalize("NFKD", stem)
+    ascii_str = norm.encode("ascii", "ignore").decode("ascii")
+    cleaned = "".join(c if (c.isalnum() or c in " _-") else "_" for c in ascii_str)
+    return cleaned.strip() or "documento"
 
 
 def main() -> None:
@@ -68,14 +80,27 @@ def main() -> None:
     print(f"PDFs a subir: {len(pdfs)}\n")
 
     # 2. Subir cada PDF y esperar la indexación
+    import shutil
+    import tempfile
+
     ok, err = 0, 0
     for pdf in pdfs:
         print(f"  Subiendo {pdf.name} ...", end=" ", flush=True)
+        tmp_path = None
         try:
+            upload_path = pdf
+            # El SDK codifica el NOMBRE del archivo como ASCII; una tilde en el
+            # filename ('Evaluación') rompe la subida. Si el nombre tiene no-ASCII,
+            # se sube desde una copia temporal con nombre saneado.
+            if any(ord(c) > 127 for c in pdf.name):
+                safe_name = _ascii_display_name(pdf.stem) + ".pdf"
+                tmp_path = Path(tempfile.gettempdir()) / safe_name
+                shutil.copy2(pdf, tmp_path)
+                upload_path = tmp_path
             op = client.file_search_stores.upload_to_file_search_store(
-                file=str(pdf),
+                file=str(upload_path),
                 file_search_store_name=store_name,
-                config={"display_name": pdf.stem},
+                config={"display_name": _ascii_display_name(pdf.stem)},
             )
             while not op.done:
                 time.sleep(5)
@@ -85,6 +110,12 @@ def main() -> None:
         except Exception as e:
             print(f"ERROR: {e}")
             err += 1
+        finally:
+            if tmp_path is not None:
+                try:
+                    tmp_path.unlink()
+                except Exception:
+                    pass
 
     print(f"\nListo. Subidos: {ok}  Errores: {err}")
     print("\n=== Agrega esto a tu .env ===")
