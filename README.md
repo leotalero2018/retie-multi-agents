@@ -509,6 +509,82 @@ NOTEBOOKLM_NOTEBOOK_ID=retie
 
 ---
 
+## Spike: Gemini File Search como fuente RAG secundaria (pruebas A/B)
+
+> ⚠️ **Spike experimental — no producción todavía.** Rama `test/gemini-file-search-spike`. Valida si [Gemini File Search](https://ai.google.dev/gemini-api/docs/file-search) (RAG gestionado por API oficial, **sin sesiones ni logins que caducan**) puede reemplazar a NotebookLM como segunda fuente del agente. Con la configuración por defecto el spike no cambia nada del pipeline actual.
+
+### ¿Qué añade?
+
+El grafo ya recuperaba en paralelo con `chromadb_node` + `notebooklm_node`. El spike agrega un **tercer nodo `gemini_node`** que respeta el mismo contrato (escribe en `gemini_docs`, genera su propio span en Langfuse), controlado por un único feature flag:
+
+| `SECONDARY_RAG_SOURCE` | Comportamiento |
+|------------------------|----------------|
+| `notebooklm` (default) | Pipeline actual, sin cambios. |
+| `gemini`               | Gemini File Search alimenta la respuesta; NotebookLM apagado. |
+| `shadow`               | **A/B:** ambos corren en paralelo para la misma pregunta; NotebookLM alimenta la respuesta (producción segura) y Gemini queda registrado en su span de Langfuse para comparar calidad. |
+
+El flag se alterna por entorno en Railway sin redeploy de código.
+
+### Requisitos
+
+```bash
+pip install google-genai   # SDK oficial (no está en requirements.txt aún)
+```
+
+> ⚠️ Instalar `google-genai` sube `pydantic` por encima del pin de `aiogram` (`<2.8`); en las pruebas ambos siguen funcionando, pero es un punto a resolver antes de producción.
+
+Variables en el `.env` (obtén la API key en [Google AI Studio](https://aistudio.google.com/apikey) — al crearla, elige **"crear en proyecto nuevo"**, no necesitas un proyecto previo):
+
+```env
+GEMINI_API_KEY=AQ...
+GEMINI_MODEL=gemini-2.5-flash
+GEMINI_FILE_SEARCH_STORE=            # lo llena el script de ingesta (paso 1)
+SECONDARY_RAG_SOURCE=notebooklm      # cámbialo a gemini | shadow para probar
+```
+
+### Paso 1 — Cargar el corpus en un File Search Store (una sola vez)
+
+`gemini_client.py` solo **consulta** un store existente; `gemini_ingesta.py` lo crea y lo llena. Ignora todo lo que no sea `*.pdf`:
+
+```bash
+python gemini_ingesta.py /ruta/a/carpeta/con/pdfs
+# reusar un store ya creado:
+python gemini_ingesta.py /ruta/a/carpeta --store fileSearchStores/xxxxx
+```
+
+Al terminar imprime la línea `GEMINI_FILE_SEARCH_STORE="fileSearchStores/..."` — cópiala al `.env`.
+
+### Paso 2 — Probar en tres niveles
+
+```bash
+# Nivel 1 — cliente Gemini aislado (feedback más rápido)
+python -c "from dotenv import load_dotenv; load_dotenv(); \
+from retie_agent.agent.gemini_client import GeminiFileSearchClient; from retie_agent.config import settings; \
+c=GeminiFileSearchClient(api_key=settings.GEMINI_API_KEY, model=settings.GEMINI_MODEL, store=settings.GEMINI_FILE_SEARCH_STORE); \
+print(c.ask_question('¿Qué exige el RETIE sobre puesta a tierra?')[0][:400])"
+
+# Nivel 2 — por el grafo, modo gemini
+SECONDARY_RAG_SOURCE=gemini python -c "from dotenv import load_dotenv; load_dotenv(); \
+from retie_agent.config import settings; settings.SECONDARY_RAG_SOURCE='gemini'; \
+from retie_agent.agent.graph import run_graph; \
+print(run_graph('¿Qué distancias de seguridad exige el RETIE?', session='gem'))"
+
+# Nivel 3 — shadow A/B: compara notebooklm_node vs gemini_node en Langfuse
+# (.env: SECONDARY_RAG_SOURCE=shadow y LANGFUSE_ENABLED=true, luego corre el golden set del TICKET-005)
+```
+
+En **Langfuse**, cada traza `retie-query` en modo `shadow` muestra los spans `notebooklm_node` y `gemini_node` lado a lado: se comparan cobertura de filas, exactitud de valores y calidad de citas a igualdad de pregunta.
+
+### Si algo falla
+
+| Síntoma | Solución |
+|---------|----------|
+| `model not found` | Ajusta `GEMINI_MODEL` en el `.env` (el nombre del modelo pudo cambiar). |
+| Falla la ingesta por el modelo de embedding | Cambia `gemini-embedding-2` en `gemini_ingesta.py`. |
+| `gemini_node` no aparece en la traza | Falta `GEMINI_API_KEY`/`GEMINI_FILE_SEARCH_STORE`, o `SECONDARY_RAG_SOURCE` sigue en `notebooklm`. |
+
+---
+
 ## Despliegue con Docker
 
 ### Desarrollo local (bot + MinIO)

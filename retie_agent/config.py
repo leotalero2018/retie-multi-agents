@@ -133,6 +133,20 @@ class Settings(BaseSettings):
     # sesión VÁLIDA indefinidamente sin uploads manuales. 0 = desactivado.
     NOTEBOOKLM_KEEPALIVE_MINUTES: int = 240
 
+    # --- Fuente RAG secundaria: NotebookLM vs Gemini File Search (SPIKE Fase 1a) ---
+    # Selecciona qué fuente complementaria de Chroma alimenta answer_node:
+    #   "notebooklm" → comportamiento actual (default, retrocompatible)
+    #   "gemini"     → Gemini File Search alimenta la respuesta; NLM apagado
+    #   "shadow"     → ambas corren; NLM alimenta la respuesta (prod-safe) y
+    #                  Gemini queda registrado en su propio span de Langfuse para
+    #                  comparar CALIDAD a igualdad de pregunta, sin afectar al usuario.
+    # Feature flag pensado para alternar por entorno en Railway sin redeploy.
+    SECONDARY_RAG_SOURCE: str = "notebooklm"
+    GEMINI_API_KEY: Optional[str] = None
+    GEMINI_MODEL: str = "gemini-2.5-flash"
+    GEMINI_FILE_SEARCH_STORE: Optional[str] = None   # p. ej. fileSearchStores/xxxxx
+    GEMINI_TIMEOUT: float = 30.0
+
     # --- Observability (Langfuse) ---
     # Accept typical string booleans; obs.py interprets them safely.
     LANGFUSE_ENABLED: str = "false"

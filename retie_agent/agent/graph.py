@@ -26,6 +26,7 @@ from retie_agent.agent.retie_agent import _dedupe_hits, _resolve_collection, _re
 from retie_agent.observability.obs import trace_ctx, span_ctx, log_generation
 from retie_agent.services.history import get_history, add_message
 from retie_agent.agent.notebooklm_client import NotebookLMClient, NotebookLMError, NotebookLMCache, NLM_RECOVERY_NEEDED
+from retie_agent.agent.gemini_client import GeminiFileSearchClient, GeminiError
 from retie_agent.agent.table_render import render_telegram_table, render_table_image
 from retie_agent.agent.intent import (
     classify_intent,
@@ -51,6 +52,7 @@ class GraphState(TypedDict, total=False):
     # fuente. answer_node hace el fan-in: lee ambas y deriva `hits`/`nlm_answer`.
     chromadb_docs: List[Dict[str, Any]]   # documentos recuperados de ChromaDB
     notebooklm_docs: Optional[str]        # respuesta de NotebookLM
+    gemini_docs: Optional[str]            # respuesta de Gemini File Search (SPIKE Fase 1a)
     hits: List[Dict[str, Any]]            # = chromadb_docs (lo consumen table/stylist)
     route: str
     answer: Any   # may now hold dict for styled payload
@@ -61,6 +63,9 @@ class GraphState(TypedDict, total=False):
     table_image: Any        # PNG bytes when the table is rendered as an image
     nlm_answer: Optional[str]  # = notebooklm_docs (derivado en answer_node para table_node)
     notebooklm_enabled: bool   # flag que activa/desactiva el fan-out a notebooklm_node
+    run_notebooklm: bool       # rama NLM incluida en el fan-out (según SECONDARY_RAG_SOURCE)
+    run_gemini: bool           # rama Gemini incluida en el fan-out (SPIKE Fase 1a)
+    secondary_primary: str     # "notebooklm" | "gemini": cuál fuente secundaria alimenta answer_node
     search_query: Optional[str]  # standalone query (condensed from history) used for retrieval
     suggestions: List[str]  # follow-up questions offered to the user after the answer
     intent: Optional[str]        # exhaustiva | tabla | puntual | smalltalk (TICKET-001)
@@ -360,15 +365,42 @@ def _node_chromadb(state: GraphState) -> GraphState:
                 pass
         return {"chromadb_docs": hits}
 
-def _node_route_entry(state: GraphState) -> GraphState:
-    """Entry point: smalltalk directo, o recuperación (Chroma ± NLM) en el resto.
+def _resolve_secondary_sources() -> tuple:
+    """Decide qué fuente(s) secundaria(s) corren y cuál alimenta answer_node.
 
-    El bifurcado activo/desactivado de NotebookLM NO se decide aquí: se publica el
-    flag `notebooklm_enabled` en el estado y la conditional edge desde condense_node
-    (`_fanout_retrieval`) lo usa para incluir o no a notebooklm_node en el fan-out.
+    Lee SECONDARY_RAG_SOURCE (notebooklm | gemini | shadow) junto con los flags
+    de disponibilidad de cada fuente. Devuelve (run_nlm, run_gemini, primary).
+    Diseñado como feature flag por entorno en Railway para el piloto A/B:
+      - notebooklm → solo NLM (default, retrocompatible)
+      - gemini     → solo Gemini alimenta la respuesta
+      - shadow     → ambos corren; NLM alimenta (prod-safe), Gemini se loguea
+                     para comparar calidad a igualdad de pregunta.
+    """
+    src = str(getattr(settings, "SECONDARY_RAG_SOURCE", "notebooklm")).strip().lower()
+    nlm_on = str(getattr(settings, "NOTEBOOKLM_ENABLED", "false")).lower() in ("1", "true", "yes")
+    gem_on = bool((getattr(settings, "GEMINI_API_KEY", None) or "").strip()
+                  and (getattr(settings, "GEMINI_FILE_SEARCH_STORE", None) or "").strip())
+
+    if src == "gemini":
+        return False, gem_on, "gemini"
+    if src == "shadow":
+        # Ambos; NLM sigue siendo el primario para no arriesgar producción.
+        return nlm_on, gem_on, "notebooklm"
+    # "notebooklm" (default) o valor desconocido → comportamiento actual.
+    return nlm_on, False, "notebooklm"
+
+
+def _node_route_entry(state: GraphState) -> GraphState:
+    """Entry point: smalltalk directo, o recuperación (Chroma ± NLM/Gemini) en el resto.
+
+    El bifurcado de fuentes secundarias NO se decide aquí: se publican los flags
+    `run_notebooklm` / `run_gemini` / `secondary_primary` en el estado y la
+    conditional edge desde condense_node (`_fanout_retrieval`) los usa para armar
+    el fan-out. `notebooklm_enabled` se conserva por compatibilidad.
     """
     q = state.get("question", "")
-    nlm_enabled = str(getattr(settings, "NOTEBOOKLM_ENABLED", "false")).lower() in ("1", "true", "yes")
+    run_nlm, run_gemini, secondary_primary = _resolve_secondary_sources()
+    nlm_enabled = run_nlm
     # Clasificador de intención (TICKET-001): LLM barato con fallback a regex.
     # Reemplaza el ruteo por regex como fuente PRIMARIA de la decisión.
     # `is_media`: el contenido derivado de imagen/voz nunca es smalltalk.
@@ -381,6 +413,8 @@ def _node_route_entry(state: GraphState) -> GraphState:
         None, "route_entry", as_type="chain",
         span_input={
             "nlm_enabled": nlm_enabled,
+            "run_gemini": run_gemini,
+            "secondary_primary": secondary_primary,
             "intent": intent.intent,
             "intent_source": intent.source,
             "wants_table": wants_table,
@@ -395,6 +429,9 @@ def _node_route_entry(state: GraphState) -> GraphState:
                     "intent_source": intent.source,
                     "wants_table": wants_table,
                     "wants_full": wants_full,
+                    "run_notebooklm": run_nlm,
+                    "run_gemini": run_gemini,
+                    "secondary_primary": secondary_primary,
                 })
             except Exception:
                 pass
@@ -405,6 +442,9 @@ def _node_route_entry(state: GraphState) -> GraphState:
         "intent": intent.intent,
         "intent_source": intent.source,
         "notebooklm_enabled": nlm_enabled,
+        "run_notebooklm": run_nlm,
+        "run_gemini": run_gemini,
+        "secondary_primary": secondary_primary,
     }
 
 
@@ -416,7 +456,16 @@ def _node_answer(state: GraphState) -> GraphState:
     # el LLM y se derivan `hits`/`nlm_answer`, que consumen los nodos posteriores
     # (table_node, stylist_node) tal como antes.
     hits = state.get("chromadb_docs") or []
-    nlm_answer = (state.get("notebooklm_docs") or "").strip()
+    # Fuente secundaria que alimenta la respuesta: según SECONDARY_RAG_SOURCE, es
+    # NotebookLM o Gemini File Search (en modo "shadow" ambos corrieron, pero solo
+    # el `secondary_primary` entra al prompt; el otro queda en su span para
+    # comparar calidad). Se sigue exponiendo como `nlm_answer` para no tocar el
+    # contrato de table_node/stylist_node.
+    secondary_primary = state.get("secondary_primary", "notebooklm")
+    if secondary_primary == "gemini":
+        nlm_answer = (state.get("gemini_docs") or "").strip()
+    else:
+        nlm_answer = (state.get("notebooklm_docs") or "").strip()
     source = state.get("source")
 
     if not hits and not nlm_answer:
@@ -528,6 +577,21 @@ def _get_notebooklm_client() -> NotebookLMClient:
             page_timeout_ms=int(getattr(settings, "NOTEBOOKLM_PAGE_TIMEOUT_MS", 15000)),
         )
     return _notebooklm_client
+
+
+_gemini_client: Optional[GeminiFileSearchClient] = None
+
+
+def _get_gemini_client() -> GeminiFileSearchClient:
+    global _gemini_client
+    if _gemini_client is None:
+        _gemini_client = GeminiFileSearchClient(
+            api_key=getattr(settings, "GEMINI_API_KEY", None),
+            model=getattr(settings, "GEMINI_MODEL", "gemini-2.5-flash"),
+            store=getattr(settings, "GEMINI_FILE_SEARCH_STORE", None),
+            timeout=float(getattr(settings, "GEMINI_TIMEOUT", 30.0)),
+        )
+    return _gemini_client
 
 
 # ===============================
@@ -675,6 +739,77 @@ def _node_notebooklm(state: GraphState) -> GraphState:
                 pass
 
         return {"notebooklm_docs": nlm_answer}
+
+
+# ===============================
+#  Gemini File Search Node (rama independiente — SPIKE Fase 1a)
+# ===============================
+def _node_gemini(state: GraphState) -> GraphState:
+    """Rama de recuperación contra Gemini File Search (paralela a chromadb_node).
+
+    Espeja a notebooklm_node: escribe su salida en `gemini_docs` y crea su propio
+    span en Langfuse para poder comparar, a igualdad de pregunta, la respuesta de
+    Gemini vs la de NotebookLM (validación de calidad del piloto A/B). Solo se
+    ejecuta cuando el fan-out lo incluye (SECONDARY_RAG_SOURCE=gemini|shadow y hay
+    key + store). Degrada a "" ante cualquier fallo: nunca bloquea el fan-in.
+    """
+    q = state.get("search_query") or state["question"]
+    timeout = float(getattr(settings, "GEMINI_TIMEOUT", 30.0))
+
+    with span_ctx(
+        None, "gemini_node", as_type="retriever",
+        span_input={"question": q},
+    ) as span:
+        answer = ""
+        sources: List[Dict[str, Any]] = []
+        error_msg = ""
+        status = "disabled"
+
+        client = _get_gemini_client()
+        if not client.is_available():
+            status = "unconfigured"  # falta GEMINI_API_KEY o GEMINI_FILE_SEARCH_STORE
+        else:
+            fut = _POOL.submit(client.ask_question, q)
+            try:
+                raw_answer, raw_sources = fut.result(timeout=timeout)
+                answer = (raw_answer or "").strip()
+                sources = raw_sources or []
+                status = "ok" if answer else "empty"
+            except FutureTimeoutError:
+                status = "timeout"
+                error_msg = f"Gemini no respondió en {timeout:.0f}s"
+                logger.warning("gemini_node: espera de %.0fs agotada", timeout)
+            except Exception as exc:
+                status = "error"
+                error_msg = str(exc)
+                logger.warning("gemini_node query failed: %s", exc)
+
+        if span is not None:
+            try:
+                output: Dict[str, Any] = {
+                    "answer": answer,
+                    "answer_len": len(answer),
+                    "answer_preview": answer[:1000],
+                    "sources": _format_nlm_sources(sources),
+                    "sources_count": len(sources),
+                    "status": status,
+                }
+                if error_msg:
+                    output["error"] = error_msg[:800]
+                span.update(
+                    output=output,
+                    metadata={
+                        "status": status,
+                        "model": getattr(settings, "GEMINI_MODEL", None),
+                        "store": getattr(settings, "GEMINI_FILE_SEARCH_STORE", None),
+                        "wait_budget_s": timeout,
+                        "question": q,
+                    },
+                )
+            except Exception:
+                pass
+
+        return {"gemini_docs": answer}
 
 
 # ===============================
@@ -1320,6 +1455,7 @@ def build_graph():
     # Langfuse (chromadb_node vs notebooklm_node), con su salida en clave propia.
     g.add_node("chromadb_node", _node_chromadb)
     g.add_node("notebooklm_node", _node_notebooklm)
+    g.add_node("gemini_node", _node_gemini)
     g.add_node("answer_node", _node_answer)
     g.add_node("enrich_node", _node_enrich)
     g.add_node("stylist_node", _node_stylist)
@@ -1354,28 +1490,37 @@ def build_graph():
     g.add_edge("clarify_node", "stylist_node")
 
     # ── Fan-out de recuperación (ramas paralelas que convergen) ──────────────
-    # La conditional edge devuelve la LISTA de ramas a ejecutar:
-    #   - NotebookLM ACTIVO    → ["chromadb_node", "notebooklm_node"]  (paralelo)
-    #   - NotebookLM DESACTIVADO → ["chromadb_node"]  (notebooklm_node no se ejecuta
-    #                              ni aparece en la traza)
-    # LangGraph corre ambas ramas en el mismo super-step y espera a que terminen
-    # (fan-in) antes de ejecutar answer_node.
+    # La conditional edge devuelve la LISTA de ramas a ejecutar según los flags
+    # publicados por route_entry (SECONDARY_RAG_SOURCE):
+    #   - notebooklm → ["chromadb_node", "notebooklm_node"]
+    #   - gemini     → ["chromadb_node", "gemini_node"]
+    #   - shadow     → ["chromadb_node", "notebooklm_node", "gemini_node"]  (A/B)
+    # LangGraph corre todas en el mismo super-step y espera a que terminen
+    # (fan-in) antes de ejecutar answer_node. Las ramas no incluidas ni aparecen
+    # en la traza.
     def _fanout_retrieval(s: GraphState) -> List[str]:
         targets = ["chromadb_node"]
-        if s.get("notebooklm_enabled"):
+        if s.get("run_notebooklm"):
             targets.append("notebooklm_node")
+        if s.get("run_gemini"):
+            targets.append("gemini_node")
         return targets
 
     g.add_conditional_edges(
         "condense_node",
         _fanout_retrieval,
-        {"chromadb_node": "chromadb_node", "notebooklm_node": "notebooklm_node"},
+        {
+            "chromadb_node": "chromadb_node",
+            "notebooklm_node": "notebooklm_node",
+            "gemini_node": "gemini_node",
+        },
     )
 
-    # Fan-in: ambas ramas convergen en answer_node. LangGraph lo ejecuta una sola
-    # vez, tras completarse las ramas que se hayan activado en el fan-out.
+    # Fan-in: las ramas activas convergen en answer_node. LangGraph lo ejecuta una
+    # sola vez, tras completarse las ramas que se hayan activado en el fan-out.
     g.add_edge("chromadb_node", "answer_node")
     g.add_edge("notebooklm_node", "answer_node")
+    g.add_edge("gemini_node", "answer_node")
 
     # answer_node combina ambas fuentes y enruta:
     #   - sin evidencia en ninguna fuente → no_context
