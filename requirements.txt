@@ -5,7 +5,7 @@ aiogram==3.7.0
 python-dotenv==1.1.1
 pydantic==2.7.4
 pydantic-settings==2.3.1
-httpx==0.27.2
+httpx==0.28.1  # >=0.28.1 lo exige google-genai; <1 lo exige openai. Compatible con ambos.
 
 # LLM + embeddings
 openai==1.109.1

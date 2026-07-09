@@ -544,15 +544,56 @@ SECONDARY_RAG_SOURCE=notebooklm      # cámbialo a gemini | shadow para probar
 
 ### Paso 1 — Cargar el corpus en un File Search Store (una sola vez)
 
-`gemini_client.py` solo **consulta** un store existente; `gemini_ingesta.py` lo crea y lo llena. Ignora todo lo que no sea `*.pdf`:
+`gemini_client.py` solo **consulta** un store existente; `gemini_ingesta.py` lo crea y lo llena. Ignora todo lo que no sea `*.pdf` y sanea nombres con tildes.
 
 ```bash
+# crear un store nuevo y subir todos los PDF de la carpeta
 python gemini_ingesta.py /ruta/a/carpeta/con/pdfs
-# reusar un store ya creado:
+
+# AÑADIR documentos a un store que ya existe (sin crear otro)
 python gemini_ingesta.py /ruta/a/carpeta --store fileSearchStores/xxxxx
 ```
 
 Al terminar imprime la línea `GEMINI_FILE_SEARCH_STORE="fileSearchStores/..."` — cópiala al `.env`.
+
+**El store queda atado a la cuenta de la API key.** Para el piloto con la cuenta
+del proyecto (retie), crea el store con ESA key (no la personal), anteponiéndola:
+
+```bash
+# macOS / Linux
+GEMINI_API_KEY="AQ...key_de_la_cuenta" python gemini_ingesta.py "/ruta/a/RETIE DOCUMENTS"
+```
+
+```powershell
+# Windows (PowerShell)
+cd $HOME\Documents\RETIE\retie-multi-agents
+.\.venv\Scripts\Activate.ps1
+$env:GEMINI_API_KEY="AQ...key_de_la_cuenta"
+python gemini_ingesta.py "C:\ruta\a\RETIE DOCUMENTS"
+```
+
+### Gestionar los stores (listar, ver documentos, borrar)
+
+`gemini_store_admin.py` administra los stores. Usa la key del `.env`, o antepón
+`GEMINI_API_KEY="..."` para operar sobre otra cuenta.
+
+```bash
+# listar todos los stores de la cuenta
+python gemini_store_admin.py list
+
+# ver los documentos de un store
+python gemini_store_admin.py docs fileSearchStores/xxxxx
+
+# borrar un store COMPLETO (con todos sus documentos)
+python gemini_store_admin.py delete fileSearchStores/xxxxx
+
+# borrar un solo documento
+python gemini_store_admin.py deldoc fileSearchStores/xxxxx fileSearchStores/xxxxx/documents/yyyyy
+```
+
+> Para empezar de cero (p. ej. si se subieron archivos equivocados): borra el store
+> con `delete` y vuelve a correr `gemini_ingesta.py`. En Windows, antepón la key con
+> `$env:GEMINI_API_KEY="..."` en una línea aparte, igual que en la ingesta.
 
 ### Paso 2 — Probar en tres niveles
 
