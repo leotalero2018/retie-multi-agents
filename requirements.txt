@@ -1,10 +1,13 @@
 # Core runtime
 fastapi==0.112.2
 uvicorn==0.30.6
-aiogram==3.7.0
+# aiogram/pydantic subidos por el spike: google-genai (File Search) exige
+# pydantic>=2.9, y aiogram 3.7.0 fijaba pydantic<2.8. Validado que el bot
+# importa OK con aiogram 3.29.1. Revisar el runtime del bot antes de producción.
+aiogram==3.29.1
 python-dotenv==1.1.1
-pydantic==2.7.4
-pydantic-settings==2.3.1
+pydantic==2.13.4
+pydantic-settings==2.14.2
 httpx==0.28.1  # >=0.28.1 lo exige google-genai; <1 lo exige openai. Compatible con ambos.
 
 # LLM + embeddings
