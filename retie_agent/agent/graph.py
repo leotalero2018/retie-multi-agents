@@ -587,9 +587,9 @@ def _get_gemini_client() -> GeminiFileSearchClient:
     if _gemini_client is None:
         _gemini_client = GeminiFileSearchClient(
             api_key=getattr(settings, "GEMINI_API_KEY", None),
-            model=getattr(settings, "GEMINI_MODEL", "gemini-2.5-flash"),
+            model=getattr(settings, "GEMINI_MODEL", "gemini-flash-latest"),
             store=getattr(settings, "GEMINI_FILE_SEARCH_STORE", None),
-            timeout=float(getattr(settings, "GEMINI_TIMEOUT", 30.0)),
+            timeout=float(getattr(settings, "GEMINI_TIMEOUT", 120.0)),
         )
     return _gemini_client
 
@@ -754,7 +754,7 @@ def _node_gemini(state: GraphState) -> GraphState:
     key + store). Degrada a "" ante cualquier fallo: nunca bloquea el fan-in.
     """
     q = state.get("search_query") or state["question"]
-    timeout = float(getattr(settings, "GEMINI_TIMEOUT", 30.0))
+    timeout = float(getattr(settings, "GEMINI_TIMEOUT", 120.0))
 
     with span_ctx(
         None, "gemini_node", as_type="retriever",

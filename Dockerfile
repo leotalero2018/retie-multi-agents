@@ -83,18 +83,14 @@ COPY requirements.txt ./requirements.txt
 
 # -------------------------------
 # Install deps
-# - requirements.txt del repo
-# - más: langgraph + langchain + langchain-openai (para CallbackHandler)
-# - minio client
+# - requirements.txt es la ÚNICA fuente de pines. Antes se reinstalaban aquí
+#   langgraph/langchain/minio con versiones VIEJAS (langgraph 0.2.42 pisaba el
+#   0.2.62 de requirements) y langchain-openai, que no se importa en ninguna
+#   parte (el CallbackHandler de Langfuse viene de langfuse.langchain).
 # -------------------------------
 RUN python -m pip install --upgrade pip && \
     pip install --no-cache-dir torch==2.2.2+cpu -f https://download.pytorch.org/whl/cpu/torch_stable.html && \
-    pip install --no-cache-dir -r requirements.txt --progress-bar off && \
-    pip install --no-cache-dir \
-        langchain==0.3.26 \
-        langchain-openai==0.2.14 \
-        langgraph==0.2.42 \
-        minio==7.2.16
+    pip install --no-cache-dir -r requirements.txt --progress-bar off
 
 
 

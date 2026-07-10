@@ -46,9 +46,9 @@ class GeminiFileSearchClient:
     def __init__(
         self,
         api_key: Optional[str],
-        model: str = "gemini-2.5-flash",
+        model: str = "gemini-flash-latest",
         store: Optional[str] = None,
-        timeout: float = 30.0,
+        timeout: float = 120.0,
     ) -> None:
         self.api_key = (api_key or "").strip()
         self.model = model
@@ -72,11 +72,15 @@ class GeminiFileSearchClient:
                 raise GeminiError("GEMINI_API_KEY no configurada.")
             try:
                 from google import genai  # type: ignore
+                from google.genai import types  # type: ignore
             except Exception as exc:  # pragma: no cover - depende del entorno
                 raise GeminiError(
                     "SDK google-genai no instalado. Ejecuta: pip install google-genai"
                 ) from exc
-            self._client = genai.Client(api_key=self.api_key)
+            self._client = genai.Client(
+                api_key=self.api_key,
+                http_options=types.HttpOptions(timeout=int(self.timeout * 1000)),
+            )
             return self._client
 
     def is_available(self) -> bool:
@@ -126,8 +130,8 @@ class GeminiFileSearchClient:
                     break
                 wait = _BACKOFF_BASE ** (attempt + 1)
                 logger.warning(
-                    "Gemini 503/429 (intento %d/%d) — reintentando en %.0fs",
-                    attempt + 1, _MAX_RETRIES, wait,
+                    "Gemini transitorio (intento %d/%d, reintento en %.0fs): %s",
+                    attempt + 1, _MAX_RETRIES, wait, str(exc)[:200],
                 )
                 time.sleep(wait)
 
@@ -166,6 +170,6 @@ class GeminiFileSearchClient:
                             "snippet": (getattr(ctx, "text", None) or "")[:300],
                         }
                     )
-        except Exception:  # pragma: no cover - defensivo
+        except Exception:
             pass
         return sources

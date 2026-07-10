@@ -537,10 +537,12 @@ Variables en el `.env` (obtén la API key en [Google AI Studio](https://aistudio
 
 ```env
 GEMINI_API_KEY=AQ...
-GEMINI_MODEL=gemini-2.5-flash
-GEMINI_FILE_SEARCH_STORE=            # lo llena el script de ingesta (paso 1)
-SECONDARY_RAG_SOURCE=notebooklm      # cámbialo a gemini | shadow para probar
+GEMINI_MODEL=gemini-flash-latest
+GEMINI_FILE_SEARCH_STORE=            
+GEMINI_TIMEOUT=120 
+SECONDARY_RAG_SOURCE=notebooklm      
 ```
+
 
 ### Paso 1 — Cargar el corpus en un File Search Store (una sola vez)
 
@@ -620,7 +622,10 @@ En **Langfuse**, cada traza `retie-query` en modo `shadow` muestra los spans `no
 
 | Síntoma | Solución |
 |---------|----------|
-| `model not found` | Ajusta `GEMINI_MODEL` en el `.env` (el nombre del modelo pudo cambiar). |
+| `404 NOT_FOUND: no longer available to new users` | El modelo pineado fue retirado. Usa `gemini-flash-latest` o `gemini-3.1-flash-lite` en `GEMINI_MODEL`. |
+| `503 UNAVAILABLE: high demand` sostenido | El alias apunta al modelo más saturado. Cambia a `gemini-3.1-flash-lite`. |
+| `429 RESOURCE_EXHAUSTED` | Quota del free tier agotada (por minuto o por día). Espera o pasa la key a plan de pago. |
+| `gemini_node` con `status=timeout` en Langfuse | Sube `GEMINI_TIMEOUT` (default 120 s): los reintentos ante 503/429 necesitan margen. |
 | Falla la ingesta por el modelo de embedding | Cambia `gemini-embedding-2` en `gemini_ingesta.py`. |
 | `gemini_node` no aparece en la traza | Falta `GEMINI_API_KEY`/`GEMINI_FILE_SEARCH_STORE`, o `SECONDARY_RAG_SOURCE` sigue en `notebooklm`. |
 

@@ -143,9 +143,9 @@ class Settings(BaseSettings):
     # Feature flag pensado para alternar por entorno en Railway sin redeploy.
     SECONDARY_RAG_SOURCE: str = "notebooklm"
     GEMINI_API_KEY: Optional[str] = None
-    GEMINI_MODEL: str = "gemini-2.5-flash"
-    GEMINI_FILE_SEARCH_STORE: Optional[str] = None   # p. ej. fileSearchStores/xxxxx
-    GEMINI_TIMEOUT: float = 30.0
+    GEMINI_MODEL: str = "gemini-flash-latest"
+    GEMINI_FILE_SEARCH_STORE: Optional[str] = None
+    GEMINI_TIMEOUT: float = 120.0
 
     # --- Observability (Langfuse) ---
     # Accept typical string booleans; obs.py interprets them safely.
