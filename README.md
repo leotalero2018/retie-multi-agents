@@ -517,11 +517,16 @@ NOTEBOOKLM_NOTEBOOK_ID=retie
 
 El grafo ya recuperaba en paralelo con `chromadb_node` + `notebooklm_node`. El spike agrega un **tercer nodo `gemini_node`** que respeta el mismo contrato (escribe en `gemini_docs`, genera su propio span en Langfuse), controlado por un único feature flag:
 
-| `SECONDARY_RAG_SOURCE` | Comportamiento |
-|------------------------|----------------|
-| `notebooklm` (default) | Pipeline actual, sin cambios. |
-| `gemini`               | Gemini File Search alimenta la respuesta; NotebookLM apagado. |
-| `shadow`               | **A/B:** ambos corren en paralelo para la misma pregunta; NotebookLM alimenta la respuesta (producción segura) y Gemini queda registrado en su span de Langfuse para comparar calidad. |
+| `SECONDARY_RAG_SOURCE` | Nodos que corren | Comportamiento |
+|------------------------|------------------|----------------|
+| `notebooklm` (default) | Chroma + NLM | Pipeline actual, sin cambios. |
+| `gemini`               | Chroma + Gemini | Gemini File Search alimenta la respuesta; NotebookLM apagado. |
+| `shadow`               | Chroma + NLM + Gemini | **A/B:** los tres corren en paralelo para la misma pregunta; NotebookLM alimenta la respuesta (producción segura) y Gemini queda registrado en su span de Langfuse para comparar calidad — **por diseño Gemini NO entra en la respuesta entregada**. |
+| `chroma`               | solo Chroma | Sin fuente secundaria (alias: `chromadb`, `solo-chroma`, `none`). |
+| `solo-notebooklm`      | solo NLM | NotebookLM alimenta la respuesta, sin recuperación de Chroma. |
+| `solo-gemini`          | solo Gemini | Gemini alimenta la respuesta, sin recuperación de Chroma. |
+
+> Si la única fuente pedida no está disponible (p. ej. `solo-gemini` sin key/store), el fan-out degrada a Chroma para no romper el grafo. El valor tolera comillas pegadas (`"shadow"` desde el dashboard de Railway).
 
 El flag se alterna por entorno en Railway sin redeploy de código.
 

@@ -18,7 +18,8 @@ from retie_agent.config import settings
 import retie_agent.agent.graph as graph
 
 
-# ── Feature flag: _resolve_secondary_sources ─────────────────────────────────
+# ── Feature flag: _resolve_rag_sources ───────────────────────────────────────
+# Devuelve (run_chroma, run_nlm, run_gemini, primary).
 
 @pytest.fixture
 def gemini_configured(monkeypatch):
@@ -29,31 +30,52 @@ def gemini_configured(monkeypatch):
 
 def test_flag_notebooklm_default(gemini_configured, monkeypatch):
     monkeypatch.setattr(settings, "SECONDARY_RAG_SOURCE", "notebooklm")
-    assert graph._resolve_secondary_sources() == (True, False, "notebooklm")
+    assert graph._resolve_rag_sources() == (True, True, False, "notebooklm")
 
 
 def test_flag_gemini(gemini_configured, monkeypatch):
     monkeypatch.setattr(settings, "SECONDARY_RAG_SOURCE", "gemini")
-    assert graph._resolve_secondary_sources() == (False, True, "gemini")
+    assert graph._resolve_rag_sources() == (True, False, True, "gemini")
 
 
-def test_flag_shadow_corre_ambos_y_alimenta_nlm(gemini_configured, monkeypatch):
+def test_flag_shadow_corre_los_tres_y_alimenta_nlm(gemini_configured, monkeypatch):
     monkeypatch.setattr(settings, "SECONDARY_RAG_SOURCE", "shadow")
-    assert graph._resolve_secondary_sources() == (True, True, "notebooklm")
+    assert graph._resolve_rag_sources() == (True, True, True, "notebooklm")
+
+
+def test_flag_chroma_solo(gemini_configured, monkeypatch):
+    monkeypatch.setattr(settings, "SECONDARY_RAG_SOURCE", "chroma")
+    assert graph._resolve_rag_sources() == (True, False, False, "notebooklm")
+
+
+def test_flag_solo_gemini_sin_chroma(gemini_configured, monkeypatch):
+    monkeypatch.setattr(settings, "SECONDARY_RAG_SOURCE", "solo-gemini")
+    assert graph._resolve_rag_sources() == (False, False, True, "gemini")
+
+
+def test_flag_solo_notebooklm_sin_chroma(gemini_configured, monkeypatch):
+    monkeypatch.setattr(settings, "SECONDARY_RAG_SOURCE", "solo-notebooklm")
+    assert graph._resolve_rag_sources() == (False, True, False, "notebooklm")
+
+
+def test_flag_tolera_comillas_pegadas_de_railway(gemini_configured, monkeypatch):
+    # Pegar `"shadow"` (con comillas) en el dashboard de Railway no debe caer al default.
+    monkeypatch.setattr(settings, "SECONDARY_RAG_SOURCE", '"shadow"')
+    assert graph._resolve_rag_sources() == (True, True, True, "notebooklm")
 
 
 def test_flag_gemini_sin_store_no_corre(monkeypatch):
     monkeypatch.setattr(settings, "SECONDARY_RAG_SOURCE", "gemini")
     monkeypatch.setattr(settings, "GEMINI_API_KEY", "fake-key")
     monkeypatch.setattr(settings, "GEMINI_FILE_SEARCH_STORE", None)
-    run_nlm, run_gemini, primary = graph._resolve_secondary_sources()
+    run_chroma, run_nlm, run_gemini, primary = graph._resolve_rag_sources()
     assert run_gemini is False
     assert primary == "gemini"  # answer_node leerá gemini_docs vacío y degrada a Chroma
 
 
 def test_flag_desconocido_es_retrocompatible(gemini_configured, monkeypatch):
     monkeypatch.setattr(settings, "SECONDARY_RAG_SOURCE", "algo-raro")
-    assert graph._resolve_secondary_sources() == (True, False, "notebooklm")
+    assert graph._resolve_rag_sources() == (True, True, False, "notebooklm")
 
 
 # ── Cliente: disponibilidad y validación ─────────────────────────────────────
