@@ -425,13 +425,18 @@ def _node_query_enrichment(state: GraphState) -> GraphState:
 _node_condense = _node_query_enrichment
 
 
-def _node_chromadb(state: GraphState) -> GraphState:
+def _node_chromadb(state: GraphState, config=None) -> GraphState:
     """Rama de recuperación contra ChromaDB (paralela a notebooklm_node).
 
     Nodo independiente: escribe su salida en `chromadb_docs` para que, en la
     traza de Langfuse, al hacer clic en chromadb_node se vean exactamente los
     documentos/scores recuperados de Chroma — separados de lo que aportó NLM.
     """
+    _emit_progress(
+        _progress_from_config(config),
+        "chromadb_node",
+        "📚 Buscando en la base normativa…",
+    )
     q = state.get("search_query") or state["question"]
     agent_key = state.get("agent_key")
     coll = _resolve_collection(agent_key, explicit=None)
@@ -515,7 +520,7 @@ def _resolve_rag_sources() -> tuple:
     return True, nlm_on, False, "notebooklm"
 
 
-def _node_classifier(state: GraphState) -> GraphState:
+def _node_classifier(state: GraphState, config=None) -> GraphState:
     """Entry point del grafo: clasifica la intención y publica IntentResultV3.
 
     Solo decide QUÉ quiere el usuario (intención + parámetros de entrega); la
@@ -527,6 +532,11 @@ def _node_classifier(state: GraphState) -> GraphState:
     q = state.get("question", "")
     is_media = state.get("source") in ("image", "voice")
     channel = (state.get("metadata") or {}).get("channel", "telegram")
+    _emit_progress(
+        _progress_from_config(config),
+        "classifier_node",
+        "🧭 Clasificando tu consulta…",
+    )
     res = classify_intent_v3(
         q, history=state.get("history"), is_media=is_media, channel=channel,
         media_source=state.get("source"),
@@ -702,9 +712,9 @@ def _node_answer(state: GraphState, config=None) -> GraphState:
         _emit_progress(
             progress_callback,
             "media_answer",
-            "🖼️ Analizando el contenido enviado y preparando respuesta…"
+            "🖼️ Interpretando la imagen enviada…"
             if source == "image"
-            else "🎙️ Revisando la transcripción y preparando respuesta…",
+            else "🎙️ Interpretando la nota de voz…",
             source=source,
         )
         with span_ctx(
@@ -730,7 +740,7 @@ def _node_answer(state: GraphState, config=None) -> GraphState:
         _emit_progress(
             progress_callback,
             "no_evidence",
-            "🔎 No encontré evidencia suficiente en las fuentes disponibles…",
+            "🔎 Sin evidencia suficiente en las fuentes disponibles…",
         )
         return {
             "answer": NO_EVIDENCE_PHRASE,
@@ -748,7 +758,7 @@ def _node_answer(state: GraphState, config=None) -> GraphState:
         _emit_progress(
             progress_callback,
             "answer_node",
-            "🧠 Preparando análisis normativo con las fuentes recuperadas…",
+            "📖 Analizando la evidencia normativa recuperada…",
             hits=len(hits),
             has_secondary=bool(nlm_answer),
             intent=state.get("intent"),
@@ -779,7 +789,7 @@ def _node_answer(state: GraphState, config=None) -> GraphState:
                     _emit_progress(
                         progress_callback,
                         "fallback_simple",
-                        "✍️ Preparando respuesta de respaldo con la evidencia disponible…",
+                        "✍️ Elaborando la respuesta con la evidencia disponible…",
                         status=status,
                     )
                     answer = _synthesize_simple(
@@ -882,7 +892,7 @@ def _get_nlm_cache() -> NotebookLMCache:
     return _nlm_cache
 
 
-def _node_notebooklm(state: GraphState) -> GraphState:
+def _node_notebooklm(state: GraphState, config=None) -> GraphState:
     """Rama de recuperación contra NotebookLM (paralela a chromadb_node).
 
     Nodo independiente: escribe su salida en `notebooklm_docs` para que, en la
@@ -907,6 +917,11 @@ def _node_notebooklm(state: GraphState) -> GraphState:
     sem_sim = float(getattr(settings, "NLM_SEMANTIC_CACHE_SIM", 0.93))
     hard_timeout = float(getattr(settings, "NOTEBOOKLM_HARD_TIMEOUT", 180.0))
 
+    _emit_progress(
+        _progress_from_config(config),
+        "notebooklm_node",
+        "📖 Consultando NotebookLM…",
+    )
     nlm_eligible = len(q.strip()) >= min_chars
     cache = _get_nlm_cache()
     cache_kind = None
@@ -1018,7 +1033,7 @@ def _node_notebooklm(state: GraphState) -> GraphState:
 # ===============================
 #  Gemini File Search Node (rama independiente — SPIKE Fase 1a)
 # ===============================
-def _node_gemini(state: GraphState) -> GraphState:
+def _node_gemini(state: GraphState, config=None) -> GraphState:
     """Rama de recuperación contra Gemini File Search (paralela a chromadb_node).
 
     Espeja a notebooklm_node: escribe su salida en `gemini_docs` y crea su propio
@@ -1030,6 +1045,11 @@ def _node_gemini(state: GraphState) -> GraphState:
     """
     q = state.get("search_query") or state["question"]
     timeout = float(getattr(settings, "GEMINI_TIMEOUT", 120.0))
+    _emit_progress(
+        _progress_from_config(config),
+        "gemini_node",
+        "🌐 Consultando el corpus vía Gemini…",
+    )
 
     with span_ctx(
         None, "gemini_node", as_type="retriever",
@@ -1580,7 +1600,7 @@ def _get_enrichment_agent() -> EnrichmentAssistant:
     return _enrichment_agent
 
 
-def _node_enrich(state: GraphState) -> GraphState:
+def _node_enrich(state: GraphState, config=None) -> GraphState:
     """Asistente secundario que enriquece la respuesta base sin bloquear el flujo.
 
     Con ENRICHMENT_ENABLED=false el nodo es un pass-through (respuesta ~2x más
@@ -1594,6 +1614,11 @@ def _node_enrich(state: GraphState) -> GraphState:
         return {"answer": base_answer}
 
     timeout = float(getattr(settings, "ENRICHMENT_TIMEOUT", 30.0))
+    _emit_progress(
+        _progress_from_config(config),
+        "enrich_node",
+        "🪶 Puliendo la redacción…",
+    )
 
     with span_ctx(
         None,
@@ -2151,7 +2176,20 @@ def run_graph(
     agent_key: Optional[str] = None,
     *,
     metadata: Optional[Dict[str, Any]] = None,
+    progress_callback: Optional[ProgressCallback] = None,
 ) -> Any:
+    """`progress_callback` (opcional) recibe los eventos {"stage", "message",
+    "detail"} que emiten _node_answer/_node_enrich/deep_answer.py durante la
+    corrida — el router de Telegram lo usa para ir editando un mensaje de
+    estado ("Buscando…", "Pensando…") mientras el grafo trabaja. Se invoca
+    SIEMPRE desde el hilo donde corre app.invoke (ver _emit_progress); si el
+    caller viene de otro hilo/loop (asyncio), debe encargarse de saltar de
+    vuelta de forma thread-safe."""
+    # Primera señal INMEDIATA (antes de build_graph/history/clasificación): el
+    # caller no debe esperar a que el grafo llegue a ninguna etapa para saber
+    # que la consulta ya está en curso.
+    _emit_progress(progress_callback, "graph_start", "📩 Analizando tu consulta…")
+
     app = build_graph()
 
     langfuse_handler = _make_langfuse_handler()
@@ -2194,6 +2232,7 @@ def run_graph(
                 "run_name": "LangGraph",
                 "tags": ["retie-agent", "graph", f"user:{user_id}", f"session:{session}"],
                 "metadata": {**(metadata or {}), "agent_key": agent_key or "default"},
+                "configurable": {"progress_callback": progress_callback},
             },
         )
 

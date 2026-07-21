@@ -149,7 +149,7 @@ def _build_tools(
         _emit_progress(
             progress_callback,
             "search_chroma",
-            "📚 Consultando fragmentos normativos…",
+            "📚 Consultando la normativa técnica…",
             query=query,
             top_k=top_k,
         )
@@ -168,7 +168,7 @@ def _build_tools(
             _emit_progress(
                 progress_callback,
                 "search_chroma_done",
-                "📚 Evidencia normativa recuperada; revisando relevancia…",
+                "📚 Evidencia recuperada, evaluando relevancia…",
                 query=query,
                 n_results=len(hits),
             )
@@ -187,7 +187,7 @@ def _build_tools(
             _emit_progress(
                 progress_callback,
                 "search_chroma_error",
-                "⚠️ La búsqueda normativa falló; continúo con la evidencia disponible…",
+                "⚙️ Ajustando la búsqueda, continúo con la evidencia disponible…",
                 query=query,
                 error=str(exc)[:200],
             )
@@ -209,7 +209,7 @@ def _build_tools(
             _emit_progress(
                 progress_callback,
                 "ask_gemini",
-                "🔎 Consultando el corpus completo para contrastar la respuesta…",
+                "🌐 Contrastando con el corpus normativo completo…",
                 query=query,
             )
             try:
@@ -225,7 +225,7 @@ def _build_tools(
                 _emit_progress(
                     progress_callback,
                     "ask_gemini_done",
-                    "🔎 Consulta complementaria recibida; cruzando fuentes…",
+                    "🌐 Fuente complementaria recibida, cruzando información…",
                     query=query,
                     n_results=len(raw_sources or []),
                 )
@@ -239,7 +239,7 @@ def _build_tools(
                 _emit_progress(
                     progress_callback,
                     "ask_gemini_error",
-                    "⚠️ La consulta complementaria falló; continúo con la evidencia disponible…",
+                    "⚙️ Ajustando la búsqueda, continúo con la evidencia disponible…",
                     query=query,
                     error=str(exc)[:200],
                 )
@@ -451,7 +451,7 @@ def run_deep_answer(
         _emit_progress(
             progress_callback,
             "deep_answer_start",
-            "🧠 Revisando la evidencia inicial y decidiendo si hace falta buscar más…",
+            "🧠 Evaluando la evidencia disponible…",
             intent=intent,
             skill=skill.name,
             initial_hits=len(initial_hits),
@@ -487,7 +487,7 @@ def run_deep_answer(
             _emit_progress(
                 progress_callback,
                 "deep_agent_reasoning",
-                "⚙️ Analizando requisitos, fuentes y posibles vacíos…",
+                "⚙️ Evaluando requisitos y posibles vacíos de información…",
                 max_retrievals=max_retrievals,
             )
             return agent.invoke({"messages": messages}, cfg)
@@ -496,7 +496,7 @@ def run_deep_answer(
         _emit_progress(
             progress_callback,
             "deep_agent_synthesizing",
-            "✍️ Sintetizando la respuesta con la evidencia encontrada…",
+            "✍️ Redactando la respuesta…",
             tool_calls=len(log.tool_calls),
         )
         msgs = (result or {}).get("messages") or []
@@ -523,7 +523,7 @@ def run_deep_answer(
             _emit_progress(
                 progress_callback,
                 "deep_answer_done",
-                "✅ Respuesta técnica lista; preparando presentación…",
+                "✅ Respuesta lista, preparando la entrega…",
                 answer_len=len(answer),
                 tool_calls=len(log.tool_calls),
             )
@@ -532,7 +532,7 @@ def run_deep_answer(
         _emit_progress(
             progress_callback,
             "deep_answer_timeout",
-            "⏱️ La revisión profunda tardó demasiado; preparo una respuesta de respaldo…",
+            "⏱️ Esto está tomando más tiempo de lo usual, preparando una respuesta con lo disponible…",
             timeout=timeout,
         )
         logger.warning(
@@ -543,7 +543,7 @@ def run_deep_answer(
         _emit_progress(
             progress_callback,
             "deep_answer_error",
-            "⚠️ La revisión profunda falló; preparo una respuesta de respaldo…",
+            "⚙️ Ajustando el enfoque, preparando una respuesta con la evidencia disponible…",
             error=str(exc)[:200],
         )
         logger.warning("deep agent falló: %s", exc)

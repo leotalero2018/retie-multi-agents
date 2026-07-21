@@ -3,11 +3,12 @@ from __future__ import annotations
 
 import os
 import re
+import time
 import asyncio
 import tempfile
 import contextvars
 from pathlib import Path
-from typing import Dict, Set, Optional, List
+from typing import Any, Dict, Set, Optional, List
 
 from aiogram import Router, F
 from aiogram.enums import ChatAction
@@ -25,7 +26,6 @@ from aiogram.exceptions import TelegramBadRequest
 from retie_agent.agent.graph import run_graph
 from retie_agent.agent.registry import AGENTS as _AGENTS
 from retie_agent.services.history import clear_history
-from retie_agent.config import settings, as_bool
 
 # --- create router FIRST (before any @router.message decorators) ---
 router = Router(name="telegram_router")
@@ -280,47 +280,90 @@ async def _to_thread_ctx(func, *args, **kwargs):
 
 
 # Entrega con feedback: el "typing" de Telegram expira a los ~5s, así que en
-# consultas largas (NotebookLM puede tardar >30s) el chat parecía muerto.
-# Mantiene el typing vivo y, pasado un umbral, avisa que se está consultando.
-#
-# El aviso menciona NotebookLM SOLO si la fuente está activada (NOTEBOOKLM_ENABLED):
-# con el flag apagado NotebookLM no se consulta, así que nombrarlo confundía.
-_PROGRESS_NOTICE_HYBRID = (
-    "🔎 Estoy consultando la base normativa y NotebookLM para darte una "
-    "respuesta completa; puede tardar un poco más…"
-)
-_PROGRESS_NOTICE_CHROMA = (
-    "🔎 Estoy consultando la base normativa para darte una "
-    "respuesta completa; puede tardar un poco más…"
-)
-_PROGRESS_AFTER_S = 10.0
-_TYPING_REFRESH_S = 4.0
-
-
-def _progress_notice() -> str:
-    """Aviso de progreso acorde al feature flag de NotebookLM (leído en cada uso
-    para reflejar cambios de configuración sin reiniciar el bot)."""
-    nlm_enabled = as_bool(getattr(settings, "NOTEBOOKLM_ENABLED", "false"))
-    return _PROGRESS_NOTICE_HYBRID if nlm_enabled else _PROGRESS_NOTICE_CHROMA
+# consultas largas (NotebookLM/el deep agent pueden tardar >30s) el chat
+# parecía muerto. El grafo emite su propio progreso narrado por etapa
+# (graph.py:_emit_progress, deep_answer.py — "Analizando…", "Buscando…",
+# "Pensando…", "Redactando…"), pero algunas etapas son UNA sola llamada de
+# red/LLM sin sub-pasos que reportar (la síntesis final, una consulta a
+# Gemini/NotebookLM): ahí puede haber varios segundos de silencio real.
+# _HEARTBEAT_MESSAGES es la red de seguridad para ESE silencio — genéricos a
+# propósito (no atados a una etapa concreta) porque no sabemos cuál está
+# tardando; rotan cada _PROGRESS_AFTER_S para que el chat nunca se sienta
+# muerto más de ese tiempo, tenga o no el grafo algo específico que contar.
+_HEARTBEAT_MESSAGES = [
+    "⏳ Sigo trabajando en tu respuesta…",
+    "🔍 Revisando los detalles normativos…",
+    "🧩 Cruzando la información recopilada…",
+    "⌛ Ya casi está…",
+]
+_PROGRESS_AFTER_S = 2.0
+_TYPING_REFRESH_S = 1.0
 
 
 async def _run_graph_with_feedback(message: Message, *args, **kwargs):
-    task = asyncio.create_task(_to_thread_ctx(run_graph, *args, **kwargs))
-    elapsed = 0.0
-    notified = False
-    while True:
-        done, _ = await asyncio.wait({task}, timeout=_TYPING_REFRESH_S)
-        if done:
-            return task.result()
-        elapsed += _TYPING_REFRESH_S
-        try:
-            await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
-        except Exception:
-            pass
-        if not notified and elapsed >= _PROGRESS_AFTER_S:
-            notified = True
+    """Corre el grafo en un hilo aparte editando UN mensaje de estado en vivo
+    ("📩 Analizando…" → "📚 Buscando en la base…" → "🧠 Pensando…" →
+    "✍️ Redactando…" → "🪶 Puliendo la redacción…") en vez de dejar el chat
+    sin señales mientras el deep agent trabaja.
+
+    El progreso lo emite el grafo (graph.py:_emit_progress, deep_answer.py)
+    desde el hilo worker donde corre app.invoke — nunca desde este loop de
+    asyncio — así que el callback thread-safe usa run_coroutine_threadsafe
+    para reenviar la edición al loop en vez de tocar la API de Telegram
+    directamente desde otro hilo. Si el grafo se queda callado más de
+    _PROGRESS_AFTER_S (una llamada de red sin sub-etapas propias), el propio
+    loop de abajo rellena el silencio con _HEARTBEAT_MESSAGES.
+    """
+    loop = asyncio.get_running_loop()
+    status_msg: Optional[Message] = None
+    last_text: Optional[str] = None
+    last_update = time.monotonic()
+    heartbeat_idx = 0
+    lock = asyncio.Lock()
+
+    async def _show_status(text: str) -> None:
+        nonlocal status_msg, last_text, last_update
+        async with lock:
+            last_update = time.monotonic()
+            if text == last_text:
+                return
+            last_text = text
             try:
-                await message.answer(_progress_notice())
+                if status_msg is None:
+                    status_msg = await message.answer(text)
+                else:
+                    await status_msg.edit_text(text)
+            except TelegramBadRequest:
+                pass  # mensaje ya no editable (borrado, "not modified", etc.)
+            except Exception:
+                pass
+
+    def _on_progress(event: Dict[str, Any]) -> None:
+        text = event.get("message")
+        if not text:
+            return
+        asyncio.run_coroutine_threadsafe(_show_status(text), loop)
+
+    kwargs = dict(kwargs)
+    kwargs["progress_callback"] = _on_progress
+
+    task = asyncio.create_task(_to_thread_ctx(run_graph, *args, **kwargs))
+    try:
+        while True:
+            done, _ = await asyncio.wait({task}, timeout=_TYPING_REFRESH_S)
+            if done:
+                return task.result()
+            try:
+                await message.bot.send_chat_action(message.chat.id, ChatAction.TYPING)
+            except Exception:
+                pass
+            if time.monotonic() - last_update >= _PROGRESS_AFTER_S:
+                await _show_status(_HEARTBEAT_MESSAGES[heartbeat_idx % len(_HEARTBEAT_MESSAGES)])
+                heartbeat_idx += 1
+    finally:
+        if status_msg is not None:
+            try:
+                await status_msg.delete()
             except Exception:
                 pass
 
