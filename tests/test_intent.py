@@ -1,18 +1,19 @@
-"""Pruebas del clasificador de intención (TICKET-001 / H-901).
+"""Pruebas del léxico regex del clasificador (TICKET-001 / H-901).
 
-El set parametrizado (≥30 formulaciones reales) corre SIN red: un fixture autouse
-fuerza `_llm_classify -> None`, de modo que se ejerce el fallback regex ampliado,
-que por sí solo debe clasificar correctamente el léxico normativo del negocio
-(incluida la consulta canónica "dame los requerimientos para X").
+El set parametrizado (≥30 formulaciones reales) corre SIN red: un fixture
+autouse fuerza `_llm_classify_v3 -> None`, de modo que se ejerce el FALLBACK
+regex ampliado del classifier v3 — que por sí solo debe clasificar
+correctamente el léxico normativo del negocio (incluida la consulta canónica
+"dame los requerimientos para X", el caso que H-901 fallaba).
 
-Pruebas adicionales cubren el camino LLM (preferido cuando está disponible), el
-fallback, el fast-path de smalltalk y la compatibilidad de los helpers.
+El camino LLM, la cascada y los guardarraíles del v3 se prueban en
+tests/test_intent_v3.py.
 """
 import pytest
 
 from retie_agent.agent import intent as intent_mod
 from retie_agent.agent.intent import (
-    classify_intent,
+    classify_intent_v3,
     _wants_full,
     _wants_table,
 )
@@ -21,11 +22,11 @@ from retie_agent.agent.intent import (
 @pytest.fixture(autouse=True)
 def _no_llm(monkeypatch):
     """Desactiva el clasificador LLM → todas las pruebas del set usan el regex."""
-    monkeypatch.setattr(intent_mod, "_llm_classify", lambda *a, **k: None)
+    monkeypatch.setattr(intent_mod, "_llm_classify_v3", lambda *a, **k: None)
 
 
 # ── Set de formulaciones reales (≥30) ────────────────────────────────────────
-# (consulta, intención esperada). Cubre las 4 categorías.
+# (consulta, intención esperada). Cubre las 4 categorías del léxico base.
 CASES = [
     # — exhaustiva: léxico normativo del negocio (el caso que H-901 fallaba) —
     ("dame los requerimientos para puesta a tierra en zonas húmedas", "exhaustiva"),
@@ -50,6 +51,9 @@ CASES = [
     ("necesito la tabla de factores de corrección por temperatura", "tabla"),
     ("tablas de capacidad de corriente", "tabla"),
     ("la tabla completa 250.122 de conductores de puesta a tierra", "tabla"),
+    # — comparativa (léxico nuevo del fallback v3) —
+    ("diferencias entre RETIE y NTC 2050 en puesta a tierra", "comparativa"),
+    ("cobre versus aluminio para acometidas", "comparativa"),
     # — puntual —
     ("¿cuál es la tensión nominal en Colombia?", "puntual"),
     ("¿qué significa GFCI?", "puntual"),
@@ -74,7 +78,7 @@ def test_case_set_has_at_least_30_formulations():
 
 @pytest.mark.parametrize("question,expected", CASES)
 def test_regex_intent_classification(question, expected):
-    result = classify_intent(question)
+    result = classify_intent_v3(question)
     assert result.intent == expected, (
         f"{question!r} → {result.intent!r} (esperado {expected!r})"
     )
@@ -82,7 +86,7 @@ def test_regex_intent_classification(question, expected):
 
 def test_h901_canonical_business_query_is_exhaustive():
     """La consulta canónica del negocio debe activar el camino completo."""
-    result = classify_intent("dame los requerimientos para X")
+    result = classify_intent_v3("dame los requerimientos para X")
     assert result.intent == "exhaustiva"
     assert result.wants_full is True
     assert result.wants_table is False
@@ -91,57 +95,18 @@ def test_h901_canonical_business_query_is_exhaustive():
 # ── Mapeo de intención a flags / ruta ─────────────────────────────────────────
 
 def test_flags_mapping():
-    tabla = classify_intent("dame la tabla 220.55")
-    assert (tabla.wants_table, tabla.wants_full, tabla.route) == (True, False, "retrieve")
+    tabla = classify_intent_v3("dame la tabla 220.55")
+    assert (tabla.wants_table, tabla.route) == (True, "retrieve")
 
-    full = classify_intent("dame todos los requisitos de puesta a tierra")
+    full = classify_intent_v3("dame todos los requisitos de puesta a tierra")
     assert (full.wants_table, full.wants_full, full.route) == (False, True, "retrieve")
 
-    puntual = classify_intent("¿cuál es la tensión nominal?")
+    puntual = classify_intent_v3("¿cuál es la tensión nominal?")
     assert (puntual.wants_table, puntual.wants_full, puntual.route) == (False, False, "retrieve")
 
-    chat = classify_intent("hola")
+    chat = classify_intent_v3("hola")
     assert chat.route == "smalltalk"
-
-
-# ── Camino LLM (fuente primaria) vs fallback regex ────────────────────────────
-
-def test_llm_label_is_preferred_over_regex(monkeypatch):
-    # El regex clasificaría esto como "puntual"; el LLM dice "exhaustiva".
-    monkeypatch.setattr(intent_mod, "_llm_classify", lambda *a, **k: "exhaustiva")
-    result = classify_intent("¿cuál es la tensión nominal en Colombia?")
-    assert result.intent == "exhaustiva"
-    assert result.source == "llm"
-
-
-def test_regex_fallback_when_llm_returns_none(monkeypatch):
-    monkeypatch.setattr(intent_mod, "_llm_classify", lambda *a, **k: None)
-    result = classify_intent("dame los requisitos de puesta a tierra")
-    assert result.intent == "exhaustiva"
-    assert result.source == "regex"
-
-
-def test_smalltalk_fastpath_skips_llm(monkeypatch):
-    # Aunque el LLM esté disponible, smalltalk evidente no debe consultarlo.
-    called = {"n": 0}
-
-    def _spy(*a, **k):
-        called["n"] += 1
-        return "puntual"
-
-    monkeypatch.setattr(intent_mod, "_llm_classify", _spy)
-    result = classify_intent("hola")
-    assert result.intent == "smalltalk"
-    assert result.source == "regex"
-    assert called["n"] == 0
-
-
-def test_invalid_llm_label_falls_back_to_puntual(monkeypatch):
-    monkeypatch.setattr(intent_mod, "_llm_classify", lambda *a, **k: "basura")
-    # _llm_classify ya devuelve None ante etiqueta inválida en la práctica;
-    # aquí simulamos una etiqueta fuera de dominio que _build_result normaliza.
-    result = classify_intent("una consulta cualquiera sin léxico especial")
-    assert result.intent == "puntual"
+    assert chat.requires_rag is False
 
 
 # ── Compatibilidad de helpers ─────────────────────────────────────────────────
@@ -151,9 +116,3 @@ def test_backward_compat_helpers():
     assert _wants_full("¿cuál es la tensión nominal?") is False
     assert _wants_table("muéstrame la tabla 5") is True
     assert _wants_table("dame el requisito 250.122") is False
-
-
-def test_parse_label_tolerates_noise():
-    assert intent_mod._parse_label("Intención: exhaustiva") == "exhaustiva"
-    assert intent_mod._parse_label('"tabla"') == "tabla"
-    assert intent_mod._parse_label("no-se-sabe") is None

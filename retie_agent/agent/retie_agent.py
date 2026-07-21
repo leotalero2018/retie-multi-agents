@@ -24,6 +24,18 @@ _client = OpenAI(api_key=getattr(settings, "OPENAI_API_KEY", None))
 
 
 # --------------------------- internals --------------------------- #
+def _hit_score(h: Dict) -> float:
+    """Score numérico comparable. Los hits de expansión de página
+    (retrieval_method="page_expand") traen score=None — se tratan como el peor
+    score posible para que nunca desplacen a un hit con distancia real y para
+    que None < None no reviente el dedupe (bug destapado por el deep agent al
+    unir hits iniciales + acumulados por tools)."""
+    s = h.get("score")
+    if isinstance(s, (int, float)) and not isinstance(s, bool):
+        return float(s)
+    return float("inf")
+
+
 def _dedupe_hits(hits: List[Dict]) -> List[Dict]:
     """
     Deduplicate by (source, page), keep best score.
@@ -33,7 +45,7 @@ def _dedupe_hits(hits: List[Dict]) -> List[Dict]:
     for h in hits:
         meta = h.get("meta", {})
         key = (meta.get("source", "?"), meta.get("page", None))
-        if key not in best or h.get("score", 1e9) < best[key].get("score", 1e9):
+        if key not in best or _hit_score(h) < _hit_score(best[key]):
             best[key] = h
 
     ordered = OrderedDict()

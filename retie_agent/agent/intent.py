@@ -1,33 +1,36 @@
 # app/agent/intent.py
-"""Clasificación de intención de la consulta (TICKET-001 / H-901).
+"""Clasificación de intención de la consulta — Intent v3 (classifier_node).
 
-El camino de "respuesta exhaustiva" (más chunks recuperados, expansión por página,
-4000 tokens de salida, salto del enriquecedor) antes se activaba SOLO con un regex
-frágil (`todos`, `completa`, `sin omitir`…). La consulta canónica del negocio
-—"dame los requerimientos para X"— no contiene ninguna de esas palabras y se
-respondía con `TOP_K=4` / `MAX_TOKENS=600`, produciendo respuestas parciales sin
-aviso.
+Clasificador ÚNICO del grafo (el v1 de una palabra fue retirado; v3 es el
+definitivo). Produce un `IntentResultV3` estructurado que gobierna al deep agent:
+taxonomía `{puntual, exhaustiva, tabla, comparativa, procedimiento, verificacion,
+fuera_de_dominio, smalltalk}` (+ `ambiguous` vía regex), formato y longitud de
+entrega, entidades normativas y confianza.
 
-Este módulo sustituye esa decisión por un clasificador de intención con salida
-`{exhaustiva, tabla, puntual, smalltalk}`:
-
+Orden de decisión:
   1. Fast-path determinístico: smalltalk puro (saludos/cortesías) se resuelve por
-     regex anclado — no se paga un LLM por "hola".
-  2. Clasificador LLM barato (gpt-4o-mini) como FUENTE PRIMARIA del resto.
-  3. Regex ampliado como FALLBACK robusto y siempre disponible (sin red, sin coste):
-     cubre por sí solo el léxico normativo del negocio, de modo que el sistema sigue
-     clasificando bien aunque el LLM esté desactivado o falle.
+     regex anclado — no se paga un LLM por "hola". Única puerta al saludo.
+  2. Fragmento vago sin historial → ambiguous (se pide aclaración).
+  3. Clasificador LLM con salida JSON (structured output) como fuente primaria,
+     con CASCADA: los casos dudosos re-clasifican con el modelo potente
+     (INTENT_V3_ESCALATION_MODEL).
+  4. Regex ampliado como FALLBACK robusto y siempre disponible (sin red, sin
+     coste): cubre por sí solo el léxico normativo del negocio (H-901), de modo
+     que el sistema sigue clasificando bien aunque el LLM esté caído.
+  5. Guardarraíles: smalltalk del LLM sin confirmación del regex → falso
+     positivo; fuera_de_dominio solo corta el pipeline con confianza alta.
 
-El resultado (`IntentResult`) trae además los flags `wants_table` / `wants_full` que
-consume el grafo, y `route` (smalltalk | retrieve). La intención y su origen
-(`regex` | `llm`) quedan registrados en la traza de Langfuse desde `route_entry`.
+Los flags calientes `wants_table` / `wants_full` se derivan por REGLA DURA para
+los nodos existentes; el resto viaja en `GraphState['intent_meta']` y queda
+registrado en la traza de Langfuse desde `classifier_node`.
 """
 from __future__ import annotations
 
+import json
 import logging
 import re
-from dataclasses import dataclass
-from typing import List, Dict, Optional
+from dataclasses import dataclass, field
+from typing import Any, List, Dict, Optional, Tuple
 
 from openai import OpenAI
 
@@ -35,11 +38,6 @@ from retie_agent.config import settings, as_bool
 from retie_agent.llm.provider import create_chat_completion
 
 logger = logging.getLogger(__name__)
-
-# Categorías válidas de intención.
-#   ambiguous = fragmento vago/incompleto ("que", "que es") → se pide aclaración.
-_LABELS = ("exhaustiva", "tabla", "puntual", "smalltalk", "ambiguous")
-
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Léxico determinístico (fallback robusto, sin red)
@@ -92,6 +90,20 @@ _SMALLTALK_RE = re.compile(
 )
 
 
+# Alargamientos expresivos ("graciaaas", "holaaaa", "heyyy"): el regex anclado
+# solo tolera repetir la ÚLTIMA letra de cada saludo ("gracias+"), así que un
+# alargamiento interno lo sacaba del fast-path y el guardarraíl 5a terminaba
+# mandando un "gracias" al RAG completo. Colapsar rachas de 3+ letras iguales a
+# una sola es seguro en español (no hay palabras legítimas con triples letras);
+# 2 repeticiones se respetan ("ll", "rr", "cc").
+_ELONGATION_RE = re.compile(r"(\w)\1{2,}", re.UNICODE)
+
+
+def _collapse_elongations(text: str) -> str:
+    """Normaliza alargamientos expresivos SOLO para los regex de smalltalk."""
+    return _ELONGATION_RE.sub(r"\1", text or "")
+
+
 # Palabras funcionales/interrogativas que no aportan tema. Un mensaje compuesto
 # SOLO por ellas es demasiado vago para recuperar algo útil ("que", "que es").
 _STOPWORDS = {
@@ -127,55 +139,6 @@ def _wants_full(text: str) -> bool:
     return bool(_FULL_RE.search(text or ""))
 
 
-def _regex_intent(q: str) -> str:
-    """Clasificación determinística por léxico. Prioridad:
-    smalltalk → tabla → exhaustiva → puntual.
-
-    `tabla` precede a `exhaustiva` porque una petición tabular ("la tabla completa
-    220.55") debe enrutarse por table_node aunque contenga "completa".
-    """
-    if _SMALLTALK_RE.match(q):
-        return "smalltalk"
-    if _TABLE_RE.search(q):
-        return "tabla"
-    if _FULL_RE.search(q):
-        return "exhaustiva"
-    return "puntual"
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Clasificador LLM barato (fuente primaria)
-# ──────────────────────────────────────────────────────────────────────────────
-
-_SYSTEM_PROMPT = (
-    "Eres un clasificador de intención para un asistente de normativa eléctrica "
-    "colombiana (RETIE y NTC 2050). Clasifica la consulta del usuario en EXACTAMENTE "
-    "una de estas cuatro categorías y responde SOLO con esa palabra, sin explicar:\n\n"
-    "- exhaustiva: pide el contenido normativo COMPLETO de un tema o artículo "
-    "(requisitos, requerimientos, exigencias, condiciones, obligaciones; "
-    "\"qué exige/requiere/establece/dice el artículo\"; \"todos los numerales\"; "
-    "\"lista completa\"; \"sin omitir\").\n"
-    "- tabla: pide una tabla concreta o datos tabulares "
-    "(\"la tabla 220.55\", \"tabla de calibres\", \"ampacidades en tabla\").\n"
-    "- puntual: pregunta por un dato único y acotado "
-    "(\"¿cuál es la tensión nominal?\", \"¿qué significa GFCI?\", \"define acometida\").\n"
-    "- smalltalk: SOLO saludo, agradecimiento o despedida a secas, o una pregunta "
-    "sobre el propio bot (\"¿quién eres?\", \"¿qué puedes hacer?\").\n\n"
-    "REGLA CLAVE: si el mensaje MEZCLA un saludo o cortesía CON una pregunta o "
-    "petición de información (p. ej. \"hola, ¿qué es el RETIE?\"), clasifícalo por la "
-    "PREGUNTA y NUNCA como smalltalk. Solo es smalltalk cuando NO hay ninguna "
-    "pregunta ni petición sobre normativa eléctrica.\n\n"
-    "Ejemplos:\n"
-    "- \"hola\" → smalltalk\n"
-    "- \"gracias, muy amable\" → smalltalk\n"
-    "- \"buenas, ¿quién eres?\" → smalltalk\n"
-    "- \"hola, ¿qué es el RETIE?\" → puntual\n"
-    "- \"buenas tardes, dame los requisitos de puesta a tierra\" → exhaustiva\n"
-    "- \"hey, pásame la tabla 220.55\" → tabla\n"
-    "- \"¿cuál es la tensión nominal de servicio?\" → puntual\n\n"
-    "Responde con una sola palabra: exhaustiva, tabla, puntual o smalltalk."
-)
-
 # Cliente OpenAI perezoso y compartido para el clasificador.
 _client: Optional[OpenAI] = None
 
@@ -190,19 +153,266 @@ def _get_client() -> Optional[OpenAI]:
     return _client
 
 
-def _parse_label(raw: str) -> Optional[str]:
-    """Extrae una de las 4 etiquetas de la respuesta cruda del LLM (tolerante a
-    comillas, mayúsculas o texto extra del tipo "Intención: exhaustiva")."""
-    low = (raw or "").strip().lower()
-    for label in _LABELS:
-        if label in low:
-            return label
-    return None
+# ══════════════════════════════════════════════════════════════════════════════
+# Intent v3 (classifier_node — FINAL_IMPLEMENTATION_NODES §4)
+#
+# Salida estructurada que gobierna al deep agent: taxonomía ampliada
+# (comparativa/procedimiento/verificacion/fuera_de_dominio), formato y longitud
+# de entrega, entidades normativas extraídas por regex y cascada de modelos
+# (nano primero; los casos dudosos escalan al modelo potente). Conserva TODOS
+# los guardarraíles de v1: el saludo solo lo emite el regex anclado, la vaguedad
+# se corta antes del LLM, y fuera_de_dominio jamás corta el pipeline sin
+# confianza alta del LLM.
+# ══════════════════════════════════════════════════════════════════════════════
+
+_V3_INTENTS = (
+    "smalltalk", "puntual", "exhaustiva", "tabla", "comparativa",
+    "procedimiento", "verificacion", "fuera_de_dominio",
+)
+_V3_FORMATS = ("markdown", "markdown_table", "bullet_list", "comparison", "steps")
+_V3_LENGTHS = ("short", "medium", "detailed")
+_V3_COMPLEXITY = ("low", "medium", "high")
+
+# Intents donde equivocarse es más caro (cortan el RAG o cambian el procedimiento
+# del deep agent): escalan al modelo potente con un umbral más exigente.
+_V3_SENSITIVE_INTENTS = ("fuera_de_dominio", "comparativa", "verificacion")
+
+# Comparativa por léxico (fallback determinístico, sin red).
+_COMPARE_RE = re.compile(
+    r"\b(diferencias?|comparar?|comparaci[oó]n|versus|vs\.?|frente\s+a|"
+    r"cu[aá]l\s+es\s+mejor|en\s+qu[eé]\s+se\s+diferencian?)\b",
+    re.IGNORECASE,
+)
 
 
-def _llm_classify(question: str, history: Optional[List[Dict[str, str]]] = None) -> Optional[str]:
-    """Clasifica con el LLM barato. Devuelve una etiqueta válida o None (para que
-    el llamador caiga al regex). Nunca lanza: cualquier fallo → None."""
+# ──────────────────────────────────────────────────────────────────────────────
+# Extracción de entidades normativas (determinística, corre SIEMPRE)
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Los IDs de tabla llevan sufijo de letra en RETIE ("2.3.26.2.2.1.a") y NTC
+# ("392.10(A)" / "392.10 (A)"): capturarlo completo es requisito del lookup
+# canónico por identificador. El sufijo ".a" se exige en minúscula ((?-i:...))
+# para no absorber la inicial de un título ("tabla 220.55. Factores").
+_TABLE_ID_RE = r"(\d+(?:[.\-]\d+)*(?:\.(?-i:[a-zñ])\b|\s*\((?-i:[A-Za-zñ])\))?)"
+
+_ENTITY_PATTERNS: List[Tuple[str, "re.Pattern[str]"]] = [
+    ("tabla",    re.compile(r"\btablas?\s+" + _TABLE_ID_RE, re.IGNORECASE)),
+    ("articulo", re.compile(r"\bart[ií]culos?\s+" + _TABLE_ID_RE + r"[°ºo]?", re.IGNORECASE)),
+    ("seccion",  re.compile(r"\bsecci[oó]n(?:es)?\s+(\d+(?:\.\d+)*)\b", re.IGNORECASE)),
+    ("capitulo", re.compile(r"\bcap[ií]tulos?\s+([ivxlcdm]+|\d+)\b", re.IGNORECASE)),
+    ("anexo",    re.compile(r"\banexos?\s+([a-z0-9]+)\b", re.IGNORECASE)),
+    ("norma",    re.compile(r"\b(ntc\s*\d+(?:-\d+)?|retie|retilap)\b", re.IGNORECASE)),
+    # Referencias numéricas sueltas tipo NEC/NTC: "la 220.55", "el 110-14".
+    # DEBE ir de última: solo se emite si tabla/articulo/seccion no la capturaron ya.
+    ("ref",      re.compile(r"\b(\d{2,3}[.\-]\d{1,3}(?:[.\-]\d{1,3})?)\b")),
+]
+
+
+def extract_entities(text: str) -> List[Dict[str, str]]:
+    """Extrae referencias normativas de la pregunta (sin LLM, sin costo).
+
+    Devuelve [{"type", "value", "raw"}] deduplicado por (type, value). El tipo
+    "ref" (número suelto "220.55") solo se emite si el valor no fue capturado ya
+    por tabla/articulo/seccion — evita duplicar "tabla 220.55" + ref "220.55".
+    El deep agent las usa como queries dirigidas (buscar la referencia literal
+    rinde más que la pregunta completa) y quedan en la traza de Langfuse.
+    """
+    out: List[Dict[str, str]] = []
+    seen: set = set()
+    captured_values: set = set()
+    for etype, rx in _ENTITY_PATTERNS:
+        for m in rx.finditer(text or ""):
+            value = m.group(1).strip()
+            if etype == "norma":
+                value = re.sub(r"\s+", " ", value.upper())
+            elif etype in ("tabla", "articulo"):
+                # "392.10 (A)" → "392.10(A)": misma normalización que el pipeline.
+                value = re.sub(r"\s+", "", value)
+            if etype == "ref" and value in captured_values:
+                continue
+            key = (etype, value.lower())
+            if key in seen:
+                continue
+            seen.add(key)
+            if etype in ("tabla", "articulo", "seccion"):
+                captured_values.add(value)
+            out.append({"type": etype, "value": value, "raw": m.group(0).strip()})
+    return out
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Resultado v3
+# ──────────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class IntentResultV3:
+    """Contrato de salida del classifier_node (consumido por el deep agent)."""
+    intent: str                # taxonomía _V3_INTENTS (+ "ambiguous" vía regex)
+    source: str                # regex | llm | llm+escalated | *+guard
+    route: str                 # smalltalk | ambiguous | out_of_domain | image_direct | retrieve
+    wants_table: bool          # compat v1: rutea table_node / top_k tablas
+    wants_full: bool           # compat v1: presupuesto amplio + salta enrich
+    requires_rag: bool         # derivado por regla dura (route == "retrieve")
+    response_format: str       # _V3_FORMATS
+    output_length: str         # _V3_LENGTHS
+    complexity: str            # _V3_COMPLEXITY ("high" = mensaje compuesto)
+    needs_calculation: bool
+    confidence: float          # 0.0–1.0 (regex determinístico → 1.0; fallback → 0.6)
+    entities: List[Dict[str, str]] = field(default_factory=list)
+
+    def to_state_meta(self) -> Dict[str, Any]:
+        """Serializa los campos v3 para GraphState['intent_meta'] (JSON-safe)."""
+        return {
+            "requires_rag": self.requires_rag,
+            "response_format": self.response_format,
+            "output_length": self.output_length,
+            "complexity": self.complexity,
+            "needs_calculation": self.needs_calculation,
+            "confidence": self.confidence,
+            "entities": self.entities,
+        }
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Clasificador LLM v3 (structured output + parser tolerante)
+# ──────────────────────────────────────────────────────────────────────────────
+
+_V3_JSON_SCHEMA = {
+    "name": "intent_v3",
+    "strict": True,
+    "schema": {
+        "type": "object",
+        "additionalProperties": False,
+        "required": [
+            "intent", "response_format", "output_length",
+            "complexity", "needs_calculation", "confidence",
+        ],
+        "properties": {
+            "intent": {"type": "string", "enum": list(_V3_INTENTS)},
+            "response_format": {"type": "string", "enum": list(_V3_FORMATS)},
+            "output_length": {"type": "string", "enum": list(_V3_LENGTHS)},
+            "complexity": {"type": "string", "enum": list(_V3_COMPLEXITY)},
+            "needs_calculation": {"type": "boolean"},
+            "confidence": {"type": "number"},
+        },
+    },
+}
+
+_SYSTEM_PROMPT_V3 = (
+    "Eres un clasificador de intención para un asistente de normativa eléctrica "
+    "colombiana (RETIE y NTC 2050). Analiza la consulta y responde ÚNICAMENTE con un "
+    "objeto JSON válido, sin markdown ni texto adicional, con esta forma exacta:\n"
+    '{"intent": "...", "response_format": "...", "output_length": "...", '
+    '"complexity": "...", "needs_calculation": false, "confidence": 0.0}\n\n'
+    "intent — exactamente una de:\n"
+    "- puntual: dato único y acotado (\"¿qué significa GFCI?\", \"define acometida\").\n"
+    "- exhaustiva: contenido normativo COMPLETO de un tema o artículo (requisitos, "
+    "exigencias, condiciones; \"qué exige/establece el artículo\"; \"todos los numerales\").\n"
+    "- tabla: pide una tabla concreta o datos tabulares (\"la tabla 220.55\", "
+    "\"tabla de calibres\", \"ampacidades en tabla\").\n"
+    "- comparativa: contrastar dos o más normas, artículos, materiales o casos "
+    "(\"diferencias entre RETIE y NTC 2050 en X\", \"cobre vs aluminio\").\n"
+    "- procedimiento: pide pasos o trámite (\"¿cómo certifico una instalación?\", "
+    "\"pasos para legalizar\").\n"
+    "- verificacion: pregunta si algo cumple o es válido (\"¿puedo usar calibre 14 "
+    "para tomas de 20 A?\", \"¿es obligatorio el GFCI en baños?\").\n"
+    "- smalltalk: SOLO saludo/agradecimiento/despedida a secas, o pregunta sobre el "
+    "propio bot (\"¿quién eres?\").\n"
+    "- fuera_de_dominio: NO trata de normativa eléctrica, instalaciones eléctricas ni "
+    "del RETIE/NTC 2050 (películas, deportes, matemática general, otra disciplina).\n\n"
+    "response_format — markdown | markdown_table | bullet_list | comparison | steps: "
+    "cómo conviene presentar la respuesta (una pregunta puntual sobre datos tabulares "
+    "puede llevar markdown_table).\n"
+    "output_length — short | medium | detailed. 'detailed' si el usuario espera TODO "
+    "el contenido de un tema sin omisiones.\n"
+    "complexity — low | medium | high. 'high' si el mensaje contiene DOS O MÁS "
+    "preguntas o peticiones distintas, o exige combinar varios artículos/normas.\n"
+    "needs_calculation — true si la respuesta exige calcular con números del usuario "
+    "(cargas, calibres por amperaje, distancias, factores de demanda aplicados).\n"
+    "confidence — tu certeza en 'intent', de 0.0 a 1.0.\n\n"
+    "REGLA CLAVE: si el mensaje MEZCLA un saludo o cortesía CON una pregunta o "
+    "petición de información, clasifica por la PREGUNTA y NUNCA como smalltalk. "
+    "En caso de duda entre fuera_de_dominio y otra categoría, elige la otra "
+    "categoría y baja confidence.\n\n"
+    "IMAGEN: si el mensaje contiene secciones como 'Usuario dijo sobre la imagen:', "
+    "'Contenido interpretado de la imagen:' o 'Texto detectado en la imagen:', la "
+    "consulta proviene de una imagen que envió el usuario: clasifica según la "
+    "PREGUNTA del usuario sobre ese contenido (no según el tipo de objeto "
+    "fotografiado). Una foto de un tablero, un conductor o un artículo normativo "
+    "con una pregunta eléctrica NO es fuera_de_dominio.\n\n"
+    "Ejemplos:\n"
+    '- "hola" → {"intent":"smalltalk","response_format":"markdown","output_length":"short",'
+    '"complexity":"low","needs_calculation":false,"confidence":0.99}\n'
+    '- "hola, ¿qué es el RETIE?" → {"intent":"puntual","response_format":"markdown",'
+    '"output_length":"short","complexity":"low","needs_calculation":false,"confidence":0.95}\n'
+    '- "dame los requisitos de puesta a tierra" → {"intent":"exhaustiva",'
+    '"response_format":"bullet_list","output_length":"detailed","complexity":"low",'
+    '"needs_calculation":false,"confidence":0.9}\n'
+    '- "pásame la tabla 220.55" → {"intent":"tabla","response_format":"markdown_table",'
+    '"output_length":"detailed","complexity":"low","needs_calculation":false,"confidence":0.97}\n'
+    '- "diferencias entre RETIE y NTC 2050 sobre GFCI" → {"intent":"comparativa",'
+    '"response_format":"comparison","output_length":"detailed","complexity":"medium",'
+    '"needs_calculation":false,"confidence":0.9}\n'
+    '- "¿qué calibre necesito para una estufa de 12 kW a 240 V?" → {"intent":"verificacion",'
+    '"response_format":"markdown","output_length":"medium","complexity":"medium",'
+    '"needs_calculation":true,"confidence":0.85}\n'
+    '- "recomiéndame una serie" → {"intent":"fuera_de_dominio","response_format":"markdown",'
+    '"output_length":"short","complexity":"low","needs_calculation":false,"confidence":0.97}'
+)
+
+
+def _parse_intent_json(raw: str) -> Optional[Dict[str, Any]]:
+    """Valida la salida del classifier v3. Tolerante a fences/texto alrededor.
+
+    Devuelve el dict normalizado o None (→ el llamador cae al regex). `intent`
+    inválido invalida todo; el resto de campos degrada a defaults seguros.
+    Nunca lanza.
+    """
+    if not raw:
+        return None
+    text = raw.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.IGNORECASE).strip()
+    start, end = text.find("{"), text.rfind("}")
+    if start == -1 or end <= start:
+        return None
+    try:
+        data = json.loads(text[start:end + 1])
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, dict):
+        return None
+
+    intent = data.get("intent")
+    if not isinstance(intent, str) or intent.strip().lower() not in _V3_INTENTS:
+        return None
+
+    def _pick(key: str, valid: tuple, default: str) -> str:
+        v = data.get(key)
+        return v if isinstance(v, str) and v in valid else default
+
+    conf = data.get("confidence")
+    conf = float(conf) if isinstance(conf, (int, float)) and not isinstance(conf, bool) else 0.5
+    conf = min(max(conf, 0.0), 1.0)
+
+    return {
+        "intent": intent.strip().lower(),
+        "response_format": _pick("response_format", _V3_FORMATS, "markdown"),
+        "output_length": _pick("output_length", _V3_LENGTHS, "medium"),
+        "complexity": _pick("complexity", _V3_COMPLEXITY, "low"),
+        "needs_calculation": data.get("needs_calculation") is True,
+        "confidence": conf,
+    }
+
+
+def _llm_classify_v3(question: str, model: str) -> Optional[Dict[str, Any]]:
+    """Una llamada del classifier v3. Devuelve el dict validado o None. Nunca lanza.
+
+    Usa structured output nativo (json_schema estricto); si el modelo no lo
+    soporta, create_chat_completion omite el parámetro y reintenta, y el parser
+    tolerante cubre la salida sin esquema. La llamada queda registrada en
+    Langfuse (modelo, usage) — v1 no la registraba y su costo real era invisible.
+    """
     if not as_bool(getattr(settings, "INTENT_LLM_ENABLED", "true")):
         return None
     if not getattr(settings, "OPENAI_API_KEY", None):
@@ -210,101 +420,210 @@ def _llm_classify(question: str, history: Optional[List[Dict[str, str]]] = None)
     client = _get_client()
     if client is None:
         return None
-
-    model = getattr(settings, "INTENT_MODEL", None) or getattr(settings, "CHAT_MODEL", "gpt-4o-mini")
     try:
         resp = create_chat_completion(
             client,
             model=model,
             temperature=0.0,
-            max_tokens=8,
+            max_tokens=int(getattr(settings, "INTENT_V3_MAX_TOKENS", 200)),
+            response_format={"type": "json_schema", "json_schema": _V3_JSON_SCHEMA},
             messages=[
-                {"role": "system", "content": _SYSTEM_PROMPT},
+                {"role": "system", "content": _SYSTEM_PROMPT_V3},
                 {"role": "user", "content": (question or "").strip()[:500]},
             ],
         )
-        return _parse_label(resp.choices[0].message.content or "")
+        raw = resp.choices[0].message.content or ""
+        data = _parse_intent_json(raw)
+        try:
+            from retie_agent.observability.obs import log_generation
+            usage = getattr(resp, "usage", None)
+            log_generation(
+                None,
+                name="intent.classify_v3",
+                input_text=(question or "")[:500],
+                output_text=raw,
+                model=model,
+                usage={
+                    "input": getattr(usage, "prompt_tokens", None),
+                    "output": getattr(usage, "completion_tokens", None),
+                    "total": getattr(usage, "total_tokens", None),
+                },
+                metadata={"parsed": data is not None},
+            )
+        except Exception:
+            pass
+        return data
     except Exception as exc:
-        logger.warning("intent LLM classifier failed, using regex fallback: %s", exc)
+        logger.warning("intent v3 LLM classifier failed (%s): %s", model, exc)
         return None
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# API pública
-# ──────────────────────────────────────────────────────────────────────────────
+def _regex_intent_v3(q: str) -> str:
+    """Fallback determinístico v3. Prioridad:
+    smalltalk → tabla → comparativa → exhaustiva → puntual.
 
-@dataclass
-class IntentResult:
-    intent: str          # exhaustiva | tabla | puntual | smalltalk | ambiguous
-    source: str          # "regex" | "llm"
-    route: str           # "smalltalk" | "ambiguous" | "retrieve"
-    wants_table: bool
-    wants_full: bool
+    procedimiento/verificacion/fuera_de_dominio NO tienen vía regex: solo el LLM
+    puede emitirlas (fallback conservador — degradan al léxico de negocio v1).
+    """
+    if _SMALLTALK_RE.match(_collapse_elongations(q)):
+        return "smalltalk"
+    if _TABLE_RE.search(q):
+        return "tabla"
+    if _COMPARE_RE.search(q):
+        return "comparativa"
+    if _FULL_RE.search(q):
+        return "exhaustiva"
+    return "puntual"
 
 
-def _build_result(intent: str, source: str) -> IntentResult:
-    intent = intent if intent in _LABELS else "puntual"
-    if intent == "smalltalk":
-        route = "smalltalk"
-    elif intent == "ambiguous":
-        route = "ambiguous"
-    else:
-        route = "retrieve"
-    return IntentResult(
+def _v3_defaults(intent: str, confidence: float) -> Dict[str, Any]:
+    """Campos v3 por defecto cuando clasificó el regex (sin LLM)."""
+    fmt = {
+        "tabla": "markdown_table",
+        "comparativa": "comparison",
+        "exhaustiva": "bullet_list",
+        "procedimiento": "steps",
+    }.get(intent, "markdown")
+    length = "detailed" if intent in ("tabla", "comparativa", "exhaustiva") else "medium"
+    return {
+        "intent": intent,
+        "response_format": fmt,
+        "output_length": length,
+        "complexity": "low",
+        "needs_calculation": False,
+        "confidence": confidence,
+    }
+
+
+def _fixed_v3(intent: str, *, route: str, question: str) -> IntentResultV3:
+    """Resultado determinístico de los fast-path regex (smalltalk/ambiguous)."""
+    return IntentResultV3(
         intent=intent,
-        source=source,
+        source="regex",
         route=route,
-        wants_table=(intent == "tabla"),
-        wants_full=(intent == "exhaustiva"),
+        wants_table=False,
+        wants_full=False,
+        requires_rag=False,
+        response_format="markdown",
+        output_length="short",
+        complexity="low",
+        needs_calculation=False,
+        confidence=1.0,
+        entities=extract_entities(question),
     )
 
 
-def classify_intent(
+def classify_intent_v3(
     question: str,
     *,
     history: Optional[List[Dict[str, str]]] = None,
     is_media: bool = False,
-) -> IntentResult:
-    """Clasifica la intención de la consulta.
+    channel: str = "telegram",
+    media_source: Optional[str] = None,
+) -> IntentResultV3:
+    """Clasificación v3 con cascada de modelos y guardarraíles heredados de v1.
 
-    El SALUDO solo se emite si el mensaje se IDENTIFICA como saludo (regex anclado);
-    no hay otra vía. Orden de decisión:
-      1. Saludo/cortesía CONFIRMADO por regex anclado → smalltalk. Única puerta al
-         mensaje de bienvenida. No aplica a imagen/voz.
-      2. Fragmento vago/incompleto ("que", "que es") y SIN historial que lo
-         complete → ambiguous (se pide aclaración; ni saludo ni "sin evidencia").
-      3. Clasificador LLM (si está habilitado) → fuente primaria del resto.
-      4. Regex ampliado → fallback determinístico (léxico de negocio).
-      5. Guardarraíl: a esta altura el regex NO confirmó saludo, así que cualquier
-         'smalltalk' del LLM es un falso positivo → se enruta a recuperación.
+    Orden de decisión:
+      1. Saludo confirmado por regex anclado → smalltalk (única puerta al saludo).
+      2. Fragmento vago sin historial → ambiguous (se pide aclaración).
+      3. LLM primario (INTENT_V3_MODEL → INTENT_MODEL). Si la confianza es baja
+         (< INTENT_V3_ESCALATION_CONF) o el intent es sensible con confianza
+         < INTENT_V3_SENSITIVE_CONF, re-clasifica con INTENT_V3_ESCALATION_MODEL.
+      4. LLM caído/JSON inválido → regex v3 (léxico de negocio + comparativa).
+      5. Guardarraíles: smalltalk del LLM sin confirmación del regex → falso
+         positivo; fuera_de_dominio solo corta con vía LLM y confianza
+         ≥ INTENT_OOD_MIN_CONF (si no, degrada a puntual + retrieve); si la
+         consulta proviene de una IMAGEN (`media_source == "image"`),
+         fuera_de_dominio nunca corta: rutea a "image_direct" para responder
+         desde el contenido leído de la imagen (OCR/Vision), que viaja en la
+         propia pregunta.
 
-    `is_media=True` indica texto derivado de imagen (OCR/Vision) o voz; nunca es
-    saludo ni se trata como vago.
+    `channel` queda reservado (hint de formato por canal); hoy no altera la
+    clasificación. `media_source` es el origen del mensaje ("image" | "voice" |
+    "text" | ...): solo "image" activa la ruta image_direct.
     """
     q = (question or "").strip()
+    is_media = is_media or media_source in ("image", "voice")
 
-    # 1. Saludo confirmado por regex anclado → único camino al mensaje de bienvenida.
-    #    No aplica a imagen/voz: el usuario envió un medio para que lo procesemos.
-    if not is_media and _SMALLTALK_RE.match(q):
-        return _build_result("smalltalk", "regex")
+    # 1. Saludo: solo el regex anclado puede emitirlo. No aplica a imagen/voz.
+    #    Se normalizan alargamientos ("graciaaas" → "gracias") solo para el match.
+    if not is_media and _SMALLTALK_RE.match(_collapse_elongations(q)):
+        return _fixed_v3("smalltalk", route="smalltalk", question=q)
 
-    # 2. Fragmento vago/incompleto (sin historial previo que lo complete) → aclarar.
+    # 2. Fragmento vago/incompleto sin historial que lo complete → aclarar.
     if not is_media and not history and _is_too_vague(q):
-        return _build_result("ambiguous", "regex")
+        return _fixed_v3("ambiguous", route="ambiguous", question=q)
 
-    # 3. LLM como fuente primaria; 4. regex como fallback.
-    llm_label = _llm_classify(q, history)
-    if llm_label is not None:
-        intent, source = llm_label, "llm"
-    else:
-        intent, source = _regex_intent(q), "regex"
+    # 3. LLM primario + cascada (los checks de habilitación viven en
+    #    _llm_classify_v3, como en v1: cualquier impedimento → None → regex).
+    primary = (
+        getattr(settings, "INTENT_V3_MODEL", None)
+        or getattr(settings, "INTENT_MODEL", None)
+        or getattr(settings, "CHAT_MODEL", "gpt-4o-mini")
+    )
+    data = _llm_classify_v3(q, primary)
+    source = "llm"
+    esc_model = getattr(settings, "INTENT_V3_ESCALATION_MODEL", None)
+    if data is not None and esc_model and esc_model != primary:
+        esc_conf = float(getattr(settings, "INTENT_V3_ESCALATION_CONF", 0.7))
+        sens_conf = float(getattr(settings, "INTENT_V3_SENSITIVE_CONF", 0.85))
+        dudoso = data["confidence"] < esc_conf or (
+            data["intent"] in _V3_SENSITIVE_INTENTS and data["confidence"] < sens_conf
+        )
+        if dudoso:
+            data2 = _llm_classify_v3(q, esc_model)
+            if data2 is not None:
+                data, source = data2, "llm+escalated"
 
-    # 5. Guardarraíl: el saludo solo lo decide el regex anclado (paso 1). Si el LLM
-    #    etiquetó smalltalk pero el regex no lo confirmó, es un falso positivo
-    #    ("que", "explícame", "info") → se reclasifica hacia recuperación.
-    if intent == "smalltalk":
-        fallback = _regex_intent(q)
-        intent = fallback if fallback != "smalltalk" else "puntual"
+    # 4. Fallback determinístico.
+    if data is None:
+        data = _v3_defaults(_regex_intent_v3(q), confidence=0.6)
+        source = "regex"
+
+    # 5a. Guardarraíl: smalltalk del LLM sin confirmación del regex (paso 1).
+    if data["intent"] == "smalltalk":
+        fb = _regex_intent_v3(q)
+        data["intent"] = fb if fb != "smalltalk" else "puntual"
         source = f"{source}+guard"
 
-    return _build_result(intent, source)
+    # 5b. Guardarraíl: fuera_de_dominio solo corta con vía LLM y confianza alta.
+    # 5c. Guardarraíl imagen: si la consulta proviene de una imagen, lo leído por
+    #     OCR/Vision viaja en la propia pregunta y suele contener la respuesta
+    #     (p. ej. la clase de una etiqueta de eficiencia). El rechazo fijo la
+    #     descartaría → se responde directo desde ese contenido, sin RAG.
+    route = "retrieve"
+    if data["intent"] == "fuera_de_dominio":
+        if media_source == "image":
+            route = "image_direct"
+            source = f"{source}+guard"
+        else:
+            ood_conf = float(getattr(settings, "INTENT_OOD_MIN_CONF", 0.8))
+            if source.startswith("llm") and data["confidence"] >= ood_conf:
+                route = "out_of_domain"
+            else:
+                data["intent"] = "puntual"
+                source = f"{source}+guard"
+
+    # Derivaciones por regla dura (el LLM no puede contradecirlas).
+    intent = data["intent"]
+    wants_table = intent == "tabla" or data["response_format"] == "markdown_table"
+    wants_full = intent in ("exhaustiva", "comparativa") or data["output_length"] == "detailed"
+    if wants_full:
+        data["output_length"] = "detailed"
+
+    return IntentResultV3(
+        intent=intent,
+        source=source,
+        route=route,
+        wants_table=wants_table,
+        wants_full=wants_full,
+        requires_rag=(route == "retrieve"),
+        response_format=data["response_format"],
+        output_length=data["output_length"],
+        complexity=data["complexity"],
+        needs_calculation=data["needs_calculation"],
+        confidence=data["confidence"],
+        entities=extract_entities(q),
+    )
+
+

@@ -60,12 +60,18 @@ app.include_router(router)
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 if TELEGRAM_BOT_TOKEN:
     from aiogram import Bot, types
+    from aiogram.client.default import DefaultBotProperties
     try:
         from retie_agent.bot.run_polling import dp
     except Exception:
         dp = None
 
-    bot = Bot(token=TELEGRAM_BOT_TOKEN)
+    # parse_mode="HTML" por defecto: stylist_node (graph.py) convierte el
+    # markdown de las respuestas a <b>/<i>/<code>/<pre> asumiendo que Telegram
+    # los va a interpretar. Sin este default, el bot de webhook mostraba las
+    # etiquetas literalmente ("<b>Artículo...</b>") en vez de renderizarlas,
+    # a diferencia del bot de run_polling.py que sí lo tenía configurado.
+    bot = Bot(token=TELEGRAM_BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 
     @app.post("/telegram/webhook")
     async def telegram_webhook(request: Request):

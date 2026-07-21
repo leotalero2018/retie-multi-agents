@@ -33,6 +33,7 @@ venv.bak/
 # === Editors ===
 .vscode/
 .idea/
+.claude/
 *.swp
 *.swo
 *.swn

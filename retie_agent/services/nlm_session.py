@@ -180,11 +180,12 @@ def download_nlm_session(dest_dir: str | None = None) -> None:
 
     try:
         cli.stat_object(bucket, _MINIO_KEY)
-    except Exception:
+    except Exception as exc:
+        endpoint = os.getenv("MINIO_PRIVATE_ENDPOINT") or os.getenv("MINIO_PUBLIC_ENDPOINT")
         raise FileNotFoundError(
-            f"No NLM session found in MinIO ({bucket}/{_MINIO_KEY}). "
+            f"No NLM session found in MinIO ({bucket}/{_MINIO_KEY}) via {endpoint!r}: {exc}. "
             "Run: python setup_notebooklm.py --upload"
-        )
+        ) from exc
 
     buf = io.BytesIO()
     response = cli.get_object(bucket, _MINIO_KEY)

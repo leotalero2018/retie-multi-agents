@@ -33,11 +33,13 @@ Usuario
   └── CLI (script local)
           └── index_docs.py
                 │
-          ┌─────▼────────────────────────────────────────┐
-          │               LangGraph Pipeline              │
-          │   retrieve → router → answer → enrich → style │
-          │          retie_agent/agent/graph.py           │
-          └─────────────────┬────────────────────────────┘
+          ┌─────▼─────────────────────────────────────────────────┐
+          │                  LangGraph Pipeline (v3)               │
+          │ classifier → route_entry → query_enrichment →          │
+          │   [chroma ‖ notebooklm ‖ gemini] → answer (deep agent) │
+          │   → (table) → enrich → suggest → stylist               │
+          │              retie_agent/agent/graph.py                │
+          └─────────────────┬─────────────────────────────────────┘
                             │
              ┌──────────────┴──────────────┐
              ▼                             ▼
@@ -506,6 +508,192 @@ NOTEBOOKLM_NOTEBOOK_ID=retie
 ```
 
 > 💡 **Keepalive:** con el bot/API corriendo, `NOTEBOOKLM_KEEPALIVE_MINUTES` (default 240) refresca las cookies periódicamente y resube el estado a MinIO, manteniendo viva una sesión válida sin logins manuales. La caducidad ocurre sobre todo cuando el servidor pasa horas apagado.
+
+---
+
+## Grafo v3: classifier_node + deep agent en answer_node
+
+> Diseño completo en `FINAL_IMPLEMENTATION_NODES.md`; planes de detalle en `plans/`.
+
+### classifier_node (entry point)
+
+La clasificación de intención salió de `route_entry` a un nodo propio con span
+dedicado en Langfuse. El **classifier v3 es el único clasificador del grafo**
+(el v1 de una palabra fue retirado; sin flag): salida estructurada
+`IntentResultV3` (taxonomía `puntual | exhaustiva | tabla | comparativa |
+procedimiento | verificacion | fuera_de_dominio | smalltalk`, más
+`response_format`, `output_length`, `complexity`, `needs_calculation`,
+`confidence` y entidades normativas extraídas por regex). **Cascada de
+modelos**: clasifica el modelo barato (`INTENT_V3_MODEL` → `INTENT_MODEL`) y
+los casos dudosos re-clasifican con `INTENT_V3_ESCALATION_MODEL` (si
+`confidence < INTENT_V3_ESCALATION_CONF`, o intent sensible con
+`confidence < INTENT_V3_SENSITIVE_CONF`). Con `INTENT_LLM_ENABLED=false` o el
+LLM caído, el fallback regex sin red clasifica solo el léxico del negocio.
+
+Guardarraíles heredados de v1: el saludo solo lo emite el regex anclado; la
+vaguedad se corta antes del LLM; `fuera_de_dominio` solo corta el pipeline
+(nodo `out_of_domain_node`, ahorra los 3 retrievals + 4 llamadas LLM) si vino
+del LLM con `confidence ≥ INTENT_OOD_MIN_CONF` (default 0.8) — en la duda, se
+recupera normal.
+
+`query_enrichment_node` (ex `condense_node`) enriquece la consulta pre-RAG:
+reescritura autocontenida con historial + expansión de siglas del dominio
+(SPT, DPS, GFCI…); sin historial solo actúa si el classifier marcó
+`complexity=high`.
+
+### Deep agent en answer_node
+
+`answer_node` dejó de ser una llamada única: ahora es un **deep agent**
+(`deepagents.create_deep_agent`, loop ReAct acotado) que evalúa la evidencia
+del fan-in (Chroma + fuente secundaria según `SECONDARY_RAG_SOURCE`), y si no
+basta **re-consulta con queries refinadas** usando las tools `search_chroma` y
+`ask_gemini` (construcción dinámica según disponibilidad). **NotebookLM no es
+tool**: sus 30–180 s por llamada romperían el presupuesto; su aporte entra como
+evidencia inicial.
+
+- La **skill** (directivas + presupuesto + post-proceso) la resuelve el registry
+  determinista de `retie_agent/agent/skills/` a partir del intent — el agente no
+  elige su skill. Cada skill es un archivo **`.md`** (frontmatter con metadata +
+  cuerpo con las directivas): añadir/editar una skill no toca código Python.
+  `intent=tabla` → directiva de filas completas y el render PNG sigue siendo de
+  `table_node`.
+- **Red de seguridad, no flag**: timeout (`DEEP_AGENT_TIMEOUT=75s`), error o
+  respuesta vacía degradan a `_synthesize_simple` (el camino clásico de una
+  llamada). Rollback del feature = `git revert`.
+- Límites: `DEEP_AGENT_RECURSION_LIMIT=12`, `DEEP_AGENT_MAX_RETRIEVALS=4`,
+  `DEEP_AGENT_MODEL` (override; default = modelo del agente/`CHAT_MODEL`).
+- Contención de middleware: los built-ins de deepagents (todos/filesystem/
+  execute/subagents) están excluidos vía `HarnessProfile` (`deep_answer.py`).
+- ⚠️ **No definir** `LANGSMITH_TRACING` ni `LANGCHAIN_TRACING_V2`: deepagents
+  arrastra langsmith y la observabilidad de este proyecto es Langfuse (la traza
+  del loop aparece bajo el span `answer_node` como `deep_answer_agent`).
+
+---
+
+## Spike: Gemini File Search como fuente RAG secundaria (pruebas A/B)
+
+> ⚠️ **Spike experimental — no producción todavía.** Rama `test/gemini-file-search-spike`. Valida si [Gemini File Search](https://ai.google.dev/gemini-api/docs/file-search) (RAG gestionado por API oficial, **sin sesiones ni logins que caducan**) puede reemplazar a NotebookLM como segunda fuente del agente. Con la configuración por defecto el spike no cambia nada del pipeline actual.
+
+### ¿Qué añade?
+
+El grafo ya recuperaba en paralelo con `chromadb_node` + `notebooklm_node`. El spike agrega un **tercer nodo `gemini_node`** que respeta el mismo contrato (escribe en `gemini_docs`, genera su propio span en Langfuse), controlado por un único feature flag:
+
+| `SECONDARY_RAG_SOURCE` | Nodos que corren | Comportamiento |
+|------------------------|------------------|----------------|
+| `notebooklm` (default) | Chroma + NLM | Pipeline actual, sin cambios. |
+| `gemini`               | Chroma + Gemini | Gemini File Search alimenta la respuesta; NotebookLM apagado. |
+| `shadow`               | Chroma + NLM + Gemini | **A/B:** los tres corren en paralelo para la misma pregunta; NotebookLM alimenta la respuesta (producción segura) y Gemini queda registrado en su span de Langfuse para comparar calidad — **por diseño Gemini NO entra en la respuesta entregada**. |
+| `chroma`               | solo Chroma | Sin fuente secundaria (alias: `chromadb`, `solo-chroma`, `none`). |
+| `solo-notebooklm`      | solo NLM | NotebookLM alimenta la respuesta, sin recuperación de Chroma. |
+| `solo-gemini`          | solo Gemini | Gemini alimenta la respuesta, sin recuperación de Chroma. |
+
+> Si la única fuente pedida no está disponible (p. ej. `solo-gemini` sin key/store), el fan-out degrada a Chroma para no romper el grafo. El valor tolera comillas pegadas (`"shadow"` desde el dashboard de Railway).
+
+El flag se alterna por entorno en Railway sin redeploy de código.
+
+### Requisitos
+
+```bash
+pip install google-genai   # SDK oficial (no está en requirements.txt aún)
+```
+
+> ⚠️ Instalar `google-genai` sube `pydantic` por encima del pin de `aiogram` (`<2.8`); en las pruebas ambos siguen funcionando, pero es un punto a resolver antes de producción.
+
+Variables en el `.env` (obtén la API key en [Google AI Studio](https://aistudio.google.com/apikey) — al crearla, elige **"crear en proyecto nuevo"**, no necesitas un proyecto previo):
+
+```env
+GEMINI_API_KEY=AQ...
+GEMINI_MODEL=gemini-flash-latest
+GEMINI_FILE_SEARCH_STORE=            
+GEMINI_TIMEOUT=120 
+SECONDARY_RAG_SOURCE=notebooklm      
+```
+
+
+### Paso 1 — Cargar el corpus en un File Search Store (una sola vez)
+
+`gemini_client.py` solo **consulta** un store existente; `gemini_ingesta.py` lo crea y lo llena. Ignora todo lo que no sea `*.pdf` y sanea nombres con tildes.
+
+```bash
+# crear un store nuevo y subir todos los PDF de la carpeta
+python gemini_ingesta.py /ruta/a/carpeta/con/pdfs
+
+# AÑADIR documentos a un store que ya existe (sin crear otro)
+python gemini_ingesta.py /ruta/a/carpeta --store fileSearchStores/xxxxx
+```
+
+Al terminar imprime la línea `GEMINI_FILE_SEARCH_STORE="fileSearchStores/..."` — cópiala al `.env`.
+
+**El store queda atado a la cuenta de la API key.** Para el piloto con la cuenta
+del proyecto (retie), crea el store con ESA key (no la personal), anteponiéndola:
+
+```bash
+# macOS / Linux
+GEMINI_API_KEY="AQ...key_de_la_cuenta" python gemini_ingesta.py "/ruta/a/RETIE DOCUMENTS"
+```
+
+```powershell
+# Windows (PowerShell)
+cd $HOME\Documents\RETIE\retie-multi-agents
+.\.venv\Scripts\Activate.ps1
+$env:GEMINI_API_KEY="AQ...key_de_la_cuenta"
+python gemini_ingesta.py "C:\ruta\a\RETIE DOCUMENTS"
+```
+
+### Gestionar los stores (listar, ver documentos, borrar)
+
+`gemini_store_admin.py` administra los stores. Usa la key del `.env`, o antepón
+`GEMINI_API_KEY="..."` para operar sobre otra cuenta.
+
+```bash
+# listar todos los stores de la cuenta
+python gemini_store_admin.py list
+
+# ver los documentos de un store
+python gemini_store_admin.py docs fileSearchStores/xxxxx
+
+# borrar un store COMPLETO (con todos sus documentos)
+python gemini_store_admin.py delete fileSearchStores/xxxxx
+
+# borrar un solo documento
+python gemini_store_admin.py deldoc fileSearchStores/xxxxx fileSearchStores/xxxxx/documents/yyyyy
+```
+
+> Para empezar de cero (p. ej. si se subieron archivos equivocados): borra el store
+> con `delete` y vuelve a correr `gemini_ingesta.py`. En Windows, antepón la key con
+> `$env:GEMINI_API_KEY="..."` en una línea aparte, igual que en la ingesta.
+
+### Paso 2 — Probar en tres niveles
+
+```bash
+# Nivel 1 — cliente Gemini aislado (feedback más rápido)
+python -c "from dotenv import load_dotenv; load_dotenv(); \
+from retie_agent.agent.gemini_client import GeminiFileSearchClient; from retie_agent.config import settings; \
+c=GeminiFileSearchClient(api_key=settings.GEMINI_API_KEY, model=settings.GEMINI_MODEL, store=settings.GEMINI_FILE_SEARCH_STORE); \
+print(c.ask_question('¿Qué exige el RETIE sobre puesta a tierra?')[0][:400])"
+
+# Nivel 2 — por el grafo, modo gemini
+SECONDARY_RAG_SOURCE=gemini python -c "from dotenv import load_dotenv; load_dotenv(); \
+from retie_agent.config import settings; settings.SECONDARY_RAG_SOURCE='gemini'; \
+from retie_agent.agent.graph import run_graph; \
+print(run_graph('¿Qué distancias de seguridad exige el RETIE?', session='gem'))"
+
+# Nivel 3 — shadow A/B: compara notebooklm_node vs gemini_node en Langfuse
+# (.env: SECONDARY_RAG_SOURCE=shadow y LANGFUSE_ENABLED=true, luego corre el golden set del TICKET-005)
+```
+
+En **Langfuse**, cada traza `retie-query` en modo `shadow` muestra los spans `notebooklm_node` y `gemini_node` lado a lado: se comparan cobertura de filas, exactitud de valores y calidad de citas a igualdad de pregunta.
+
+### Si algo falla
+
+| Síntoma | Solución |
+|---------|----------|
+| `404 NOT_FOUND: no longer available to new users` | El modelo pineado fue retirado. Usa `gemini-flash-latest` o `gemini-3.1-flash-lite` en `GEMINI_MODEL`. |
+| `503 UNAVAILABLE: high demand` sostenido | El alias apunta al modelo más saturado. Cambia a `gemini-3.1-flash-lite`. |
+| `429 RESOURCE_EXHAUSTED` | Quota del free tier agotada (por minuto o por día). Espera o pasa la key a plan de pago. |
+| `gemini_node` con `status=timeout` en Langfuse | Sube `GEMINI_TIMEOUT` (default 120 s): los reintentos ante 503/429 necesitan margen. |
+| Falla la ingesta por el modelo de embedding | Cambia `gemini-embedding-2` en `gemini_ingesta.py`. |
+| `gemini_node` no aparece en la traza | Falta `GEMINI_API_KEY`/`GEMINI_FILE_SEARCH_STORE`, o `SECONDARY_RAG_SOURCE` sigue en `notebooklm`. |
 
 ---
 

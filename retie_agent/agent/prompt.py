@@ -1,12 +1,33 @@
 from typing import List, Dict
 
+# Guía de formato compartida: el texto sale como Markdown ligero y
+# stylist_node (graph.py:_format_markdownish_as_telegram_html) lo convierte a
+# HTML de Telegram (<b>, <i>, <code>, viñetas "• "). Un párrafo único sin
+# estructura llega al usuario como un bloque plano difícil de leer; estas
+# reglas son las que ese conversor sabe traducir bien.
+RESPONSE_FORMAT_GUIDE = (
+    "FORMATO DE ENTREGA:\n"
+    "- Escribe en párrafos cortos (2-4 líneas) separados por una línea en blanco. "
+    "Nunca entregues un solo bloque largo de texto.\n"
+    "- Si enumeras tres o más requisitos, pasos, características o ítems, "
+    "preséntalos como lista con viñetas, cada una en su propia línea empezando "
+    "con \"- \".\n"
+    "- Resalta con **negrilla** (así: **texto**) los términos clave, "
+    "artículos/numerales citados y valores límite — con moderación, no todo "
+    "el texto.\n"
+    "- Si la respuesta cubre varios artículos o secciones, abre cada bloque "
+    "con su título en negrilla (p. ej. **Artículo 2.3.7.2 — Cintas aislantes**).\n"
+    "- No uses encabezados con # ni tablas Markdown (| ... |); usa negrilla "
+    "para títulos y viñetas o prosa para datos tabulares."
+)
+
 # System prompt compartido por los nodos de respuesta del grafo.
 SYSTEM_PROMPT_RETIE = (
     "Eres un asistente experto en el Reglamento Técnico de Instalaciones "
     "Eléctricas (RETIE) de Colombia. Respondes en español, con precisión "
     "técnica y solo con base en la evidencia que se te entrega. Cuando la "
     "evidencia incluye valores numéricos, tablas o requisitos normativos, los "
-    "reproduces fielmente sin redondear ni omitir."
+    "reproduces fielmente sin redondear ni omitir.\n\n" + RESPONSE_FORMAT_GUIDE
 )
 
 # System prompt para consultas derivadas de imagen o nota de voz cuando NO hay
@@ -21,24 +42,46 @@ SYSTEM_PROMPT_MEDIA = (
     "consulta de forma breve y precisa con base en ese contenido. Si la consulta queda "
     "fuera del alcance eléctrico/normativo, ayúdale igualmente con lo que sea visible en "
     "el material aportado y acláralo en una frase. No inventes datos que no estén presentes."
+    "\n\n" + RESPONSE_FORMAT_GUIDE
 )
 
-# Reescritura de preguntas de seguimiento: convierte una pregunta que depende
-# del historial ("¿y eso aplica en baja tensión?") en una autocontenida para
-# que el retrieval (Chroma/NotebookLM) reciba todo el contexto necesario.
-CONDENSE_PROMPT = (
+# Glosario de siglas del dominio para la expansión en query_enrichment_node:
+# el retrieval léxico (BM25) y el denso rinden más cuando la consulta contiene
+# tanto la sigla como su expansión.
+_RETIE_GLOSSARY = (
+    "RETIE = Reglamento Técnico de Instalaciones Eléctricas; "
+    "NTC = Norma Técnica Colombiana (NTC 2050 = Código Eléctrico Colombiano); "
+    "RETILAP = Reglamento Técnico de Iluminación y Alumbrado Público; "
+    "SPT = sistema de puesta a tierra; "
+    "DPS = dispositivo de protección contra sobretensiones; "
+    "GFCI = interruptor de circuito por falla a tierra; "
+    "AWG = calibre americano de conductores; "
+    "BT/MT/AT = baja/media/alta tensión; "
+    "PE = conductor de protección"
+)
+
+# Enriquecimiento de la consulta pre-RAG (query_enrichment_node, ex condense):
+# convierte una pregunta que depende del historial ("¿y eso aplica en baja
+# tensión?") en una autocontenida y expande siglas del dominio, para que el
+# retrieval (Chroma/NotebookLM/Gemini) reciba todo el contexto necesario.
+QUERY_ENRICHMENT_PROMPT = (
     "Dada la conversación previa y la última pregunta del usuario, reescribe la "
-    "última pregunta como una pregunta AUTOCONTENIDA sobre el RETIE, en español, "
-    "que pueda entenderse sin leer la conversación.\n"
+    "última pregunta como una pregunta AUTOCONTENIDA sobre el RETIE o la NTC 2050, "
+    "en español, que pueda entenderse sin leer la conversación.\n"
     "Reglas:\n"
-    "- Si la pregunta ya es autocontenida, devuélvela EXACTAMENTE igual.\n"
+    "- Si la pregunta ya es autocontenida y no usa siglas, devuélvela EXACTAMENTE igual.\n"
     "- No respondas la pregunta; solo reescríbela.\n"
     "- Conserva términos técnicos, números de artículo, tablas y unidades.\n"
+    "- Si la pregunta usa siglas del dominio, añade la expansión entre paréntesis "
+    "la primera vez que aparezca. Glosario: " + _RETIE_GLOSSARY + ".\n"
     "- Devuelve únicamente la pregunta reescrita, sin comillas ni explicación.\n\n"
     "CONVERSACIÓN PREVIA:\n{history}\n\n"
     "ÚLTIMA PREGUNTA: {question}\n\n"
     "Pregunta reescrita:"
 )
+
+# Alias legacy (imports externos); retirar en la limpieza de la Fase 5.
+CONDENSE_PROMPT = QUERY_ENRICHMENT_PROMPT
 
 
 def format_history_for_condense(history: List[Dict[str, str]], max_messages: int = 6) -> str:
