@@ -15,7 +15,34 @@ def test_telegram_formatter_converts_markdown_to_safe_html():
     assert "<i>detalle</i>" in out
     assert "<code>RETIE</code>" in out
     assert "&amp;" in out
-    assert "&lt;tag&gt;" in out
+    # <tag> no es una etiqueta Telegram soportada: se descarta en vez de
+    # mostrarse escapada (&lt;tag&gt;) — ver test_raw_html_from_model_*.
+    assert "<tag>" not in out
+    assert "&lt;tag&gt;" not in out
+
+
+def test_raw_html_from_model_preserves_safe_tags_and_drops_the_rest():
+    """El modelo (o una fuente secundaria como Gemini/NotebookLM) a veces
+    escribe HTML crudo en vez de **negrilla** markdown. Regresión del bug
+    reportado en producción: html.escape() mostraba <b> como &lt;b&gt; visible
+    en vez de negrilla real."""
+    text = "El <b>Artículo 502</b> aplica en <div class=x>áreas Clase II</div>."
+
+    out = _format_markdownish_as_telegram_html(text)
+
+    assert "<b>Artículo 502</b>" in out
+    assert "&lt;b&gt;" not in out
+    assert "<div" not in out and "&lt;div" not in out
+    assert "áreas Clase II" in out
+
+
+def test_raw_html_does_not_swallow_numeric_comparisons():
+    text = "Aplica si la tensión es <600V y **crítico**."
+
+    out = _format_markdownish_as_telegram_html(text)
+
+    assert "&lt;600V" in out
+    assert "<b>crítico</b>" in out
 
 
 def test_telegram_formatter_preserves_pre_blocks():
@@ -35,7 +62,10 @@ def test_format_for_channel_keeps_channels_separate():
 
     assert telegram_format == "telegram_html"
     assert "<b>Negrilla</b>" in telegram
-    assert "&lt;b&gt;html ajeno&lt;/b&gt;" in telegram
+    # <b> crudo del modelo es una etiqueta Telegram soportada: se preserva
+    # como negrilla real, no se escapa a &lt;b&gt; visible.
+    assert "<b>html ajeno</b>" in telegram
+    assert "&lt;b&gt;" not in telegram
     assert whatsapp_format == "whatsapp_text"
     assert "<b>" not in whatsapp
 
