@@ -1685,33 +1685,57 @@ def _node_enrich(state: GraphState, config=None) -> GraphState:
 _SUGGEST_PROMPT = (
     "Eres un asistente experto en normativa eléctrica colombiana (RETIE y NTC 2050).\n"
     "Con base en los últimos mensajes del usuario y la respuesta que recibió, "
-    "genera {n} preguntas de seguimiento CORTAS (máx. 12 palabras cada una) que "
-    "el usuario probablemente quiera hacer a continuación sobre el mismo tema.\n"
+    "genera {n} preguntas de seguimiento MUY CORTAS (máx. 6 palabras y 40 "
+    "caracteres cada una — van como texto de un botón de Telegram, no caben "
+    "preguntas largas) que el usuario probablemente quiera hacer a continuación "
+    "sobre el mismo tema.\n"
     "Reglas:\n"
+    "- Directas al grano, sin rodeos ni conectores de más.\n"
     "- Preguntas concretas y respondibles con el RETIE o la NTC 2050.\n"
     "- No repitas preguntas que el usuario ya hizo.\n"
     "- Responde ÚNICAMENTE con un array JSON de strings, sin texto adicional.\n"
-    'Ejemplo: ["¿Qué calibre de conductor exige la NTC 2050 para 40 A?"]\n\n'
+    'Ejemplo: ["¿Calibre mínimo para 40 A?", "¿Resistencia máxima permitida?"]\n\n'
     "ÚLTIMOS MENSAJES DEL USUARIO:\n{user_messages}\n\n"
     "RESPUESTA DADA (resumen):\n{answer}\n"
 )
 
 
 def _parse_suggestions(raw: str, limit: int) -> List[str]:
-    """Extrae el array JSON de la salida del LLM (tolerante a fences/texto)."""
+    """Extrae el array JSON de la salida del LLM (tolerante a fences/texto/truncamiento).
+
+    Mismo patrón de reparación que _parse_table_json: si el array se cortó a
+    mitad de una pregunta por el límite de tokens, _close_truncated_json lo
+    balancea y se descarta el último elemento (puede venir incompleto) en vez
+    de perder TODAS las sugerencias por un solo ítem malformado — la causa más
+    probable de que a veces solo aparezca 1 de las 3 sugerencias esperadas.
+    """
     if not raw:
         return []
     text = raw.strip()
     if text.startswith("```"):
         text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.IGNORECASE).strip()
-    start, end = text.find("["), text.rfind("]")
-    if start == -1 or end <= start:
+    start = text.find("[")
+    if start == -1:
         return []
-    try:
-        data = _json.loads(text[start:end + 1])
-    except _json.JSONDecodeError:
+    candidate = text[start:]
+    end = candidate.rfind("]")
+    snippet = candidate[: end + 1] if end != -1 else candidate
+
+    data = None
+    was_repaired = False
+    for i, attempt in enumerate((snippet, _close_truncated_json(candidate))):
+        try:
+            data = _json.loads(attempt)
+            was_repaired = i == 1
+            break
+        except _json.JSONDecodeError:
+            continue
+    if not isinstance(data, list):
         return []
+
     out = [s.strip() for s in data if isinstance(s, str) and s.strip()]
+    if was_repaired and out:
+        out = out[:-1]  # el último elemento del array reparado puede venir cortado
     return out[:limit]
 
 
@@ -1745,10 +1769,18 @@ def _node_suggest(state: GraphState) -> GraphState:
             _client,
                 model=_resolve_model(state.get("agent_key"), explicit=None),
                 temperature=0.7,
-                max_tokens=200,
+                # 200 se quedaba corto para n=3 preguntas de hasta 12 palabras +
+                # sintaxis JSON: el array llegaba a cortarse a mitad de la última
+                # pregunta y _parse_suggestions perdía sugerencias de más.
+                max_tokens=350,
                 messages=[{"role": "user", "content": prompt}],
             )
             suggestions = _parse_suggestions(resp.choices[0].message.content or "", n)
+            if len(suggestions) < n:
+                logger.warning(
+                    "suggest_node: se pidieron %d sugerencias, se obtuvieron %d (raw=%r)",
+                    n, len(suggestions), (resp.choices[0].message.content or "")[:300],
+                )
         except Exception as exc:
             logger.warning("suggest_node failed: %s", exc)
 

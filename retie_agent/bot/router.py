@@ -218,7 +218,22 @@ def _split_for_telegram(text: str, limit: int = _TELEGRAM_TEXT_LIMIT) -> List[st
     return parts or [text[:limit]]
 
 
-_SUGGESTION_LABEL_MAX = 38  # ancho cómodo de botón en el cliente de Telegram
+# _SUGGEST_PROMPT (graph.py) ya pide preguntas de máx. 40 caracteres — este es
+# el tope de display/red de seguridad si el modelo no lo respeta exactamente,
+# no el mecanismo principal (ver _truncate_at_word_boundary).
+_SUGGESTION_LABEL_MAX = 45
+
+
+def _truncate_at_word_boundary(text: str, limit: int) -> str:
+    """Corta `text` a `limit` caracteres sin partir una palabra a la mitad
+    (evita cosas como "equi…" en vez de "equipo…")."""
+    if len(text) <= limit:
+        return text
+    cut = text.rfind(" ", 0, limit)
+    # Sin espacio razonable donde cortar (palabra única muy larga): corte duro.
+    if cut < limit // 2:
+        cut = limit
+    return text[:cut].rstrip() + "…"
 
 
 def _build_suggestions_keyboard(message: Message, result) -> Optional[InlineKeyboardMarkup]:
@@ -230,7 +245,7 @@ def _build_suggestions_keyboard(message: Message, result) -> Optional[InlineKeyb
     SUGGESTIONS[message.chat.id] = list(suggestions)
     rows = []
     for i, s in enumerate(suggestions):
-        label = s if len(s) <= _SUGGESTION_LABEL_MAX else s[: _SUGGESTION_LABEL_MAX - 1] + "…"
+        label = _truncate_at_word_boundary(s, _SUGGESTION_LABEL_MAX)
         rows.append([InlineKeyboardButton(text=f"💬 {label}", callback_data=f"sugg:{i}")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
