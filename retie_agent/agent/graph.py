@@ -1749,6 +1749,17 @@ _HTML_PLACEHOLDER = "\x00HTML{}\x00"
 _TELEGRAM_PRE_RE = re.compile(r"<pre\b[^>]*>.*?</pre>", re.IGNORECASE | re.DOTALL)
 _MARKDOWN_FENCE_RE = re.compile(r"```(?:[^\n`]*)\n?(.*?)```", re.DOTALL)
 _MARKDOWN_LINK_RE = re.compile(r"\[([^\]\n]+)\]\((https?://[^)\s]+)\)")
+# El modelo (o una fuente secundaria como Gemini/NotebookLM) a veces escribe
+# HTML crudo en vez de **negrilla** markdown. Estas son las etiquetas simples
+# que Telegram soporta sin atributos — se preservan tal cual llegan en vez de
+# perder el énfasis que el modelo quiso dar.
+_SAFE_INLINE_TAG_RE = re.compile(
+    r"</?(?:b|strong|i|em|u|ins|s|strike|del|code)>", re.IGNORECASE
+)
+# Cualquier otra etiqueta ("<" + letra inicial, lo que excluye comparaciones
+# numéricas tipo "<600V" o "< 5") se descarta — nunca se deja llegar a
+# html.escape(), que la mostraría como &lt;b&gt; visible.
+_RAW_HTML_TAG_RE = re.compile(r"</?[a-zA-Z][a-zA-Z0-9]*\b[^<>]*>")
 
 
 def _protect_html_block(blocks: List[str], value: str) -> str:
@@ -1782,6 +1793,16 @@ def _format_markdownish_as_telegram_html(text: str) -> str:
         lambda m: _protect_html_block(blocks, m.group(0)),
         raw,
     )
+
+    # 1.5) HTML crudo colado por el modelo/fuente secundaria: las etiquetas
+    # simples de Telegram se protegen tal cual (conservan el énfasis), el
+    # resto se descarta. Sin este paso, html.escape() (4) las muestra como
+    # &lt;b&gt; visible — el bug reportado en producción.
+    raw = _SAFE_INLINE_TAG_RE.sub(
+        lambda m: _protect_html_block(blocks, m.group(0)),
+        raw,
+    )
+    raw = _RAW_HTML_TAG_RE.sub("", raw)
 
     # 2) Convertir fenced code Markdown en <pre> escapado.
     raw = _MARKDOWN_FENCE_RE.sub(
