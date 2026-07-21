@@ -541,7 +541,7 @@ async def _download_image_to_tmp(message: Message) -> Optional[Path]:
     if message.photo:
         photo = message.photo[-1]
         fd, tmp_path = tempfile.mkstemp(suffix=".jpg")
-        Path(tmp_path).unlink(missing_ok=True)
+        os.close(fd)
         dest = Path(tmp_path)
         await message.bot.download(photo, destination=dest)
         return dest
@@ -549,7 +549,7 @@ async def _download_image_to_tmp(message: Message) -> Optional[Path]:
     if message.document and message.document.mime_type and message.document.mime_type.startswith("image/"):
         suffix = Path(message.document.file_name or "image.jpg").suffix or ".jpg"
         fd, tmp_path = tempfile.mkstemp(suffix=suffix)
-        Path(tmp_path).unlink(missing_ok=True)
+        os.close(fd)
         dest = Path(tmp_path)
         await message.bot.download(message.document, destination=dest)
         return dest

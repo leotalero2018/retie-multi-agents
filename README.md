@@ -33,11 +33,13 @@ Usuario
   └── CLI (script local)
           └── index_docs.py
                 │
-          ┌─────▼────────────────────────────────────────┐
-          │               LangGraph Pipeline              │
-          │   retrieve → router → answer → enrich → style │
-          │          retie_agent/agent/graph.py           │
-          └─────────────────┬────────────────────────────┘
+          ┌─────▼─────────────────────────────────────────────────┐
+          │                  LangGraph Pipeline (v3)               │
+          │ classifier → route_entry → query_enrichment →          │
+          │   [chroma ‖ notebooklm ‖ gemini] → answer (deep agent) │
+          │   → (table) → enrich → suggest → stylist               │
+          │              retie_agent/agent/graph.py                │
+          └─────────────────┬─────────────────────────────────────┘
                             │
              ┌──────────────┴──────────────┐
              ▼                             ▼
@@ -506,6 +508,65 @@ NOTEBOOKLM_NOTEBOOK_ID=retie
 ```
 
 > 💡 **Keepalive:** con el bot/API corriendo, `NOTEBOOKLM_KEEPALIVE_MINUTES` (default 240) refresca las cookies periódicamente y resube el estado a MinIO, manteniendo viva una sesión válida sin logins manuales. La caducidad ocurre sobre todo cuando el servidor pasa horas apagado.
+
+---
+
+## Grafo v3: classifier_node + deep agent en answer_node
+
+> Diseño completo en `FINAL_IMPLEMENTATION_NODES.md`; planes de detalle en `plans/`.
+
+### classifier_node (entry point)
+
+La clasificación de intención salió de `route_entry` a un nodo propio con span
+dedicado en Langfuse. El **classifier v3 es el único clasificador del grafo**
+(el v1 de una palabra fue retirado; sin flag): salida estructurada
+`IntentResultV3` (taxonomía `puntual | exhaustiva | tabla | comparativa |
+procedimiento | verificacion | fuera_de_dominio | smalltalk`, más
+`response_format`, `output_length`, `complexity`, `needs_calculation`,
+`confidence` y entidades normativas extraídas por regex). **Cascada de
+modelos**: clasifica el modelo barato (`INTENT_V3_MODEL` → `INTENT_MODEL`) y
+los casos dudosos re-clasifican con `INTENT_V3_ESCALATION_MODEL` (si
+`confidence < INTENT_V3_ESCALATION_CONF`, o intent sensible con
+`confidence < INTENT_V3_SENSITIVE_CONF`). Con `INTENT_LLM_ENABLED=false` o el
+LLM caído, el fallback regex sin red clasifica solo el léxico del negocio.
+
+Guardarraíles heredados de v1: el saludo solo lo emite el regex anclado; la
+vaguedad se corta antes del LLM; `fuera_de_dominio` solo corta el pipeline
+(nodo `out_of_domain_node`, ahorra los 3 retrievals + 4 llamadas LLM) si vino
+del LLM con `confidence ≥ INTENT_OOD_MIN_CONF` (default 0.8) — en la duda, se
+recupera normal.
+
+`query_enrichment_node` (ex `condense_node`) enriquece la consulta pre-RAG:
+reescritura autocontenida con historial + expansión de siglas del dominio
+(SPT, DPS, GFCI…); sin historial solo actúa si el classifier marcó
+`complexity=high`.
+
+### Deep agent en answer_node
+
+`answer_node` dejó de ser una llamada única: ahora es un **deep agent**
+(`deepagents.create_deep_agent`, loop ReAct acotado) que evalúa la evidencia
+del fan-in (Chroma + fuente secundaria según `SECONDARY_RAG_SOURCE`), y si no
+basta **re-consulta con queries refinadas** usando las tools `search_chroma` y
+`ask_gemini` (construcción dinámica según disponibilidad). **NotebookLM no es
+tool**: sus 30–180 s por llamada romperían el presupuesto; su aporte entra como
+evidencia inicial.
+
+- La **skill** (directivas + presupuesto + post-proceso) la resuelve el registry
+  determinista de `retie_agent/agent/skills/` a partir del intent — el agente no
+  elige su skill. Cada skill es un archivo **`.md`** (frontmatter con metadata +
+  cuerpo con las directivas): añadir/editar una skill no toca código Python.
+  `intent=tabla` → directiva de filas completas y el render PNG sigue siendo de
+  `table_node`.
+- **Red de seguridad, no flag**: timeout (`DEEP_AGENT_TIMEOUT=75s`), error o
+  respuesta vacía degradan a `_synthesize_simple` (el camino clásico de una
+  llamada). Rollback del feature = `git revert`.
+- Límites: `DEEP_AGENT_RECURSION_LIMIT=12`, `DEEP_AGENT_MAX_RETRIEVALS=4`,
+  `DEEP_AGENT_MODEL` (override; default = modelo del agente/`CHAT_MODEL`).
+- Contención de middleware: los built-ins de deepagents (todos/filesystem/
+  execute/subagents) están excluidos vía `HarnessProfile` (`deep_answer.py`).
+- ⚠️ **No definir** `LANGSMITH_TRACING` ni `LANGCHAIN_TRACING_V2`: deepagents
+  arrastra langsmith y la observabilidad de este proyecto es Langfuse (la traza
+  del loop aparece bajo el span `answer_node` como `deep_answer_agent`).
 
 ---
 

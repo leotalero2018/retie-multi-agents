@@ -1,9 +1,10 @@
 # app/agent/graph.py
 from __future__ import annotations
+import html
 import logging
 import re
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
-from typing import TypedDict, Optional, List, Dict, Any
+from typing import Callable, TypedDict, Optional, List, Dict, Any
 from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
@@ -19,7 +20,7 @@ from retie_agent.agent.prompt import (
     make_hybrid_prompt,
     SYSTEM_PROMPT_RETIE,
     SYSTEM_PROMPT_MEDIA,
-    CONDENSE_PROMPT,
+    QUERY_ENRICHMENT_PROMPT,
     format_history_for_condense,
 )
 from retie_agent.agent.retie_agent import _dedupe_hits, _resolve_collection, _resolve_model
@@ -28,11 +29,19 @@ from retie_agent.services.history import get_history, add_message
 from retie_agent.agent.notebooklm_client import NotebookLMClient, NotebookLMError, NotebookLMCache, NLM_RECOVERY_NEEDED
 from retie_agent.agent.gemini_client import GeminiFileSearchClient, GeminiError
 from retie_agent.agent.table_render import render_telegram_table, render_table_image
+from retie_agent.agent.deep_answer import (
+    run_deep_answer,
+    deep_tools_available,
+    NO_EVIDENCE_PHRASE,
+)
 from retie_agent.agent.intent import (
-    classify_intent,
+    classify_intent_v3,                   # clasificador único del grafo (classifier_node)
+    extract_entities,                     # ref de tabla para el lookup canónico
     _TABLE_RE, _FULL_RE, _SMALLTALK_RE,   # re-exportados para compatibilidad
     _wants_table, _wants_full,
+    _collapse_elongations,                # "graciaaas" → "gracias" (solo para regex)
 )
+from retie_agent.services.table_assets import CanonicalTable, lookup_table
 
 # Executor compartido para trabajo paralelo (Chroma + NotebookLM, enrichment con
 # timeout). Es persistente a propósito: un `with ThreadPoolExecutor(...)` espera
@@ -69,15 +78,18 @@ class GraphState(TypedDict, total=False):
     secondary_primary: str     # "notebooklm" | "gemini": cuál fuente secundaria alimenta answer_node
     search_query: Optional[str]  # standalone query (condensed from history) used for retrieval
     suggestions: List[str]  # follow-up questions offered to the user after the answer
-    intent: Optional[str]        # exhaustiva | tabla | puntual | smalltalk (TICKET-001)
-    intent_source: Optional[str]  # "regex" | "llm" — origen de la clasificación
+    intent: Optional[str]        # taxonomía v3 (v1: exhaustiva | tabla | puntual | smalltalk)
+    intent_source: Optional[str]  # "regex" | "llm" | "llm+escalated" (+"+guard")
+    intent_meta: Optional[Dict[str, Any]]  # IntentResultV3.to_state_meta(): response_format,
+                                           # output_length, complexity, needs_calculation,
+                                           # confidence, entities, requires_rag
     source: Optional[str]        # "text" | "image" | "voice" | "suggestion" — origen del mensaje
 
 
-# La detección de intención (tabla / exhaustiva / smalltalk) vive en
-# retie_agent/agent/intent.py: clasificador LLM barato + regex como fallback
-# (_TABLE_RE, _FULL_RE, _SMALLTALK_RE, _wants_table, _wants_full se importan arriba).
-# route_entry usa classify_intent() como fuente primaria de decisión.
+# La clasificación de intención vive en retie_agent/agent/intent.py
+# (classify_intent_v3: structured output + cascada + regex fallback; los regexes
+# _TABLE_RE, _FULL_RE, _SMALLTALK_RE, _wants_table, _wants_full se re-exportan
+# arriba por compatibilidad). classifier_node es quien la invoca.
 
 _SMALLTALK_THANKS_RE = re.compile(
     r"gracias|adi[oó]s|hasta\s+luego|chao|nos\s+vemos|ok|vale|listo|perfecto|genial|excelente",
@@ -97,7 +109,10 @@ _SMALLTALK_THANKS = "¡Con gusto! 🙌 Si tienes otra consulta sobre el RETIE o 
 
 def _node_smalltalk(state: GraphState) -> GraphState:
     q = state.get("question", "")
-    answer = _SMALLTALK_THANKS if _SMALLTALK_THANKS_RE.search(q) else _SMALLTALK_GREETING
+    # Alargamientos ("graciaaas") se normalizan solo para elegir la respuesta:
+    # sin esto, un agradecimiento alargado recibía el saludo de bienvenida.
+    is_thanks = _SMALLTALK_THANKS_RE.search(_collapse_elongations(q))
+    answer = _SMALLTALK_THANKS if is_thanks else _SMALLTALK_GREETING
     with span_ctx(None, "smalltalk_node", as_type="chain", span_input={"question": q}):
         return {"answer": answer}
 
@@ -117,6 +132,59 @@ def _node_clarify(state: GraphState) -> GraphState:
         return {"answer": _AMBIGUOUS_CLARIFY}
 
 
+# Consulta fuera del dominio RETIE/NTC 2050 (clasificada por el LLM con confianza
+# alta): cortesía fija SIN pagar el pipeline completo (query enrichment + 3
+# retrievals + answer + enrich + suggest). Solo se llega aquí pasando el triple
+# guardarraíl de intent.classify_intent_v3 (vía LLM + confianza ≥ INTENT_OOD_MIN_CONF).
+_OUT_OF_DOMAIN_MSG = (
+    "🙋 Soy un asistente especializado en normativa eléctrica colombiana "
+    "(RETIE y NTC 2050), así que sobre ese tema no puedo ayudarte.\n\n"
+    "Pregúntame, por ejemplo:\n"
+    "• ¿Qué exige el RETIE sobre puesta a tierra?\n"
+    "• Dame la tabla 220.55 de factores de demanda\n"
+    "• ¿Es obligatorio el GFCI en baños?"
+)
+
+
+def _node_out_of_domain(state: GraphState) -> GraphState:
+    q = state.get("question", "")
+    with span_ctx(None, "out_of_domain_node", as_type="chain", span_input={"question": q}):
+        return {"answer": _OUT_OF_DOMAIN_MSG}
+
+
+def _node_image_answer(state: GraphState) -> GraphState:
+    """Respuesta directa desde el contenido de una imagen (route == "image_direct").
+
+    El clasificador marcó fuera_de_dominio, pero la consulta proviene de una
+    imagen: lo leído por OCR/Vision viaja en la propia pregunta y suele contener
+    la respuesta (p. ej. la clase de una etiqueta de eficiencia energética).
+    Responde con el prompt de media en una sola llamada, sin RAG: ayuda con lo
+    visible y aclara en una frase si el tema pertenece a otro reglamento
+    (RETIQ, etc.). Si el LLM falla, cae al mensaje fijo de fuera de dominio
+    (el comportamiento previo a esta ruta).
+    """
+    q = state.get("question", "")
+    model = _resolve_model(state.get("agent_key"), explicit=None)
+    history = state.get("history") or []
+    with span_ctx(
+        None, "image_answer_node", as_type="chain",
+        span_input={"question": q, "model": model},
+    ) as span:
+        try:
+            answer = _synthesize_simple(q, [], "", history, model, False, False, media_only=True)
+        except Exception:
+            answer = ""
+        status = "ok" if (answer or "").strip() else "fallback_out_of_domain"
+        if not (answer or "").strip():
+            answer = _OUT_OF_DOMAIN_MSG
+        if span is not None:
+            try:
+                span.update(output={"answer": answer, "status": status})
+            except Exception:
+                pass
+        return {"answer": answer}
+
+
 def make_state(question: str, *, user_id: str = "anon", session: str = "default", agent_key: Optional[str] = None, history: Optional[List[Dict[str, str]]] = None, source: Optional[str] = None) -> GraphState:
     return {
         "question": (question or "").strip(),
@@ -128,6 +196,29 @@ def make_state(question: str, *, user_id: str = "anon", session: str = "default"
     }
 
 _client = OpenAI(api_key=getattr(settings, "OPENAI_API_KEY", None))
+
+ProgressCallback = Callable[[Dict[str, Any]], None]
+
+
+def _emit_progress(
+    progress_callback: Optional[ProgressCallback],
+    stage: str,
+    message: str,
+    **detail: Any,
+) -> None:
+    """Emite progreso estructurado sin acoplar el grafo a Telegram/Web/etc."""
+    if progress_callback is None:
+        return
+    try:
+        progress_callback({"stage": stage, "message": message, "detail": detail})
+    except Exception:
+        pass
+
+
+def _progress_from_config(config: Optional[Dict[str, Any]]) -> Optional[ProgressCallback]:
+    configurable = (config or {}).get("configurable") or {}
+    cb = configurable.get("progress_callback")
+    return cb if callable(cb) else None
 
 # ---------- Trace helpers ----------
 def _format_chunks_for_trace(hits: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -267,27 +358,41 @@ def _build_user_sources(hits: List[Dict[str, Any]], limit: int = 5):
 
 
 # ---------- Nodes ----------
-def _node_condense(state: GraphState) -> GraphState:
-    """Reescribe preguntas de seguimiento como preguntas autocontenidas.
+def _node_query_enrichment(state: GraphState) -> GraphState:
+    """Enriquece/desambigua la consulta ANTES del fan-out a las fuentes RAG.
 
-    "¿Y eso aplica en baja tensión?" no recupera nada útil en Chroma/NotebookLM
-    sin el contexto previo. Con historial, una llamada corta al LLM produce la
-    consulta de búsqueda; la pregunta original se conserva para el prompt final.
-    Sin historial (o con el flag apagado) es un pass-through sin costo.
+    Dos disparadores:
+      - Con historial: reescribe la pregunta de seguimiento como autocontenida
+        ("¿y eso aplica en baja tensión?" no recupera nada útil sin el contexto
+        previo) y expande siglas del dominio (SPT, DPS, GFCI…).
+      - Sin historial: solo si el classifier marcó complexity=high (mensaje
+        compuesto/ambiguo que se beneficia de la expansión).
+    En el resto de casos es un pass-through sin costo. La pregunta original se
+    conserva para el prompt final; aquí solo se produce `search_query`.
+
+    (Ex condense_node — renombrado en Fase 2 del plan v3; la responsabilidad
+    post-answer de pulir la redacción vive en enrich_node, que es otra cosa.)
     """
     q = state["question"]
     history = state.get("history") or []
+    meta = state.get("intent_meta") or {}
     enabled = as_bool(getattr(settings, "QUERY_REWRITE_ENABLED", "true"))
-    if not enabled or not history:
+    # Sin historial, la reescritura solo aporta cuando el mensaje es complejo.
+    force = meta.get("complexity") == "high"
+    if not enabled or not (history or force):
         return {"search_query": q}
 
     with span_ctx(
-        None, "condense_node", as_type="chain",
-        span_input={"question": q, "history_messages": len(history)},
+        None, "query_enrichment_node", as_type="chain",
+        span_input={
+            "question": q,
+            "history_messages": len(history),
+            "forced_by_complexity": force and not history,
+        },
     ) as span:
         search_query = q
         try:
-            prompt = CONDENSE_PROMPT.format(
+            prompt = QUERY_ENRICHMENT_PROMPT.format(
                 history=format_history_for_condense(history), question=q
             )
             resp = create_chat_completion(
@@ -302,7 +407,7 @@ def _node_condense(state: GraphState) -> GraphState:
             if rewritten and len(rewritten) <= max(300, len(q) * 4):
                 search_query = rewritten
         except Exception as exc:
-            logger.warning("condense_node failed, using original question: %s", exc)
+            logger.warning("query_enrichment_node failed, using original question: %s", exc)
 
         if span is not None:
             try:
@@ -313,6 +418,11 @@ def _node_condense(state: GraphState) -> GraphState:
             except Exception:
                 pass
         return {"search_query": search_query}
+
+
+# Alias legacy: scripts/imports externos que referencien el nombre anterior.
+# Retirar en el commit de limpieza de la Fase 5.
+_node_condense = _node_query_enrichment
 
 
 def _node_chromadb(state: GraphState) -> GraphState:
@@ -405,174 +515,320 @@ def _resolve_rag_sources() -> tuple:
     return True, nlm_on, False, "notebooklm"
 
 
-def _node_route_entry(state: GraphState) -> GraphState:
-    """Entry point: smalltalk directo, o recuperación (Chroma ± NLM/Gemini) en el resto.
+def _node_classifier(state: GraphState) -> GraphState:
+    """Entry point del grafo: clasifica la intención y publica IntentResultV3.
 
-    El bifurcado de fuentes secundarias NO se decide aquí: se publican los flags
-    `run_notebooklm` / `run_gemini` / `secondary_primary` en el estado y la
-    conditional edge desde condense_node (`_fanout_retrieval`) los usa para armar
-    el fan-out. `notebooklm_enabled` se conserva por compatibilidad.
+    Solo decide QUÉ quiere el usuario (intención + parámetros de entrega); la
+    resolución de fuentes RAG vive en route_entry. El clasificador v3 es el
+    único del grafo (structured output + cascada de modelos + fallback regex —
+    ver intent.classify_intent_v3). `is_media`: el contenido derivado de
+    imagen/voz nunca es smalltalk.
     """
     q = state.get("question", "")
-    run_chroma, run_nlm, run_gemini, secondary_primary = _resolve_rag_sources()
-    nlm_enabled = run_nlm
-    # Clasificador de intención (TICKET-001): LLM barato con fallback a regex.
-    # Reemplaza el ruteo por regex como fuente PRIMARIA de la decisión.
-    # `is_media`: el contenido derivado de imagen/voz nunca es smalltalk.
     is_media = state.get("source") in ("image", "voice")
-    intent = classify_intent(q, history=state.get("history"), is_media=is_media)
-    route = intent.route
-    wants_table = intent.wants_table
-    wants_full = intent.wants_full
+    channel = (state.get("metadata") or {}).get("channel", "telegram")
+    res = classify_intent_v3(
+        q, history=state.get("history"), is_media=is_media, channel=channel,
+        media_source=state.get("source"),
+    )
     with span_ctx(
-        None, "route_entry", as_type="chain",
-        span_input={
-            "nlm_enabled": nlm_enabled,
-            "run_chromadb": run_chroma,
-            "run_gemini": run_gemini,
-            "secondary_primary": secondary_primary,
-            "intent": intent.intent,
-            "intent_source": intent.source,
-            "wants_table": wants_table,
-            "wants_full": wants_full,
-        },
+        None, "classifier_node", as_type="chain",
+        span_input={"question": q, "source": state.get("source"), "channel": channel},
     ) as span:
         if span is not None:
             try:
                 span.update(output={
-                    "route": route,
-                    "intent": intent.intent,
-                    "intent_source": intent.source,
-                    "wants_table": wants_table,
-                    "wants_full": wants_full,
-                    "run_chromadb": run_chroma,
-                    "run_notebooklm": run_nlm,
-                    "run_gemini": run_gemini,
-                    "secondary_primary": secondary_primary,
+                    "intent": res.intent,
+                    "intent_source": res.source,
+                    "route": res.route,
+                    "confidence": res.confidence,
+                    "requires_rag": res.requires_rag,
+                    "response_format": res.response_format,
+                    "output_length": res.output_length,
+                    "complexity": res.complexity,
+                    "needs_calculation": res.needs_calculation,
+                    "entities": res.entities,
+                    "wants_table": res.wants_table,
+                    "wants_full": res.wants_full,
                 })
             except Exception:
                 pass
     return {
-        "route": route,
-        "wants_table": wants_table,
-        "wants_full": wants_full,
-        "intent": intent.intent,
-        "intent_source": intent.source,
-        "notebooklm_enabled": nlm_enabled,
+        "route": res.route,
+        "intent": res.intent,
+        "intent_source": res.source,
+        "intent_meta": res.to_state_meta(),
+        "wants_table": res.wants_table,
+        "wants_full": res.wants_full,
+    }
+
+
+def _node_route_entry(state: GraphState) -> GraphState:
+    """Resuelve CON QUÉ fuentes RAG se responde (SECONDARY_RAG_SOURCE + disponibilidad).
+
+    La clasificación de intención ya ocurrió en classifier_node (entry point).
+    Aquí solo se publican los flags que `_fanout_retrieval` usa para armar el
+    fan-out desde query_enrichment_node. `notebooklm_enabled` se conserva por
+    compatibilidad.
+    """
+    run_chroma, run_nlm, run_gemini, secondary_primary = _resolve_rag_sources()
+    flags = {
         "run_chromadb": run_chroma,
         "run_notebooklm": run_nlm,
         "run_gemini": run_gemini,
         "secondary_primary": secondary_primary,
     }
+    with span_ctx(
+        None, "route_entry", as_type="chain", span_input=flags,
+    ) as span:
+        if span is not None:
+            try:
+                span.update(output=flags)
+            except Exception:
+                pass
+    return {"notebooklm_enabled": run_nlm, **flags}
 
 
-def _node_answer(state: GraphState) -> GraphState:
-    q = state["question"]
-    agent_key = state.get("agent_key")
-    # Fan-in de las dos ramas de recuperación: cada nodo escribió en su propia
-    # clave (chromadb_docs / notebooklm_docs) sin solaparse. Aquí se combinan para
-    # el LLM y se derivan `hits`/`nlm_answer`, que consumen los nodos posteriores
-    # (table_node, stylist_node) tal como antes.
-    hits = state.get("chromadb_docs") or []
-    # Fuente secundaria que alimenta la respuesta: según SECONDARY_RAG_SOURCE, es
-    # NotebookLM o Gemini File Search (en modo "shadow" ambos corrieron, pero solo
-    # el `secondary_primary` entra al prompt; el otro queda en su span para
-    # comparar calidad). Se sigue exponiendo como `nlm_answer` para no tocar el
-    # contrato de table_node/stylist_node.
-    secondary_primary = state.get("secondary_primary", "notebooklm")
-    if secondary_primary == "gemini":
-        nlm_answer = (state.get("gemini_docs") or "").strip()
-    else:
-        nlm_answer = (state.get("notebooklm_docs") or "").strip()
-    source = state.get("source")
-
-    if not hits and not nlm_answer:
-        # Imagen/voz sin evidencia recuperada: el material a interpretar (texto
-        # OCR/Vision o transcripción) viaja en la propia pregunta, así que se
-        # responde desde ahí con un prompt dedicado en vez de cortar con el
-        # genérico "no tengo evidencia" (que ante una foto se sentía como ignorarla).
-        if source not in ("image", "voice"):
-            return {
-                "answer": "No tengo evidencia en los documentos.",
-                "hits": hits,
-                "nlm_answer": nlm_answer,
-                "route": "no_context",
-            }
-
-    model = _resolve_model(agent_key, explicit=None)
-    media_only = not hits and not nlm_answer
+def _synthesize_simple(
+    question: str,
+    hits: List[Dict[str, Any]],
+    nlm_answer: str,
+    history: List[Dict[str, str]],
+    model: str,
+    wants_table: bool,
+    wants_full: bool,
+    *,
+    media_only: bool = False,
+) -> str:
+    """Síntesis clásica de UNA llamada (el cuerpo del answer_node previo al deep
+    agent, extraído literal). Es la RED DE SEGURIDAD del deep agent — no un flag:
+    corre cuando el agente agota su presupuesto, falla o devuelve vacío, y también
+    resuelve el camino media_only (imagen/voz sin evidencia, sin agente)."""
     if media_only:
-        # El contenido de la imagen/voz ya está en `q` (lo compuso el router).
+        # El contenido de la imagen/voz ya está en `question` (lo compuso el router).
         sys = SYSTEM_PROMPT_MEDIA
-        prompt = q
+        prompt = question
     else:
         sys = SYSTEM_PROMPT_RETIE
         prompt = make_hybrid_prompt(
-            hits, nlm_answer, q,
-            is_admin=False,
-            wants_table=state.get("wants_table", False),
+            hits, nlm_answer, question, is_admin=False, wants_table=wants_table
         )
     messages = [{"role": "system", "content": sys}]
-    for msg in state.get("history", []):
+    for msg in history:
         messages.append(msg)
     messages.append({"role": "user", "content": prompt})
 
     temperature = 0.0
     # Tablas y respuestas exhaustivas (todos los numerales a–y) necesitan mucho
     # más presupuesto de salida; las respuestas normales conservan el default.
-    wants_table = state.get("wants_table", False)
-    wants_full = state.get("wants_full", False)
     default_max = getattr(settings, "MAX_TOKENS", 600)
     max_tokens = 4000 if (wants_table or wants_full) else default_max
+
+    resp = create_chat_completion(
+        _client,
+        model=model,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        messages=messages,
+    )
+    answer = (resp.choices[0].message.content or "").strip()
+
+    try:
+        usage = getattr(resp, "usage", None)
+        usage_dict = {
+            "input": getattr(usage, "prompt_tokens", None),
+            "output": getattr(usage, "completion_tokens", None),
+            "total": getattr(usage, "total_tokens", None),
+        }
+        log_generation(
+            None,
+            name="openai.chat",
+            input_text=messages,  # lista de mensajes → Langfuse la renderiza como chat
+            output_text=answer,
+            model=model,
+            usage=usage_dict,
+            metadata={
+                "context_chunks": len(hits),
+                "sources": [(h.get("meta", {}) or {}).get("source") for h in hits],
+                "media_only": media_only,
+            },
+            model_parameters={"temperature": temperature, "max_tokens": max_tokens},
+        )
+    except Exception:
+        pass
+    return answer
+
+
+def _node_answer(state: GraphState, config=None) -> GraphState:
+    """Orquestador del deep agent (Fase 4 del plan v3).
+
+    Fan-in de las ramas de recuperación (cada una escribió su clave propia:
+    chromadb_docs / notebooklm_docs / gemini_docs) y delegación en el deep agent
+    (deep_answer.run_deep_answer), que puede re-consultar las fuentes con
+    queries refinadas si la evidencia inicial no basta. Timeout / error /
+    respuesta vacía degradan a _synthesize_simple (el camino clásico) sin
+    exponer el fallo al usuario.
+
+    CONTRATO INTOCABLE del nodo: {"answer", "hits", "nlm_answer", "route"} —
+    table_node consume answer+hits+nlm_answer, stylist_node arma las citas desde
+    hits y _after_answer rutea por route. `config` lo inyecta langgraph con el
+    CallbackHandler de Langfuse; pasarlo al agente es imprescindible (corre en
+    otro thread; sin él la traza del subgrafo se corta).
+    """
+    q = state["question"]
+    agent_key = state.get("agent_key")
+    hits = state.get("chromadb_docs") or []
+    # Fuente secundaria que alimenta la respuesta: según SECONDARY_RAG_SOURCE, es
+    # NotebookLM o Gemini File Search (en "shadow" ambos corrieron, pero solo el
+    # `secondary_primary` entra al agente; el otro queda en su span). Se sigue
+    # exponiendo como `nlm_answer` para no tocar el contrato de table/stylist.
+    secondary_primary = state.get("secondary_primary", "notebooklm")
+    if secondary_primary == "gemini":
+        nlm_answer = (state.get("gemini_docs") or "").strip()
+    else:
+        nlm_answer = (state.get("notebooklm_docs") or "").strip()
+    source = state.get("source")
+    wants_table = state.get("wants_table", False)
+    wants_full = state.get("wants_full", False)
+    model = _resolve_model(agent_key, explicit=None)
+    history = state.get("history") or []
+    progress_callback = _progress_from_config(config)
+
+    no_evidence = not hits and not nlm_answer
+
+    # Imagen/voz sin evidencia recuperada: el material a interpretar (OCR/Vision
+    # o transcripción) viaja en la propia pregunta → prompt dedicado, SIN agente.
+    if no_evidence and source in ("image", "voice"):
+        _emit_progress(
+            progress_callback,
+            "media_answer",
+            "🖼️ Analizando el contenido enviado y preparando respuesta…"
+            if source == "image"
+            else "🎙️ Revisando la transcripción y preparando respuesta…",
+            source=source,
+        )
+        with span_ctx(
+            None, "answer_node",
+            {"model": model, "context_chunks": 0, "agent_key": agent_key or "default"},
+            as_type="chain",
+            span_input={"question": q, "media_only": True},
+        ) as span:
+            answer = _synthesize_simple(
+                q, [], "", history, model, False, False, media_only=True
+            )
+            if span is not None:
+                try:
+                    span.update(output={"answer": answer, "status": "media_only"})
+                except Exception:
+                    pass
+            return {"answer": answer, "hits": hits, "nlm_answer": nlm_answer, "route": "answer"}
+
+    # Sin evidencia inicial Y sin ninguna tool de re-consulta → corte temprano
+    # (como el grafo clásico). CAMBIO DELIBERADO respecto al grafo previo: sin
+    # evidencia pero CON tools, el agente corre — puede reformular y encontrar.
+    if no_evidence and not deep_tools_available():
+        _emit_progress(
+            progress_callback,
+            "no_evidence",
+            "🔎 No encontré evidencia suficiente en las fuentes disponibles…",
+        )
+        return {
+            "answer": NO_EVIDENCE_PHRASE,
+            "hits": hits,
+            "nlm_answer": nlm_answer,
+            "route": "no_context",
+        }
 
     with span_ctx(
         None, "answer_node",
         {"model": model, "context_chunks": len(hits), "agent_key": agent_key or "default"},
         as_type="chain",
-        span_input={"question": q},
+        span_input={"question": q, "intent": state.get("intent")},
     ) as span:
-        resp = create_chat_completion(
-            _client,
-            model=model,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            messages=messages,
+        _emit_progress(
+            progress_callback,
+            "answer_node",
+            "🧠 Preparando análisis normativo con las fuentes recuperadas…",
+            hits=len(hits),
+            has_secondary=bool(nlm_answer),
+            intent=state.get("intent"),
         )
-        answer = (resp.choices[0].message.content or "").strip()
+        result = run_deep_answer(
+            q,
+            initial_hits=hits,
+            secondary_answer=nlm_answer,
+            history=history,
+            agent_key=agent_key,
+            intent=state.get("intent"),
+            intent_meta=state.get("intent_meta"),
+            wants_table=wants_table,
+            wants_full=wants_full,
+            model=model,
+            config=config,
+            progress_callback=progress_callback,
+        )
+        answer = result.answer
+        status = result.status
+
+        if status != "ok" or not answer.strip():
+            # Red de seguridad (no flag): el camino clásico de una sola llamada.
+            if no_evidence:
+                answer = NO_EVIDENCE_PHRASE
+            else:
+                try:
+                    _emit_progress(
+                        progress_callback,
+                        "fallback_simple",
+                        "✍️ Preparando respuesta de respaldo con la evidencia disponible…",
+                        status=status,
+                    )
+                    answer = _synthesize_simple(
+                        q, hits, nlm_answer, history, model, wants_table, wants_full
+                    )
+                    status = f"{status}->simple"
+                except Exception as exc:
+                    logger.warning("answer_node: síntesis simple también falló: %s", exc)
+                    answer = NO_EVIDENCE_PHRASE
+
+        # hits = iniciales + acumulados por las tools del agente (deduplicados):
+        # las citas del stylist y el contexto crudo del table_node salen de aquí.
+        all_hits = _dedupe_hits(hits + result.hits) if result.hits else hits
 
         try:
-            usage = getattr(resp, "usage", None)
-            usage_dict = {
-                "input": getattr(usage, "prompt_tokens", None),
-                "output": getattr(usage, "completion_tokens", None),
-                "total": getattr(usage, "total_tokens", None),
-            }
             log_generation(
                 None,
-                name="openai.chat",
-                input_text=messages,  # lista de mensajes → Langfuse la renderiza como chat
+                name="deep_answer_agent",
+                input_text=q,
                 output_text=answer,
                 model=model,
-                usage=usage_dict,
+                usage=result.usage,
                 metadata={
                     "agent_key": agent_key or "default",
-                    "context_chunks": len(hits),
-                    "sources": [(h.get("meta", {}) or {}).get("source") for h in hits],
+                    "status": status,
+                    "skill": result.skill,
+                    "tool_calls": result.tool_calls,
+                    "n_hits_inicial": len(hits),
+                    "n_hits_final": len(all_hits),
                 },
-                model_parameters={"temperature": temperature, "max_tokens": max_tokens},
             )
         except Exception:
             pass
 
         if span is not None:
             try:
-                span.update(output={"answer": answer})
+                span.update(output={
+                    "answer": answer,
+                    "status": status,
+                    "skill": result.skill,
+                    "tool_calls": result.tool_calls,
+                    "n_hits_inicial": len(hits),
+                    "n_hits_final": len(all_hits),
+                })
             except Exception:
                 pass
 
-        # `hits`/`nlm_answer` se exponen para los nodos posteriores (table_node usa
-        # los chunks crudos y la nota de "tabla parcial"; stylist_node arma las citas).
-        return {"answer": answer, "hits": hits, "nlm_answer": nlm_answer, "route": "answer"}
+        route = "no_context" if answer.strip() == NO_EVIDENCE_PHRASE else "answer"
+        return {"answer": answer, "hits": all_hits, "nlm_answer": nlm_answer, "route": route}
 
 def _node_no_context(_state: GraphState) -> GraphState:
     with span_ctx(None, "no_context", as_type="chain"):
@@ -1043,9 +1299,124 @@ _TABLE_INCOMPLETE_NOTE = (
 _TABLE_RAW_CONTEXT_CHARS = 24000
 
 
+def _requested_table_ref(state: GraphState) -> Optional[str]:
+    """Referencia de tabla pedida por el usuario: primero las entidades del
+    classifier (intent_meta), si no, extracción regex directa de la pregunta."""
+    meta = state.get("intent_meta") or {}
+    for e in meta.get("entities") or []:
+        if isinstance(e, dict) and e.get("type") == "tabla" and e.get("value"):
+            return str(e["value"])
+    try:
+        for e in extract_entities(state.get("question", "")):
+            if e.get("type") == "tabla" and e.get("value"):
+                return e["value"]
+    except Exception:
+        pass
+    return None
+
+
+def _serve_canonical_table(canonical: CanonicalTable, state: GraphState) -> Optional[GraphState]:
+    """Entrega la tabla desde el activo canónico del índice v2 (cero LLM).
+
+    - estado verificada/extraida con JSON → render PNG desde headers/rows
+      canónicos (cada valor en su columna, cero filas faltantes por diseño).
+    - estado solo_imagen → el PNG original del PDF (fidelidad 100 %).
+    - revision / sin datos → None: el llamador cae al camino LLM.
+    Los footnotes y la línea "Fuente" (notes del JSON) van en el caption.
+    """
+    question = state.get("question", "")
+    title = canonical.titulo or f"Tabla {canonical.tabla_id}"
+
+    # Entrada de un índice previo al fix de IDs truncados (la referencia es más
+    # específica que el id registrado): su JSON puede ser OTRA tabla (las
+    # variantes .a/.b se fusionaban bajo un id). No confiable → camino LLM.
+    if canonical.match == "ref_extends_stored":
+        return None
+
+    image: Optional[bytes] = None
+    final_text: Optional[str] = None
+    status: Optional[str] = None
+
+    if canonical.estado in ("verificada", "extraida") and canonical.headers and canonical.rows:
+        caption = f"📊 Tabla {canonical.tabla_id}"
+        clean_title = title.strip()
+        if clean_title and not clean_title.lower().startswith(f"tabla {canonical.tabla_id}".lower()):
+            caption += f" — {clean_title}"
+        try:
+            image = render_table_image(canonical.headers, canonical.rows, title=title)
+            final_text = caption
+            status = "canonical_json"
+        except Exception as img_exc:
+            logger.warning("tabla canónica %s: render de imagen falló, tabla de texto: %s",
+                           canonical.tabla_id, img_exc)
+            final_text = render_telegram_table(canonical.headers, canonical.rows)
+            status = "canonical_text"
+        if canonical.notes:
+            final_text += "\n\n" + canonical.notes.strip()[:400]
+    elif canonical.estado == "solo_imagen" and canonical.png_path is not None:
+        try:
+            image = canonical.png_path.read_bytes()
+            final_text = f"📊 Tabla {canonical.tabla_id} (imagen original del documento)"
+            status = "canonical_png"
+        except Exception:
+            return None
+    else:
+        return None
+
+    with span_ctx(
+        None, "table_node", {"tabla_id": canonical.tabla_id},
+        as_type="chain",
+        span_input={"question": question, "tabla_id": canonical.tabla_id},
+    ) as span:
+        if span is not None:
+            try:
+                span.update(
+                    output={"preview": final_text[:200], "has_image": image is not None},
+                    metadata={
+                        "status": status,
+                        "doc_id": canonical.doc_id,
+                        "estado_extraccion": canonical.estado,
+                        "n_filas": len(canonical.rows),
+                        "n_cols": len(canonical.headers),
+                    },
+                )
+            except Exception:
+                pass
+        try:
+            log_generation(
+                None, name="table_node", input_text=question, output_text=final_text,
+                model="canonical_asset",
+                metadata={"status": status, "tabla_id": canonical.tabla_id,
+                          "has_image": image is not None},
+            )
+        except Exception:
+            pass
+
+    out: GraphState = {"answer": final_text, "route": "stylist_node"}
+    if image is not None:
+        out["table_image"] = image
+    return out
+
+
 def _node_table(state: GraphState) -> GraphState:
     base_answer = state.get("answer", "") or ""
     question = state.get("question", "")
+
+    # ── Camino canónico (índice v2): la tabla se sirve como unidad atómica ────
+    # desde el registro de activos (JSON estructurado en la indexación o PNG
+    # original), en vez de que un LLM la RECONSTRUYA adivinando desde chunks de
+    # texto plano — que es como se perdían filas y se corrían columnas.
+    ref = _requested_table_ref(state)
+    if ref:
+        try:
+            canonical = lookup_table(ref)
+        except Exception:
+            canonical = None
+        if canonical is not None:
+            served = _serve_canonical_table(canonical, state)
+            if served is not None:
+                return served
+
     if not base_answer.strip():
         return {"answer": base_answer, "route": "stylist_node"}
 
@@ -1374,6 +1745,118 @@ def _utcnow_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+_HTML_PLACEHOLDER = "\x00HTML{}\x00"
+_TELEGRAM_PRE_RE = re.compile(r"<pre\b[^>]*>.*?</pre>", re.IGNORECASE | re.DOTALL)
+_MARKDOWN_FENCE_RE = re.compile(r"```(?:[^\n`]*)\n?(.*?)```", re.DOTALL)
+_MARKDOWN_LINK_RE = re.compile(r"\[([^\]\n]+)\]\((https?://[^)\s]+)\)")
+
+
+def _protect_html_block(blocks: List[str], value: str) -> str:
+    token = _HTML_PLACEHOLDER.format(len(blocks))
+    blocks.append(value)
+    return token
+
+
+def _restore_html_blocks(text: str, blocks: List[str]) -> str:
+    for i, block in enumerate(blocks):
+        text = text.replace(_HTML_PLACEHOLDER.format(i), block)
+    return text
+
+
+def _format_markdownish_as_telegram_html(text: str) -> str:
+    """Convierte una respuesta interna tipo Markdown a HTML seguro de Telegram.
+
+    El resto del sistema usa `response_format=markdown` como formato lógico, pero
+    el bot de Telegram está en `parse_mode=HTML`. Esta función es deliberadamente
+    conservadora: preserva bloques `<pre>` ya renderizados por `table_node`,
+    convierte solo Markdown común y escapa todo lo demás.
+    """
+    raw = str(text or "")
+    if not raw:
+        return ""
+
+    blocks: List[str] = []
+
+    # 1) Preservar tablas ya generadas como HTML seguro (<pre>...</pre>).
+    raw = _TELEGRAM_PRE_RE.sub(
+        lambda m: _protect_html_block(blocks, m.group(0)),
+        raw,
+    )
+
+    # 2) Convertir fenced code Markdown en <pre> escapado.
+    raw = _MARKDOWN_FENCE_RE.sub(
+        lambda m: _protect_html_block(blocks, f"<pre>{html.escape(m.group(1).strip())}</pre>"),
+        raw,
+    )
+
+    # 3) Convertir enlaces seguros a <a>; el texto y href van escapados.
+    def _link_repl(match: re.Match[str]) -> str:
+        label = html.escape(match.group(1).strip())
+        href = html.escape(match.group(2).strip(), quote=True)
+        return _protect_html_block(blocks, f'<a href="{href}">{label}</a>')
+
+    raw = _MARKDOWN_LINK_RE.sub(_link_repl, raw)
+
+    # 4) Escapar todo el texto libre antes de reinsertar markup propio.
+    escaped = html.escape(raw)
+
+    # 5) Títulos Markdown → negrilla Telegram. No hay <h1>/<h2> en Telegram.
+    escaped = re.sub(
+        r"(?m)^\s{0,3}#{1,6}\s+(.+?)\s*$",
+        lambda m: f"<b>{m.group(1).strip()}</b>",
+        escaped,
+    )
+
+    # 6) Énfasis Markdown básico. Se evita tocar saltos de línea para no comerse
+    # listas/tablas; Telegram acepta <b>/<i>/<code>.
+    escaped = re.sub(r"`([^`\n]+)`", r"<code>\1</code>", escaped)
+    escaped = re.sub(r"\*\*([^*\n]+)\*\*", r"<b>\1</b>", escaped)
+    escaped = re.sub(r"__([^_\n]+)__", r"<b>\1</b>", escaped)
+    escaped = re.sub(r"(?<!\*)\*([^*\n]+)\*(?!\*)", r"<i>\1</i>", escaped)
+    escaped = re.sub(r"(?<!\w)_([^_\n]+)_(?!\w)", r"<i>\1</i>", escaped)
+
+    # 7) Bullets Markdown → bullets más naturales en clientes móviles.
+    escaped = re.sub(r"(?m)^(\s*)[-+]\s+", r"\1• ", escaped)
+
+    return _restore_html_blocks(escaped, blocks)
+
+
+def _format_as_whatsapp_text(text: str) -> str:
+    """Salida textual portable para WhatsApp.
+
+    WhatsApp usa una variante simple de Markdown. Mantener texto casi plano evita
+    llevar HTML de Telegram a otros canales; los títulos Markdown siguen siendo
+    legibles y las tablas <pre> se degradan a texto.
+    """
+    raw = str(text or "")
+    raw = re.sub(r"</?pre\b[^>]*>", "```", raw, flags=re.IGNORECASE)
+    raw = re.sub(r"<[^>]+>", "", raw)
+    return html.unescape(raw).strip()
+
+
+def _format_as_web_html(text: str) -> str:
+    """HTML básico y seguro para superficies web futuras."""
+    telegram_html = _format_markdownish_as_telegram_html(text)
+    paragraphs = [
+        p.replace("\n", "<br>")
+        for p in re.split(r"\n{2,}", telegram_html)
+        if p.strip()
+    ]
+    return "\n".join(f"<p>{p}</p>" for p in paragraphs)
+
+
+def _format_for_channel(text: str, channel: str) -> tuple[str, str]:
+    """Devuelve `(texto_formateado, formato)` según el canal de entrega."""
+    normalized = (channel or "telegram").lower()
+    if normalized == "telegram":
+        return _format_markdownish_as_telegram_html(text), "telegram_html"
+    if normalized == "whatsapp":
+        return _format_as_whatsapp_text(text), "whatsapp_text"
+    if normalized == "web":
+        return _format_as_web_html(text), "web_html"
+    return str(text or ""), "plain_text"
+
+
 def _node_stylist(state: GraphState) -> GraphState:
     """
     Post-processing node that prepares the enriched response for downstream delivery.
@@ -1396,25 +1879,26 @@ def _node_stylist(state: GraphState) -> GraphState:
         "stylist_node",
         {"channel": channel},
         as_type="chain",
-    ):
+        span_input={
+            "question": question,
+            "channel": channel,
+            "answer_preview": str(enriched_answer or "")[:2000],
+            "sources_count": len(hits),
+            "has_image": table_image is not None,
+        },
+    ) as span:
         try:
-            # Simple rules: add emojis, Markdown, or remove unsupported tags depending on channel
-            if channel == "telegram":
-                styled_text = enriched_answer  # Telegram already supports Markdown/HTML
-            elif channel == "whatsapp":
-                styled_text = enriched_answer.replace("*", "").replace("_", "")
-            elif channel == "web":
-                styled_text = f"<p>{enriched_answer}</p>"
-            else:
-                styled_text = enriched_answer
+            styled_text, output_format = _format_for_channel(enriched_answer, channel)
+            styled_sources_text, _ = _format_for_channel(sources_text, channel)
 
             # Unified JSON payload (future-proof)
             styled_payload = {
                 "channel": channel,
+                "format": output_format,
                 "user_message": question,
                 "formatted_response": styled_text,
                 "sources": sources,
-                "sources_text": sources_text,
+                "sources_text": styled_sources_text,
                 "suggestions": state.get("suggestions") or [],
                 "image": table_image,  # PNG bytes → router sends it as a photo
                 "timestamp": _utcnow_iso(),
@@ -1425,6 +1909,7 @@ def _node_stylist(state: GraphState) -> GraphState:
         except Exception as e:
             styled_payload = {
                 "channel": channel,
+                "format": "plain_text",
                 "user_message": question,
                 "formatted_response": enriched_answer,
                 "sources": sources,
@@ -1435,6 +1920,18 @@ def _node_stylist(state: GraphState) -> GraphState:
                 "timestamp": _utcnow_iso(),
             }
             status = "fallback"
+
+        # Dejar el resultado visible en el nodo del árbol de Langfuse. Sin esto,
+        # el span existe pero la UI muestra Output=undefined; `log_generation`
+        # registra otra observación hija, no el output del nodo seleccionado.
+        if span is not None:
+            try:
+                span_output = {k: v for k, v in styled_payload.items() if k != "image"}
+                span_output["image"] = f"<{len(table_image)} bytes PNG>" if table_image else None
+                span_output["status"] = status
+                span.update(output=span_output)
+            except Exception:
+                pass
 
         # Log to Langfuse for visibility (sin los bytes crudos de la imagen)
         try:
@@ -1468,8 +1965,11 @@ def build_graph():
         return _COMPILED.app
 
     g = StateGraph(GraphState)
+    g.add_node("classifier_node", _node_classifier)
     g.add_node("route_entry", _node_route_entry)
-    g.add_node("condense_node", _node_condense)
+    g.add_node("out_of_domain_node", _node_out_of_domain)
+    g.add_node("image_answer_node", _node_image_answer)
+    g.add_node("query_enrichment_node", _node_query_enrichment)
     # Ramas de recuperación INDEPENDIENTES → cada una genera su propio span en
     # Langfuse (chromadb_node vs notebooklm_node), con su salida en clave propia.
     g.add_node("chromadb_node", _node_chromadb)
@@ -1484,29 +1984,41 @@ def build_graph():
     g.add_node("clarify_node", _node_clarify)
     g.add_node("suggest_node", _node_suggest)
 
-    # Entry: smalltalk responde directo; lo demás pasa por condense_node
-    # (reescritura de seguimiento) y de ahí al fan-out de recuperación.
-    g.set_entry_point("route_entry")
+    # Entry: classifier_node decide QUÉ quiere el usuario. Los short-circuits
+    # (smalltalk / ambiguous / fuera de dominio) responden con mensaje fijo sin
+    # pagar RAG; image_direct responde desde el contenido leído de la imagen
+    # (una llamada LLM, sin RAG); el resto pasa por route_entry (fuentes) →
+    # query_enrichment_node (consulta autocontenida) → fan-out de recuperación.
+    g.set_entry_point("classifier_node")
 
-    def _entry_branch(s: GraphState) -> str:
+    def _after_classifier(s: GraphState) -> str:
         route = s.get("route")
         if route == "smalltalk":
             return "smalltalk"
         if route == "ambiguous":
             return "ambiguous"
-        return "condense"
+        if route == "out_of_domain":
+            return "out_of_domain"
+        if route == "image_direct":
+            return "image_direct"
+        return "route_entry"
 
     g.add_conditional_edges(
-        "route_entry",
-        _entry_branch,
+        "classifier_node",
+        _after_classifier,
         {
             "smalltalk": "smalltalk_node",
             "ambiguous": "clarify_node",
-            "condense": "condense_node",
+            "out_of_domain": "out_of_domain_node",
+            "image_direct": "image_answer_node",
+            "route_entry": "route_entry",
         },
     )
     g.add_edge("smalltalk_node", "stylist_node")
     g.add_edge("clarify_node", "stylist_node")
+    g.add_edge("out_of_domain_node", "stylist_node")
+    g.add_edge("image_answer_node", "stylist_node")
+    g.add_edge("route_entry", "query_enrichment_node")
 
     # ── Fan-out de recuperación (ramas paralelas que convergen) ──────────────
     # La conditional edge devuelve la LISTA de ramas a ejecutar según los flags
@@ -1533,7 +2045,7 @@ def build_graph():
         return targets or ["chromadb_node"]
 
     g.add_conditional_edges(
-        "condense_node",
+        "query_enrichment_node",
         _fanout_retrieval,
         {
             "chromadb_node": "chromadb_node",
@@ -1576,8 +2088,8 @@ def build_graph():
     g.add_edge("enrich_node", "suggest_node")
     g.add_edge("table_node", "suggest_node")
     g.add_edge("suggest_node", "stylist_node")
+    g.add_edge("no_context", "stylist_node")
     g.add_edge("stylist_node", END)
-    g.add_edge("no_context", END)
 
     app = g.compile()
     _COMPILED = _Compiled(app=app)

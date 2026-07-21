@@ -38,11 +38,22 @@ class Settings(BaseSettings):
     CHAT_MODEL: str = "gpt-5.4-nano-2026-03-17"
     MAX_TOKENS: int = 600
 
-    # --- Clasificación de intención (TICKET-001) ---
-    # Clasificador LLM barato con salida {exhaustiva, tabla, puntual, smalltalk}.
-    # "false" → solo el regex ampliado (fallback determinístico, sin red).
+    # --- Clasificación de intención 
     INTENT_LLM_ENABLED: str = "true"
     INTENT_MODEL: str = "gpt-5.4-nano-2026-03-17"              # modelo barato para clasificar
+
+    # --- Classifier v3 (classifier_node — FINAL_IMPLEMENTATION_NODES §4) ---
+    # Clasificador ÚNICO del grafo (sin flag: v3 es el definitivo). Salida
+    # estructurada IntentV3 (taxonomía ampliada + response_format/output_length
+    # + entidades) con cascada de modelos y fallback regex sin red.
+    INTENT_V3_MODEL: Optional[str] = None            # None → INTENT_MODEL
+    # Cascada: los casos dudosos se re-clasifican con un modelo potente. None → sin cascada.
+    INTENT_V3_ESCALATION_MODEL: Optional[str] = None
+    INTENT_V3_ESCALATION_CONF: float = 0.7           # confidence < esto → escala
+    INTENT_V3_SENSITIVE_CONF: float = 0.85           # umbral extra para intents sensibles
+    # fuera_de_dominio solo corta el pipeline si vino del LLM con esta confianza mínima.
+    INTENT_OOD_MIN_CONF: float = 0.8
+    INTENT_V3_MAX_TOKENS: int = 200                  # presupuesto del JSON del classifier
 
     # --- RAG / Chroma ---
     CHROMA_PERSIST_DIR: str = "data/chroma_db"     # primary
@@ -132,6 +143,17 @@ class Settings(BaseSettings):
     # cookies) y sube el browser_state renovado a MinIO. Mantiene viva una
     # sesión VÁLIDA indefinidamente sin uploads manuales. 0 = desactivado.
     NOTEBOOKLM_KEEPALIVE_MINUTES: int = 240
+
+    # --- Deep agent (answer_node — Fase 4 del plan v3) ---
+    # Loop ReAct acotado (deepagents) dentro de answer_node: evalúa la evidencia
+    # del fan-in y re-consulta con queries refinadas si falta información.
+    # Sin flag de activación (decisión fija D1): rollback = git revert; la red de
+    # seguridad en runtime es _synthesize_simple (timeout/error → camino clásico).
+    DEEP_AGENT_TIMEOUT: float = 75.0        # tope duro; al vencer → _synthesize_simple
+    DEEP_AGENT_RECURSION_LIMIT: int = 12    # recursion_limit del subgrafo deepagents
+    DEEP_AGENT_MAX_RETRIEVALS: int = 4      # tope de re-consultas (inyectado en el prompt)
+    DEEP_AGENT_MODEL: Optional[str] = None  # override; None → _resolve_model(agent_key)
+    DEEP_AGENT_MAX_TOKENS: int = 1600       # síntesis base (skills/tabla suben a 4000)
 
     # --- Fuentes de recuperación: Chroma / NotebookLM / Gemini File Search ---
     # Selecciona qué fuentes corren en el fan-out y cuál secundaria alimenta answer_node:

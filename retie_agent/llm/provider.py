@@ -85,8 +85,9 @@ def _build_openai_client():
     from openai import OpenAI
 
     # Optional proxy + custom base URL (Azure/OpenRouter/etc.)
+    # httpx 0.28 eliminó el kwarg `proxies`; el singular `proxy` existe desde 0.26.
     proxy = os.getenv("HTTPS_PROXY") or os.getenv("HTTP_PROXY") or None
-    http_client = httpx.Client(proxies=proxy, timeout=60) if proxy else None
+    http_client = httpx.Client(proxy=proxy, timeout=60) if proxy else None
     base_url = os.getenv("OPENAI_BASE_URL") or None
 
     api_key = (

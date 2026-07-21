@@ -29,11 +29,25 @@ log = logging.getLogger(__name__)
 
 # Anclas de DEFINICIÓN de tabla: la línea EMPIEZA con "Tabla N" (las menciones
 # inline "véase la Tabla N" no abren tabla).
-_ANCHOR_RE = re.compile(r"^\s*Tabla\s+(\d+(?:[.\-]\d+)*(?:\([a-z]\))?)\b(.*)", re.IGNORECASE)
+# El ID debe capturar el SUFIJO DE LETRA: RETIE usa "Tabla 2.3.26.2.2.1.a" y
+# NTC "Tabla 392.10 (A)". Truncarlo fusionaba las tablas .a/.b bajo un mismo
+# id (solo sobrevivía la primera región → se extraía la tabla equivocada) y
+# rompía el lookup canónico por identificador en runtime.
+# El sufijo ".a" se exige en minúscula ((?-i:...)) para no capturar ".A" de un
+# título que empiece con mayúscula pegada al punto.
+_ANCHOR_RE = re.compile(
+    r"^\s*Tabla\s+(\d+(?:[.\-]\d+)*(?:\.(?-i:[a-zñ])\b|\s*\((?-i:[A-Za-zñ])\))?)(.*)",
+    re.IGNORECASE,
+)
 _CONT_RE = re.compile(r"continuaci[oó]n", re.IGNORECASE)
 
 _MIN_ROWS = 2
 _MIN_COLS = 2
+
+# Versión del extractor: participa del hash_region para que un cambio de lógica
+# invalide el caché de extracciones previas (sin esto, una tabla mal extraída
+# con la lógica vieja quedaría congelada para siempre por el cache-hit).
+_EXTRACTION_VERSION = "v3"
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -49,7 +63,8 @@ def find_anchors(pages_text: Dict[str, str]) -> List[Dict[str, Any]]:
                 continue
             rest = (m.group(2) or "").strip(" .–-:")
             anchors.append({
-                "tabla_id": m.group(1),
+                # "392.10 (A)" → "392.10(A)": id canónico sin espacios internos.
+                "tabla_id": re.sub(r"\s+", "", m.group(1)),
                 "page": int(pno_s),
                 "titulo": rest[:160],
                 "is_continuation": bool(_CONT_RE.search(rest)),
@@ -120,16 +135,134 @@ def render_region_png(page: fitz.Page, rect: fitz.Rect, dpi: int) -> bytes:
 # ──────────────────────────────────────────────────────────────────────────────
 # Extracción geométrica (pdfplumber)
 # ──────────────────────────────────────────────────────────────────────────────
+# Celda "de datos": solo dígitos/puntuación numérica/rangos ("458", "65,4",
+# "26-30", "1,5 – (30 Sd)" NO — contiene letras → no matchea, correcto: es dato
+# pero con letras; el guard numérico solo sirve para descartar filas de datos
+# como candidatas a subheader).
+_NUMERIC_CELL_RE = re.compile(r"^[\d.,\s%–\-—()]+$")
+_SUBHEADER_MAX_LEN = 30
+
+
+def _is_subheader_row(header: List[str], row: List[str]) -> bool:
+    """¿`row` es una fila de SUBCOLUMNAS del header multinivel?
+
+    Señales exigidas (todas):
+      - el nivel superior tiene celdas vacías (spans de un padre combinado);
+      - `row` llena al menos una de esas columnas vacías (complementariedad);
+      - las celdas llenas de `row` son etiquetas cortas (unidades tipo gr/m²,
+        µm, kV) — ninguna es un valor numérico puro ni una oración.
+    Una fila de datos ("Pletinas y láminas | 458 | 65,4 | …") tiene celdas
+    numéricas → jamás se absorbe como subheader.
+    """
+    if not any(h == "" for h in header):
+        return False
+    filled = [c for c in row if c]
+    if not filled:
+        return False
+    if any(_NUMERIC_CELL_RE.match(c) for c in filled):
+        return False
+    if not all(len(c) <= _SUBHEADER_MAX_LEN and not re.search(r"[.;:]\s", c) for c in filled):
+        return False
+    n = min(len(header), len(row))
+    return any(header[j] == "" and row[j] for j in range(n))
+
+
+def _ffill(row: List[str]) -> List[str]:
+    """Colspan reconstruido: un padre combinado abarca las celdas vacías a su
+    derecha ("PROMEDIO", "" → "PROMEDIO", "PROMEDIO")."""
+    out: List[str] = []
+    last = ""
+    for c in row:
+        if c:
+            last = c
+        out.append(last)
+    return out
+
+
+def merge_multilevel_headers(
+    rows: List[List[str]], max_levels: int = 3
+) -> Tuple[List[str], List[List[str]]]:
+    """Devuelve (headers, body) fusionando headers de 2-3 niveles.
+
+    "PROMEDIO" que abarca (gr/m², µm) produce los headers compuestos
+    "PROMEDIO gr/m²" y "PROMEDIO µm" — un header por columna de datos, que es
+    el contrato del JSON canónico. Un header plano pasa intacto (rows[0]).
+    """
+    if not rows:
+        return [], []
+    if len(rows) < 2:
+        return rows[0], []
+
+    levels = [rows[0]]
+    idx = 1
+    # rows[idx] puede absorberse como nivel de header mientras quede al menos
+    # una fila de datos después (len(rows) - 1).
+    while idx < len(rows) - 1 and len(levels) < max_levels and _is_subheader_row(levels[-1], rows[idx]):
+        levels.append(rows[idx])
+        idx += 1
+
+    if len(levels) == 1:
+        return rows[0], rows[1:]
+
+    ncol = max(len(lv) for lv in levels)
+    parents = [_ffill(lv) for lv in levels[:-1]]
+    last = levels[-1]
+    headers: List[str] = []
+    for j in range(ncol):
+        parts: List[str] = []
+        for lv in parents:
+            v = lv[j] if j < len(lv) else ""
+            if v and (not parts or parts[-1] != v):
+                parts.append(v)
+        v = last[j] if j < len(last) else ""
+        if v and (not parts or parts[-1] != v):
+            parts.append(v)
+        headers.append(" ".join(parts).strip())
+    return headers, rows[idx:]
+
+
 def _normalize_rows(data: List[List[Any]]) -> Tuple[List[str], List[List[str]]]:
     rows = [[("" if c is None else str(c).strip()) for c in row] for row in (data or [])]
     rows = [r for r in rows if any(c for c in r)]
     if len(rows) < 2:
         return [], []
-    headers = rows[0]
-    body = rows[1:]
+    # Ancho uniforme ANTES de fusionar niveles (pdfplumber puede devolver filas
+    # de largos distintos).
+    ncol = max(len(r) for r in rows)
+    rows = [(r + [""] * (ncol - len(r)))[:ncol] for r in rows]
+    headers, body = merge_multilevel_headers(rows)
+    if not headers or not body:
+        return [], []
     ncol = len(headers)
     body = [(r + [""] * (ncol - len(r)))[:ncol] for r in body]
     return headers, body
+
+
+def _looks_like_prose(headers: List[str], rows: List[List[str]]) -> bool:
+    """¿La "tabla" es texto corrido partido en columnas falsas?
+
+    Firma real del bug (NTC 392.10): la estrategia de texto de pdfplumber cortó
+    prosa a dos columnas en celdas que PARTEN PALABRAS —
+    "(1) Conduct | ores individua | les. Debe perm | itirse la ins-".
+    Señales: bordes de celda pegados (celda termina en letra y la siguiente
+    empieza en minúscula) y celdas terminadas en guion de silabeo.
+    """
+    all_rows = [headers] + rows
+    total = len(all_rows)
+    if not total:
+        return False
+    glued_rows = 0
+    hyphen_rows = 0
+    for r in all_rows:
+        if any(c.rstrip().endswith("-") for c in r if c):
+            hyphen_rows += 1
+        pairs = 0
+        for a, b in zip(r, r[1:]):
+            if a and b and a[-1].isalpha() and b[0].islower():
+                pairs += 1
+        if pairs >= 2:
+            glued_rows += 1
+    return (glued_rows / total) >= 0.4 or (hyphen_rows / total) >= 0.25
 
 
 def _consistent(headers: List[str], rows: List[List[str]]) -> bool:
@@ -167,10 +300,37 @@ def extract_geometric(pl_page, clip: Tuple[float, float, float, float]) -> Optio
             headers, rows = _normalize_rows(best.extract())
         except Exception:
             continue
+        # La estrategia de texto (sin rejilla vectorial) puede "ver" columnas en
+        # prosa a dos columnas: si las celdas parten palabras, NO es una tabla —
+        # se rechaza para que la cascada caiga a Vision/PNG en vez de indexar
+        # ensalada de palabras como JSON canónico.
+        if metodo == "text" and _looks_like_prose(headers, rows):
+            log.info("[E3] estrategia text rechazada: la región parece prosa, no tabla")
+            continue
         if _consistent(headers, rows):
             return {"metodo": metodo, "headers": headers, "rows": rows,
                     "bbox": [round(v, 1) for v in best.bbox]}
     return None
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Footnotes / línea "Fuente" (ruta geométrica; Vision los entrega vía notes)
+# ──────────────────────────────────────────────────────────────────────────────
+_FOOTNOTE_LINE_RE = re.compile(
+    r"^\s*(?:\*+\s|\(\d+\)\s|\d\)\s|Nota[s]?\b|Fuente\b)", re.IGNORECASE
+)
+
+
+def collect_footnotes(pl_page, clip: Tuple[float, float, float, float]) -> Optional[str]:
+    """Rescata footnotes y la línea 'Fuente: …' del texto de la región de la
+    tabla. La extracción geométrica solo devuelve la rejilla; estas líneas
+    viven fuera de ella y deben preservarse en notes (criterio de aceptación)."""
+    try:
+        text = pl_page.crop(clip).extract_text() or ""
+    except Exception:
+        return None
+    keep = [ln.strip() for ln in text.splitlines() if _FOOTNOTE_LINE_RE.match(ln.strip())]
+    return " · ".join(keep) if keep else None
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -258,7 +418,9 @@ def _process_table(cfg: V2Config, doc_id: str, tid: str, info: dict,
         except Exception:
             pass
 
-    hash_region = hashlib.sha256(b"".join(png_parts)).hexdigest()[:16]
+    hash_region = hashlib.sha256(
+        _EXTRACTION_VERSION.encode("utf-8") + b"".join(png_parts)
+    ).hexdigest()[:16]
 
     # Caché entre corridas: región idéntica + JSON previo → reutilizar.
     cached = registry.cached_extraction(doc_id, tid, hash_region)
@@ -305,6 +467,10 @@ def _process_table(cfg: V2Config, doc_id: str, tid: str, info: dict,
             estado = "revision"
     elif geo:
         headers, rows, metodo, estado = geo["headers"], geo["rows"], geo["metodo"], "extraida"
+        # Footnotes y línea "Fuente" de la región (Vision ya los trae en notes;
+        # la rejilla geométrica no los incluye y deben preservarse).
+        notes = collect_footnotes(pdoc.pages[first_page - 1],
+                                  (region.x0, region.y0, region.x1, region.y1))
 
     # Continuaciones multipágina con Vision (concatenar filas si headers compatibles)
     if estado in ("verificada", "extraida") and len(pages) > 1 and cfg.vision_enabled and metodo.startswith("vision"):
