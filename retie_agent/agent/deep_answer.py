@@ -324,23 +324,45 @@ def _build_initial_message(
     skill: SkillSpec,
     intent_meta: Optional[Dict[str, Any]],
     wants_full: bool,
+    secondary_kind: str = "notebooklm",
 ) -> str:
     """Mensaje inicial: evidencia del fan-in (el agente NO repite el retrieval
-    inicial) + directivas resueltas por el registry + parámetros del classifier."""
+    inicial) + directivas resueltas por el registry + parámetros del classifier.
+
+    `secondary_kind` define la jerarquía de las fuentes: con "gemini" la
+    respuesta de la fuente secundaria proviene del corpus COMPLETO (Gemini File
+    Search) y es la BASE de la respuesta; los fragmentos de Chroma pasan a ser
+    apoyo para citas y verificación literal. Con "notebooklm" (modo previo) los
+    fragmentos siguen siendo la evidencia principal."""
     parts: List[str] = []
+    gemini_base = bool(secondary_answer) and secondary_kind == "gemini"
 
-    if initial_hits:
+    if gemini_base:
         parts.append(
-            "FRAGMENTOS DEL DOCUMENTO (evidencia inicial ya recuperada):\n"
-            + build_context(initial_hits, include_meta=True)
+            "RESPUESTA BASE (consulta al corpus normativo completo):\n" + secondary_answer
         )
+        if initial_hits:
+            parts.append(
+                "FRAGMENTOS DE APOYO (para verificación literal y citas):\n"
+                + build_context(initial_hits, include_meta=True)
+            )
+        else:
+            parts.append("FRAGMENTOS DE APOYO: (ninguno recuperado en la pasada inicial)")
     else:
-        parts.append("FRAGMENTOS DEL DOCUMENTO: (ninguno recuperado en la pasada inicial)")
+        if initial_hits:
+            parts.append(
+                "FRAGMENTOS DEL DOCUMENTO (evidencia inicial ya recuperada):\n"
+                + build_context(initial_hits, include_meta=True)
+            )
+        else:
+            parts.append("FRAGMENTOS DEL DOCUMENTO: (ninguno recuperado en la pasada inicial)")
 
-    if secondary_answer:
-        parts.append("ANÁLISIS COMPLEMENTARIO (fuente secundaria):\n" + secondary_answer)
+        if secondary_answer:
+            parts.append("ANÁLISIS COMPLEMENTARIO (fuente secundaria):\n" + secondary_answer)
 
     directives: List[str] = [skill.directives]
+    if gemini_base:
+        directives.append(DIR_GEMINI_BASE_NOTE)
     meta = intent_meta or {}
     entities = meta.get("entities") or []
     if entities:
@@ -378,6 +400,15 @@ DIR_FULL_NOTE = (
     "evidencia y declara explícitamente los faltantes."
 )
 
+DIR_GEMINI_BASE_NOTE = (
+    "La RESPUESTA BASE proviene de una consulta al corpus normativo COMPLETO: si "
+    "contesta la pregunta, úsala como fundamento de tu respuesta y usa los "
+    "fragmentos solo para verificar valores y construir citas. Si un valor "
+    "numérico difiere entre fuentes, prefiere el fragmento literal del documento. "
+    "Declara falta de evidencia ÚNICAMENTE si ninguna de las fuentes responde la "
+    "pregunta."
+)
+
 
 def _content_to_text(content: Any) -> str:
     """Normaliza el content de un AIMessage (str o lista de bloques) a texto."""
@@ -413,6 +444,7 @@ def run_deep_answer(
     *,
     initial_hits: List[Dict[str, Any]],
     secondary_answer: str,
+    secondary_kind: str = "notebooklm",
     history: Optional[List[Dict[str, str]]] = None,
     agent_key: Optional[str] = None,
     intent: Optional[str] = None,
@@ -464,7 +496,8 @@ def run_deep_answer(
         tools = _build_tools(log, agent_key, progress_callback=progress_callback)
         system_prompt = DEEP_AGENT_SYSTEM_PROMPT.format(max_retrievals=max_retrievals)
         initial_message = _build_initial_message(
-            question, initial_hits, secondary_answer, skill, intent_meta, wants_full
+            question, initial_hits, secondary_answer, skill, intent_meta, wants_full,
+            secondary_kind=secondary_kind,
         )
 
         def _invoke():

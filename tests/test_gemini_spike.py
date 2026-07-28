@@ -163,3 +163,14 @@ def test_extract_citations_shape_file_search():
 def test_extract_citations_respuesta_sin_grounding_no_rompe():
     assert GeminiFileSearchClient._extract_citations(SimpleNamespace(text="x")) == []
     assert GeminiFileSearchClient._extract_citations(None) == []
+
+
+def test_default_del_flag_es_gemini():
+    """Cierre del piloto shadow (2026-07-27): Gemini pasa a alimentar la respuesta.
+
+    Con "shadow" los 3 nodos corrían pero answer_node leía notebooklm_docs, así
+    que la respuesta de Gemini nunca llegaba al agente (quedaba solo en su span).
+    """
+    from retie_agent.config import Settings
+
+    assert Settings.model_fields["SECONDARY_RAG_SOURCE"].default == "gemini"

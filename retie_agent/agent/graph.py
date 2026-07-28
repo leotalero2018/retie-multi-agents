@@ -135,10 +135,12 @@ def _node_clarify(state: GraphState) -> GraphState:
 # Consulta fuera del dominio RETIE/NTC 2050 (clasificada por el LLM con confianza
 # alta): cortesía fija SIN pagar el pipeline completo (query enrichment + 3
 # retrievals + answer + enrich + suggest). Solo se llega aquí pasando el triple
-# guardarraíl de intent.classify_intent_v3 (vía LLM + confianza ≥ INTENT_OOD_MIN_CONF).
+# guardarraíl de intent.classify_intent_v3 (vía LLM + confianza ≥ INTENT_OOD_MIN_CONF)
+# Y el guardarraíl con evidencia de _ood_evidence_guard (el índice no tiene nada).
 _OUT_OF_DOMAIN_MSG = (
-    "🙋 Soy un asistente especializado en normativa eléctrica colombiana "
-    "(RETIE y NTC 2050), así que sobre ese tema no puedo ayudarte.\n\n"
+    "📚 Solo puedo responder preguntas sobre los libros del RETIE y la NTC 2050 "
+    "(normativa eléctrica colombiana), y tu consulta parece estar por fuera de "
+    "esos documentos.\n\n"
     "Pregúntame, por ejemplo:\n"
     "• ¿Qué exige el RETIE sobre puesta a tierra?\n"
     "• Dame la tabla 220.55 de factores de demanda\n"
@@ -487,17 +489,18 @@ def _resolve_rag_sources() -> tuple:
     Lee SECONDARY_RAG_SOURCE junto con los flags de disponibilidad de cada fuente.
     Devuelve (run_chroma, run_nlm, run_gemini, primary). Feature flag por entorno
     en Railway (se alterna sin redeploy):
-      - notebooklm      → Chroma + NLM (default, retrocompatible)
-      - gemini          → Chroma + Gemini; Gemini alimenta la respuesta
-      - shadow          → los 3 corren; NLM alimenta (prod-safe), Gemini se
-                          loguea para comparar calidad a igualdad de pregunta
+      - gemini          → Chroma + Gemini; Gemini alimenta la respuesta (default
+                          desde el cierre del piloto shadow, 2026-07-27)
+      - notebooklm      → Chroma + NLM (modo previo, retrocompatible)
+      - shadow          → los 3 corren; NLM alimenta, Gemini se loguea para
+                          comparar calidad (modo del piloto, ya cerrado)
       - chroma          → solo Chroma (alias: chromadb, solo-chroma, none)
       - solo-notebooklm → solo NLM, sin Chroma (alias: notebooklm-only)
       - solo-gemini     → solo Gemini, sin Chroma (alias: gemini-only)
     NLM/Gemini solo corren si además están disponibles (NOTEBOOKLM_ENABLED /
     key+store). Un valor desconocido cae al default retrocompatible.
     """
-    raw = str(getattr(settings, "SECONDARY_RAG_SOURCE", "notebooklm"))
+    raw = str(getattr(settings, "SECONDARY_RAG_SOURCE", "gemini"))
     # Railway guarda comillas literales si se pegan en el valor del dashboard;
     # se toleran aquí para que `"shadow"` no caiga silenciosamente al default.
     src = raw.strip().strip("\"'").strip().lower()
@@ -516,8 +519,32 @@ def _resolve_rag_sources() -> tuple:
     if src in ("shadow", "all", "todos"):
         # Los 3; NLM sigue siendo el primario para no arriesgar producción.
         return True, nlm_on, gem_on, "notebooklm"
-    # "notebooklm" (default) o valor desconocido → comportamiento actual.
+    # "notebooklm" o valor desconocido → modo previo (retrocompatible).
     return True, nlm_on, False, "notebooklm"
+
+
+def _ood_evidence_guard(question: str, agent_key: Optional[str]) -> bool:
+    """¿El índice tiene evidencia semántica para una consulta marcada fuera_de_dominio?
+
+    El clasificador LLM solo conoce la DESCRIPCIÓN del dominio; el índice conoce
+    su CONTENIDO real (el Anexo General cubre electropatología, fibrilación
+    ventricular, rayos… — temas que en la superficie suenan a medicina o física).
+    Antes de cortar con el mensaje fijo se consulta Chroma (top-3): un hit denso
+    dentro de RAG_DISTANCE_THRESHOLD demuestra que los documentos SÍ hablan del
+    tema → se degrada el corte a retrieve. Los hits solo-BM25 NO cuentan como
+    evidencia (matchean léxico con cualquier palabra compartida). Cualquier fallo
+    → False (se conserva la decisión del clasificador)."""
+    if not as_bool(getattr(settings, "OOD_EVIDENCE_GUARD", "true")):
+        return False
+    try:
+        hits = search(
+            question, top_k=3,
+            collection_name=_resolve_collection(agent_key, explicit=None),
+        ) or []
+        return any(h.get("score_type") == "cosine_distance" for h in hits)
+    except Exception as exc:
+        logger.warning("ood_evidence_guard falló (se conserva el corte): %s", exc)
+        return False
 
 
 def _node_classifier(state: GraphState, config=None) -> GraphState:
@@ -541,6 +568,16 @@ def _node_classifier(state: GraphState, config=None) -> GraphState:
         q, history=state.get("history"), is_media=is_media, channel=channel,
         media_source=state.get("source"),
     )
+    # Guardarraíl con evidencia: "fuera de dominio" deja de ser una opinión del
+    # LLM y pasa a ser una afirmación verificada contra el índice. Si Chroma
+    # tiene evidencia semántica del tema, la pregunta entra al pipeline normal.
+    ood_guard_hit = False
+    if res.route == "out_of_domain" and _ood_evidence_guard(q, state.get("agent_key")):
+        ood_guard_hit = True
+        res.intent = "puntual"
+        res.route = "retrieve"
+        res.requires_rag = True
+        res.source = f"{res.source}+evidence_guard"
     with span_ctx(
         None, "classifier_node", as_type="chain",
         span_input={"question": q, "source": state.get("source"), "channel": channel},
@@ -560,6 +597,7 @@ def _node_classifier(state: GraphState, config=None) -> GraphState:
                     "entities": res.entities,
                     "wants_table": res.wants_table,
                     "wants_full": res.wants_full,
+                    "ood_evidence_guard": ood_guard_hit,
                 })
             except Exception:
                 pass
@@ -609,11 +647,14 @@ def _synthesize_simple(
     wants_full: bool,
     *,
     media_only: bool = False,
+    secondary_kind: str = "notebooklm",
 ) -> str:
     """Síntesis clásica de UNA llamada (el cuerpo del answer_node previo al deep
     agent, extraído literal). Es la RED DE SEGURIDAD del deep agent — no un flag:
     corre cuando el agente agota su presupuesto, falla o devuelve vacío, y también
-    resuelve el camino media_only (imagen/voz sin evidencia, sin agente)."""
+    resuelve el camino media_only (imagen/voz sin evidencia, sin agente).
+    `secondary_kind` indica qué fuente aporta `nlm_answer` ("gemini" invierte la
+    jerarquía: esa respuesta es la base y los fragmentos son apoyo)."""
     if media_only:
         # El contenido de la imagen/voz ya está en `question` (lo compuso el router).
         sys = SYSTEM_PROMPT_MEDIA
@@ -621,7 +662,8 @@ def _synthesize_simple(
     else:
         sys = SYSTEM_PROMPT_RETIE
         prompt = make_hybrid_prompt(
-            hits, nlm_answer, question, is_admin=False, wants_table=wants_table
+            hits, nlm_answer, question, is_admin=False, wants_table=wants_table,
+            secondary_kind=secondary_kind,
         )
     messages = [{"role": "system", "content": sys}]
     for msg in history:
@@ -767,6 +809,7 @@ def _node_answer(state: GraphState, config=None) -> GraphState:
             q,
             initial_hits=hits,
             secondary_answer=nlm_answer,
+            secondary_kind=secondary_primary,
             history=history,
             agent_key=agent_key,
             intent=state.get("intent"),
@@ -793,7 +836,8 @@ def _node_answer(state: GraphState, config=None) -> GraphState:
                         status=status,
                     )
                     answer = _synthesize_simple(
-                        q, hits, nlm_answer, history, model, wants_table, wants_full
+                        q, hits, nlm_answer, history, model, wants_table, wants_full,
+                        secondary_kind=secondary_primary,
                     )
                     status = f"{status}->simple"
                 except Exception as exc:

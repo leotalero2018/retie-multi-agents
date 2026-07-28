@@ -470,3 +470,119 @@ def test_node_answer_sin_evidencia_con_tools_corre_el_agente(monkeypatch):
     assert out["route"] == "answer"
     assert out["answer"] == "encontrado tras reformular"
     assert len(out["hits"]) == 1
+
+
+# ── Jerarquía de fuentes: Gemini como base (cierre del piloto shadow) ────────
+# Con SECONDARY_RAG_SOURCE=gemini la respuesta de Gemini se elabora sobre el
+# corpus COMPLETO, así que es la base; los chunks de Chroma son apoyo para
+# citas. Antes entraba etiquetada como "complementaria" y el agente respondía
+# "no tengo evidencia" mirando solo los fragmentos.
+
+def test_initial_message_gemini_es_la_base_y_chroma_el_apoyo():
+    msg = _build_initial_message(
+        "¿está permitido usar la sigla RETIE en productos no certificados?",
+        _hits(),
+        "No, no está permitido: induce a error al consumidor.",
+        DEFAULT_SKILL,
+        None,
+        wants_full=False,
+        secondary_kind="gemini",
+    )
+    assert msg.index("RESPUESTA BASE") < msg.index("FRAGMENTOS DE APOYO")
+    assert "ANÁLISIS COMPLEMENTARIO" not in msg
+    assert da.DIR_GEMINI_BASE_NOTE in msg
+
+
+def test_initial_message_notebooklm_conserva_la_jerarquia_previa():
+    msg = _build_initial_message(
+        "q", _hits(), "aporte nlm", DEFAULT_SKILL, None, wants_full=False,
+    )
+    assert msg.index("FRAGMENTOS DEL DOCUMENTO") < msg.index("ANÁLISIS COMPLEMENTARIO")
+    assert "RESPUESTA BASE" not in msg
+    assert da.DIR_GEMINI_BASE_NOTE not in msg
+
+
+def test_initial_message_gemini_sin_secundaria_no_promete_base():
+    # Gemini configurado pero sin respuesta (timeout/vacío) → jerarquía clásica.
+    msg = _build_initial_message(
+        "q", _hits(), "", DEFAULT_SKILL, None, wants_full=False, secondary_kind="gemini",
+    )
+    assert "RESPUESTA BASE" not in msg
+    assert "FRAGMENTOS DEL DOCUMENTO" in msg
+
+
+def test_node_answer_propaga_secondary_kind_al_agente(monkeypatch):
+    from retie_agent.agent import graph as g
+
+    captured = {}
+
+    def _spy(q, **kwargs):
+        captured.update(kwargs)
+        return _result("r")
+
+    monkeypatch.setattr(g, "run_deep_answer", _spy)
+    g._node_answer({
+        "question": "q",
+        "chromadb_docs": _hits(),
+        "gemini_docs": "respuesta de gemini",
+        "secondary_primary": "gemini",
+    })
+    assert captured["secondary_kind"] == "gemini"
+    assert captured["secondary_answer"] == "respuesta de gemini"
+
+
+def test_node_answer_fallback_simple_conserva_la_jerarquia_gemini(monkeypatch):
+    from retie_agent.agent import graph as g
+
+    captured = {}
+
+    def _fake_simple(q, hits, nlm, history, model, wt, wf, *, media_only=False,
+                     secondary_kind="notebooklm"):
+        captured["secondary_kind"] = secondary_kind
+        return "respuesta del camino clásico"
+
+    monkeypatch.setattr(
+        g, "run_deep_answer", lambda *a, **k: _result("", status="fallback_timeout")
+    )
+    monkeypatch.setattr(g, "_synthesize_simple", _fake_simple)
+    out = g._node_answer({
+        "question": "q",
+        "chromadb_docs": _hits(),
+        "gemini_docs": "respuesta de gemini",
+        "secondary_primary": "gemini",
+    })
+    assert out["answer"] == "respuesta del camino clásico"
+    assert captured["secondary_kind"] == "gemini"
+
+
+# ── make_hybrid_prompt: misma jerarquía en la red de seguridad ───────────────
+
+def test_hybrid_prompt_gemini_pone_la_respuesta_base_primero():
+    from retie_agent.agent.prompt import make_hybrid_prompt
+
+    p = make_hybrid_prompt(
+        _hits(), "respuesta de gemini", "¿aplica la sigla RETIE?",
+        secondary_kind="gemini",
+    )
+    assert p.index("RESPUESTA BASE") < p.index("FRAGMENTOS DE APOYO")
+    assert "NINGUNA de las dos fuentes" in p
+
+
+def test_hybrid_prompt_notebooklm_sin_cambios():
+    from retie_agent.agent.prompt import make_hybrid_prompt
+
+    p = make_hybrid_prompt(_hits(), "aporte nlm", "q")
+    assert "FRAGMENTOS DEL DOCUMENTO RETIE" in p
+    assert "RESPUESTA BASE" not in p
+
+
+def test_hybrid_prompt_tabla_etiqueta_la_fuente_secundaria():
+    from retie_agent.agent.prompt import make_hybrid_prompt
+
+    p = make_hybrid_prompt(
+        _hits(), "filas de gemini", "dame la tabla 220.55",
+        wants_table=True, secondary_kind="gemini",
+    )
+    assert "Gemini File Search" in p
+    assert "{secondary_label}" not in p          # el template quedó formateado
+    assert "TODAS las filas" in p

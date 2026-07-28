@@ -180,7 +180,7 @@ PROMPT_TEMPLATE_HYBRID = (
 PROMPT_TEMPLATE_HYBRID_TABLE = (
     "Eres un asistente experto en el Reglamento Técnico de Instalaciones Eléctricas (RETIE). "
     "El usuario pide una tabla. Tienes dos fuentes de datos: fragmentos del documento oficial "
-    "y un análisis previo de NotebookLM.\n\n"
+    "y un análisis previo de otra fuente ({secondary_label}).\n\n"
     "INSTRUCCIÓN: Extrae y presenta la tabla completa usando los datos de cualquiera de las "
     "dos fuentes (o combinándolas). No expliques de dónde vienen los datos. No pongas "
     "advertencias sobre qué fuente tiene qué. Solo devuelve la tabla con todos sus datos.\n\n"
@@ -190,9 +190,34 @@ PROMPT_TEMPLATE_HYBRID_TABLE = (
     "- No omitas filas por resumir. No inventes filas que no estén en ninguna fuente.\n"
     "- Si hay varias tablas relacionadas, preséntalas todas.\n\n"
     "FRAGMENTOS DEL DOCUMENTO RETIE:\n{context}\n\n"
-    "ANÁLISIS COMPLEMENTARIO (NotebookLM):\n{nlm_answer}\n\n"
+    "ANÁLISIS COMPLEMENTARIO ({secondary_label}):\n{nlm_answer}\n\n"
     "Pregunta: {question}\n"
     "Responde SOLO con los datos de la tabla, sin meta-comentarios."
+)
+
+# Jerarquía Gemini-primaria (cierre del piloto shadow, 2026-07-27): la respuesta
+# de Gemini File Search se elabora consultando el corpus normativo COMPLETO, así
+# que es la BASE de la síntesis; los fragmentos de Chroma son apoyo para citas y
+# verificación literal. Evita el modo de fallo del template clásico, donde el
+# modelo trataba los fragmentos como única evidencia y respondía "no tengo
+# evidencia" aunque la fuente secundaria contuviera la respuesta.
+PROMPT_TEMPLATE_GEMINI_PRIMARY = (
+    "Eres un asistente experto en el Reglamento Técnico de Instalaciones Eléctricas (RETIE). "
+    "Dispones de dos fuentes: una RESPUESTA BASE elaborada consultando el corpus normativo "
+    "completo, y FRAGMENTOS DE APOYO recuperados literalmente del documento.\n\n"
+    "REGLAS:\n"
+    "- La RESPUESTA BASE es tu fundamento principal: si contesta la pregunta, construye tu "
+    "respuesta a partir de ella.\n"
+    "- Usa los FRAGMENTOS DE APOYO para verificar valores, artículos y citas, y para "
+    "complementar detalles que falten en la RESPUESTA BASE.\n"
+    "- Si un valor numérico difiere entre fuentes, prefiere el fragmento literal del "
+    "documento y no lo redondees.\n"
+    "- Solo di que no hay información si NINGUNA de las dos fuentes responde la pregunta.\n"
+    "- No menciones las fuentes ni su origen en la respuesta — solo responde.\n\n"
+    "RESPUESTA BASE (corpus normativo completo):\n{nlm_answer}\n\n"
+    "FRAGMENTOS DE APOYO (documento oficial):\n{context}\n\n"
+    "Pregunta: {question}\n"
+    "Responde en español con todos los datos relevantes."
 )
 
 
@@ -203,14 +228,30 @@ def make_hybrid_prompt(
     *,
     is_admin: bool = False,
     wants_table: bool = False,
+    secondary_kind: str = "notebooklm",
 ) -> str:
-    """Prompt that merges Chroma chunks with a NotebookLM pre-synthesized answer."""
+    """Prompt that merges Chroma chunks with a pre-synthesized secondary answer.
+
+    `secondary_kind` decide la jerarquía: "gemini" → la respuesta secundaria
+    proviene del corpus completo y es la BASE (fragmentos = apoyo); "notebooklm"
+    → modo previo con los fragmentos como evidencia principal."""
     has_chroma = bool(context_blocks)
     has_nlm = bool(nlm_answer and nlm_answer.strip())
+    secondary_label = "Gemini File Search" if secondary_kind == "gemini" else "NotebookLM"
 
     if has_chroma and has_nlm:
         ctx = build_context(context_blocks, include_meta=is_admin)
-        template = PROMPT_TEMPLATE_HYBRID_TABLE if wants_table else PROMPT_TEMPLATE_HYBRID
+        if wants_table:
+            # Tablas: ambas fuentes en pie de igualdad — gana la más completa.
+            return PROMPT_TEMPLATE_HYBRID_TABLE.format(
+                context=ctx, nlm_answer=nlm_answer.strip(), question=question,
+                secondary_label=secondary_label,
+            )
+        template = (
+            PROMPT_TEMPLATE_GEMINI_PRIMARY
+            if secondary_kind == "gemini"
+            else PROMPT_TEMPLATE_HYBRID
+        )
         return template.format(
             context=ctx, nlm_answer=nlm_answer.strip(), question=question
         )

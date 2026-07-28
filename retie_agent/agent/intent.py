@@ -318,8 +318,14 @@ _SYSTEM_PROMPT_V3 = (
     "para tomas de 20 A?\", \"¿es obligatorio el GFCI en baños?\").\n"
     "- smalltalk: SOLO saludo/agradecimiento/despedida a secas, o pregunta sobre el "
     "propio bot (\"¿quién eres?\").\n"
-    "- fuera_de_dominio: NO trata de normativa eléctrica, instalaciones eléctricas ni "
-    "del RETIE/NTC 2050 (películas, deportes, matemática general, otra disciplina).\n\n"
+    "- fuera_de_dominio: NO tiene NINGUNA relación con la electricidad, sus riesgos, "
+    "sus efectos ni su normativa (películas, deportes, cocina, matemática general). "
+    "OJO: el corpus del RETIE incluye también seguridad eléctrica y efectos de la "
+    "corriente en el cuerpo humano (electropatología, fibrilación ventricular, "
+    "tetanización), fenómenos eléctricos y atmosféricos (rayo, descargas, "
+    "sobretensiones), protección contra rayos y las definiciones técnicas del Anexo "
+    "General — preguntas sobre esos temas NUNCA son fuera_de_dominio aunque suenen "
+    "a medicina o física.\n\n"
     "response_format — markdown | markdown_table | bullet_list | comparison | steps: "
     "cómo conviene presentar la respuesta (una pregunta puntual sobre datos tabulares "
     "puede llevar markdown_table).\n"
@@ -357,7 +363,12 @@ _SYSTEM_PROMPT_V3 = (
     '"response_format":"markdown","output_length":"medium","complexity":"medium",'
     '"needs_calculation":true,"confidence":0.85}\n'
     '- "recomiéndame una serie" → {"intent":"fuera_de_dominio","response_format":"markdown",'
-    '"output_length":"short","complexity":"low","needs_calculation":false,"confidence":0.97}'
+    '"output_length":"short","complexity":"low","needs_calculation":false,"confidence":0.97}\n'
+    '- "¿en qué consiste la fibrilación ventricular?" → {"intent":"puntual",'
+    '"response_format":"markdown","output_length":"short","complexity":"low",'
+    '"needs_calculation":false,"confidence":0.9}\n'
+    '- "¿qué es un rayo?" → {"intent":"puntual","response_format":"markdown",'
+    '"output_length":"short","complexity":"low","needs_calculation":false,"confidence":0.9}'
 )
 
 

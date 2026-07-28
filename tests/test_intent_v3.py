@@ -470,3 +470,104 @@ def test_grafo_compila_con_classifier_como_entry():
         e.source == "__start__" and e.target == "classifier_node"
         for e in drawable.edges
     )
+
+
+# ── Guardarraíl con evidencia sobre fuera_de_dominio ─────────────────────────
+# El clasificador solo conoce la DESCRIPCIÓN del dominio; el índice conoce su
+# CONTENIDO. Antes de cortar se verifica contra Chroma: preguntas como
+# "¿en qué consiste la fibrilación ventricular?" viven en el Anexo General y
+# sonaban a otra disciplina, así que el LLM las cortaba con confianza alta.
+
+def _ood_result():
+    return IntentResultV3(
+        intent="fuera_de_dominio", source="llm", route="out_of_domain",
+        wants_table=False, wants_full=False, requires_rag=False,
+        response_format="markdown", output_length="short",
+        complexity="low", needs_calculation=False, confidence=0.95,
+    )
+
+
+@pytest.fixture
+def ood_graph(monkeypatch):
+    """classifier_node con el LLM fijado en fuera_de_dominio y Chroma mockeable."""
+    from retie_agent.agent import graph as graph_mod
+
+    monkeypatch.setattr(graph_mod, "classify_intent_v3", lambda *a, **k: _ood_result())
+    monkeypatch.setattr(graph_mod, "_resolve_collection", lambda *a, **k: "normativas")
+    monkeypatch.setattr(graph_mod.settings, "OOD_EVIDENCE_GUARD", "true", raising=False)
+    return graph_mod
+
+
+def _dense_hit():
+    return [{"text": "La fibrilación ventricular es…", "score": 0.21,
+             "score_type": "cosine_distance", "meta": {"source": "RETIE.pdf", "page": 12}}]
+
+
+def test_ood_guard_degrada_a_retrieve_cuando_el_indice_tiene_evidencia(ood_graph, monkeypatch):
+    monkeypatch.setattr(ood_graph, "search", lambda *a, **k: _dense_hit())
+    out = ood_graph._node_classifier({"question": "¿en qué consiste la fibrilación ventricular?"})
+    assert out["route"] == "retrieve"
+    assert out["intent"] == "puntual"
+    assert out["intent_source"].endswith("+evidence_guard")
+    assert out["intent_meta"]["requires_rag"] is True
+
+
+def test_ood_guard_conserva_el_corte_sin_evidencia(ood_graph, monkeypatch):
+    monkeypatch.setattr(ood_graph, "search", lambda *a, **k: [])
+    out = ood_graph._node_classifier({"question": "recomiéndame una serie"})
+    assert out["route"] == "out_of_domain"
+    assert out["intent"] == "fuera_de_dominio"
+
+
+def test_ood_guard_ignora_hits_solo_lexicos(ood_graph, monkeypatch):
+    # BM25 matchea por palabras compartidas con cualquier pregunta: no es evidencia.
+    bm25 = [{"text": "…", "score": 3.1, "score_type": "bm25", "meta": {}}]
+    monkeypatch.setattr(ood_graph, "search", lambda *a, **k: bm25)
+    out = ood_graph._node_classifier({"question": "cuál es la mejor receta de arroz"})
+    assert out["route"] == "out_of_domain"
+
+
+def test_ood_guard_desactivable_por_flag(ood_graph, monkeypatch):
+    def _no_search(*a, **k):
+        raise AssertionError("con el flag apagado no debe consultarse el índice")
+
+    monkeypatch.setattr(ood_graph.settings, "OOD_EVIDENCE_GUARD", "false", raising=False)
+    monkeypatch.setattr(ood_graph, "search", _no_search)
+    out = ood_graph._node_classifier({"question": "recomiéndame una serie"})
+    assert out["route"] == "out_of_domain"
+
+
+def test_ood_guard_no_gasta_retrieval_si_la_consulta_es_del_dominio(monkeypatch):
+    # Solo fuera_de_dominio paga la verificación; el resto no cambia de costo.
+    from retie_agent.agent import graph as graph_mod
+
+    fake = IntentResultV3(
+        intent="puntual", source="llm", route="retrieve",
+        wants_table=False, wants_full=False, requires_rag=True,
+        response_format="markdown", output_length="short",
+        complexity="low", needs_calculation=False, confidence=0.95,
+    )
+    monkeypatch.setattr(graph_mod, "classify_intent_v3", lambda *a, **k: fake)
+
+    def _no_search(*a, **k):
+        raise AssertionError("el guardarraíl no debe correr fuera del corte")
+
+    monkeypatch.setattr(graph_mod, "search", _no_search)
+    assert graph_mod._node_classifier({"question": "¿qué es el RETIE?"})["route"] == "retrieve"
+
+
+def test_ood_guard_si_falla_el_indice_conserva_el_corte(ood_graph, monkeypatch):
+    def _boom(*a, **k):
+        raise RuntimeError("Chroma caído")
+
+    monkeypatch.setattr(ood_graph, "search", _boom)
+    out = ood_graph._node_classifier({"question": "recomiéndame una serie"})
+    assert out["route"] == "out_of_domain"
+
+
+def test_mensaje_fuera_de_dominio_acota_a_los_libros(ood_graph):
+    msg = ood_graph._OUT_OF_DOMAIN_MSG
+    # No es el saludo de bienvenida: declara el alcance documental.
+    assert "RETIE" in msg and "NTC 2050" in msg
+    assert "Solo puedo responder" in msg
+    assert "Soy un asistente especializado" not in msg

@@ -53,6 +53,10 @@ class Settings(BaseSettings):
     INTENT_V3_SENSITIVE_CONF: float = 0.85           # umbral extra para intents sensibles
     # fuera_de_dominio solo corta el pipeline si vino del LLM con esta confianza mínima.
     INTENT_OOD_MIN_CONF: float = 0.8
+    # Guardarraíl con evidencia: antes de cortar por fuera_de_dominio se consulta
+    # Chroma (top-3); un hit denso dentro del umbral demuestra que el corpus SÍ
+    # cubre el tema (electropatología, rayos, etc.) y degrada el corte a retrieve.
+    OOD_EVIDENCE_GUARD: str = "true"
     INTENT_V3_MAX_TOKENS: int = 200                  # presupuesto del JSON del classifier
 
     # --- RAG / Chroma ---
@@ -157,16 +161,19 @@ class Settings(BaseSettings):
 
     # --- Fuentes de recuperación: Chroma / NotebookLM / Gemini File Search ---
     # Selecciona qué fuentes corren en el fan-out y cuál secundaria alimenta answer_node:
-    #   "notebooklm"      → Chroma + NLM (default, retrocompatible)
-    #   "gemini"          → Chroma + Gemini; Gemini alimenta la respuesta
-    #   "shadow"          → las 3 corren; NLM alimenta la respuesta (prod-safe) y
-    #                       Gemini queda registrado en su propio span de Langfuse para
-    #                       comparar CALIDAD a igualdad de pregunta, sin afectar al usuario.
+    #   "gemini"          → Chroma + Gemini; Gemini alimenta la respuesta (DEFAULT
+    #                       desde el cierre del piloto shadow, 2026-07-27: Gemini es
+    #                       la fuente principal y los fragmentos de Chroma son apoyo
+    #                       para citas y verificación literal)
+    #   "notebooklm"      → Chroma + NLM (modo previo, retrocompatible)
+    #   "shadow"          → las 3 corren; NLM alimenta la respuesta y Gemini queda
+    #                       registrado en su propio span de Langfuse para comparar
+    #                       calidad (modo del piloto, ya cerrado)
     #   "chroma"          → solo Chroma (sin fuente secundaria)
     #   "solo-notebooklm" → solo NLM, sin Chroma
     #   "solo-gemini"     → solo Gemini, sin Chroma
     # Feature flag pensado para alternar por entorno en Railway sin redeploy.
-    SECONDARY_RAG_SOURCE: str = "notebooklm"
+    SECONDARY_RAG_SOURCE: str = "gemini"
     GEMINI_API_KEY: Optional[str] = None
     GEMINI_MODEL: str = "gemini-flash-latest"
     GEMINI_FILE_SEARCH_STORE: Optional[str] = None
