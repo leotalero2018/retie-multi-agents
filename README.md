@@ -25,25 +25,25 @@
 Usuario
   │
   ├── Telegram Bot (voz, texto, imagen)
-  │       └── retie_agent/bot/
+  │       └── src/retie_agent/bot/
   │
   ├── API REST (HTTP)
-  │       └── retie_agent/api/
+  │       └── src/retie_agent/api/
   │
   └── CLI (script local)
-          └── index_docs.py
+          └── scripts/index_docs.py
                 │
           ┌─────▼─────────────────────────────────────────────────┐
           │                  LangGraph Pipeline (v3)               │
           │ classifier → route_entry → query_enrichment →          │
           │   [chroma ‖ notebooklm ‖ gemini] → answer (deep agent) │
           │   → (table) → enrich → suggest → stylist               │
-          │              retie_agent/agent/graph.py                │
+          │              src/retie_agent/agent/graph.py                │
           └─────────────────┬─────────────────────────────────────┘
                             │
              ┌──────────────┴──────────────┐
              ▼                             ▼
-    retie_agent/retriever/        retie_agent/services/
+    src/retie_agent/retriever/        src/retie_agent/services/
      Chroma (dense + BM25)        MongoDB · MinIO · Whisper
                                   Vision · Langfuse
              ▲
@@ -60,7 +60,7 @@ Usuario
 ```
 retie-multi-agents/
 │
-├── retie_agent/                    ← Agente inteligente RETIE
+├── src/retie_agent/                ← Agente inteligente RETIE
 │   ├── config.py                   # Configuración centralizada (Pydantic Settings)
 │   ├── agent/
 │   │   ├── graph.py                # Grafo LangGraph (pipeline principal de respuesta)
@@ -121,9 +121,12 @@ retie-multi-agents/
 ├── data/                           ← Base de datos ChromaDB persistente (no versionado)
 ├── images/                         ← Imágenes del README
 │
-├── index_docs.py                   # CLI para indexar PDFs desde terminal
-├── check_counts.py                 # Verifica el número de chunks indexados
-├── test_langfuse.py                # Test de conexión con Langfuse
+├── scripts/                        ← Utilidades de línea de comandos
+│   ├── index_docs.py               # CLI para indexar PDFs desde terminal
+│   ├── check_counts.py             # Verifica el número de chunks indexados
+│   └── _sync_chroma_only.py        # Sincroniza la DB de Chroma con MinIO
+│
+├── pyproject.toml                  # Config de pytest (pythonpath del layout src/)
 │
 ├── Dockerfile                      # Imagen Docker multi-etapa
 ├── docker-compose.yml              # Servicios: bot + MinIO
@@ -329,16 +332,16 @@ Coloca los PDFs normativos en la carpeta `docs/` y ejecuta:
 
 ```bash
 # Indexar toda la carpeta (parser por defecto: PyMuPDF)
-python index_docs.py --source ./docs --out ./data/chroma_db --engine pymupdf
+python scripts/index_docs.py --source ./docs --out ./data/chroma_db --engine pymupdf
 
 # Indexar con pdfplumber (mejor para tablas)
-python index_docs.py --source ./docs --out ./data/chroma_db --engine pdfplumber
+python scripts/index_docs.py --source ./docs --out ./data/chroma_db --engine pdfplumber
 
 # Indexar un único PDF
-python index_docs.py --file ./docs/Resolución_40117_de_2024_RETIE.pdf --engine pymupdf
+python scripts/index_docs.py --file ./docs/Resolución_40117_de_2024_RETIE.pdf --engine pymupdf
 
 # Indexar y subir la DB a MinIO/S3
-python index_docs.py --source ./docs --out ./data/chroma_db --upload --s3-prefix chroma_db/
+python scripts/index_docs.py --source ./docs --out ./data/chroma_db --upload --s3-prefix chroma_db/
 ```
 
 Parámetros disponibles:
@@ -357,8 +360,10 @@ Parámetros disponibles:
 ### Bot de Telegram (retie_agent)
 
 ```bash
-# Activar entorno virtual y PYTHONPATH primero
-python -m retie_agent.bot.run_polling
+# El paquete vive en src/, así que esa ruta debe estar en el PYTHONPATH
+# (en Docker ya viene fijado en la imagen).
+PYTHONPATH=src python -m retie_agent.bot.run_polling     # Linux/macOS
+$env:PYTHONPATH="src"; python -m retie_agent.bot.run_polling   # PowerShell
 ```
 
 Al arrancar, el bot:
@@ -384,8 +389,8 @@ Además acepta: mensajes de texto, notas de voz, fotos e imágenes de documentos
 ### API REST (retie_agent)
 
 ```bash
-# Iniciar el servidor FastAPI
-uvicorn retie_agent.api.main:app --host 0.0.0.0 --port 8000 --reload
+# Iniciar el servidor FastAPI (el paquete vive en src/)
+PYTHONPATH=src uvicorn retie_agent.api.main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
 Accede a la documentación interactiva en: **http://localhost:8000/docs**
@@ -552,7 +557,7 @@ tool**: sus 30–180 s por llamada romperían el presupuesto; su aporte entra co
 evidencia inicial.
 
 - La **skill** (directivas + presupuesto + post-proceso) la resuelve el registry
-  determinista de `retie_agent/agent/skills/` a partir del intent — el agente no
+  determinista de `src/retie_agent/agent/skills/` a partir del intent — el agente no
   elige su skill. Cada skill es un archivo **`.md`** (frontmatter con metadata +
   cuerpo con las directivas): añadir/editar una skill no toca código Python.
   `intent=tabla` → directiva de filas completas y el render PNG sigue siendo de
@@ -770,10 +775,10 @@ python -m pytest tests/test_chuncker.py -v
 python -m pytest tests/test_history.py -v
 
 # Verificar conteos en Chroma
-python check_counts.py
+python scripts/check_counts.py
 
 # Test de Langfuse
-python test_langfuse.py
+python -m pytest tests/test_langfuse.py
 ```
 
 ---

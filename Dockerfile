@@ -63,7 +63,8 @@ ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_DEFAULT_TIMEOUT=100 \
     PIP_RETRIES=5 \
     PYTHONUNBUFFERED=1 \
-    PYTHONPATH=/app \
+    # Layout src/: retie_agent vive en /app/src; pipeline_indexacion sigue en /app.
+    PYTHONPATH=/app/src:/app \
     CHROMA_DB_DIR=/data/chroma_db \
     CHROMA_PERSIST_DIR=/data/chroma_db \
     COLLECTION_NAME=retie_docs \

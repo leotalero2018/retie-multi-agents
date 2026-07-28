@@ -1,0 +1,7 @@
+[tool.pytest.ini_options]
+# Layout src/: `retie_agent` vive en src/ y `pipeline_indexacion` sigue en la
+# raíz, así que ambas rutas entran al sys.path de los tests. El despliegue usa
+# el mismo mecanismo (PYTHONPATH en el Dockerfile), no una instalación editable.
+pythonpath = ["src", "."]
+# Evita que pytest recolecte scripts sueltos de la raíz como si fueran tests.
+testpaths = ["tests"]
